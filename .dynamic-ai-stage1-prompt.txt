@@ -1,0 +1,124 @@
+You are the senior software engineer implementing MEDBOT Dynamic AI Phase 1 — STAGE 1 ONLY.
+
+PROJECT:
+~/MEDBOT
+
+IMPORTANT:
+- Use opencode/big-pickle as the coding agent.
+- Do NOT use Gemini 3.6 or any Flash/Lite/Mini/Nano model.
+- Do NOT perform unrelated work.
+- Do NOT redesign Telegram UX.
+- Do NOT modify the public AI behavior yet.
+- Do NOT inspect ~/.local/share/opencode/auth.json.
+- Never print or expose API keys/secrets.
+- Preserve existing working functionality.
+- Do not recreate the SQLite database.
+- Make real edits to the project; do not merely describe them.
+- Work incrementally and verify every change.
+
+STAGE 1 GOAL:
+Harden the AI registry so its canonical identity is:
+
+(provider, model, endpoint)
+
+The same canonical identity must never create duplicate registry rows.
+
+CURRENT DATABASE:
+~/MEDBOT/medbot_v2.sqlite3
+
+CURRENT REGISTRY COLUMNS:
+id
+provider
+model
+endpoint
+availability
+auth_status
+latency_ms
+success_rate
+capabilities
+last_success
+last_failure
+last_test
+notes
+error_category
+timeout_behavior
+rate_limit_behavior
+
+KNOWN CURRENT DUPLICATES:
+google_gemini / gemini-flash-lite-latest / Gemini endpoint -> 3 rows
+google_gemini / gemma-4-26b-a4b-it / Gemini endpoint -> 3 rows
+
+REQUIREMENTS:
+
+1. FIRST create a safe timestamped backup of:
+   - main.py
+   - database.py
+   - search_engine.py
+   - ai_router.py
+   - ai_discovery.py
+   - medbot_v2.sqlite3
+
+2. Inspect the existing database schema and current AI registry implementation.
+
+3. Merge existing duplicate registry identities safely.
+   - Keep one canonical row per (provider, model, endpoint).
+   - Preserve the most useful/non-null historical information.
+   - Preserve last_success, last_failure, last_test.
+   - Do not lose successful test history.
+   - Do not delete unrelated database records.
+   - Do not recreate the database.
+
+4. Implement idempotent registry upsert behavior.
+   - Re-registering the same (provider, model, endpoint) must update the existing row instead of inserting another row.
+   - New non-null values should update existing values.
+   - Incoming NULL values must NOT erase existing non-null values.
+   - Existing historical timestamps must not be unnecessarily destroyed.
+
+5. Add a UNIQUE constraint/index for:
+   (provider, model, endpoint)
+   only after duplicates have been safely merged.
+   Use the safest SQLite-compatible approach for the existing schema.
+
+6. Update the existing registry code so all normal registration paths use the idempotent mechanism.
+
+7. Preserve backward compatibility with existing public functions/classes.
+
+8. Do not implement dynamic provider discovery, scoring, routing, cooldown, or failover yet. Those belong to later stages.
+
+9. Run verification:
+   - Python compile checks for modified Python files.
+   - SQLite PRAGMA integrity_check.
+   - SQLite foreign_key_check.
+   - Confirm duplicate identity count = 0.
+   - Confirm unique constraint/index exists.
+   - Confirm registry rows still exist.
+   - Confirm existing source files were not accidentally corrupted.
+   - Run any existing registry-related tests if available.
+
+10. Produce:
+logs/dynamic-ai-stage1-report-${STAMP}.txt
+
+Report sections:
+IMPLEMENTED
+BACKUP
+REGISTRY_BEFORE
+REGISTRY_AFTER
+DEDUPLICATION
+UPSERT
+DATABASE
+TESTED
+WARNINGS
+REMAINING
+FINAL_STATUS
+
+FINAL_STATUS must be exactly one of:
+COMPLETE
+COMPLETE_WITH_WARNINGS
+BLOCKED
+
+At the very end print:
+STAGE1_FINAL_STATUS=<value>
+
+STOP after Stage 1.
+
+Do NOT start Stage 2.

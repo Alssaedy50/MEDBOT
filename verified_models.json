@@ -1,0 +1,32 @@
+[
+  {
+    "provider": "google_gemini",
+    "model": "gemini-flash-lite-latest",
+    "latency": 1773.5,
+    "sample": "Inhibits carbonic anhydrase, decreasing aqueo"
+  },
+  {
+    "provider": "groq",
+    "model": "groq/compound-mini",
+    "latency": 659.6,
+    "sample": "Carbonic anhydrase inhibition reduces aqueous"
+  },
+  {
+    "provider": "groq",
+    "model": "allam-2-7b",
+    "latency": 369.8,
+    "sample": "Acetazolamide reduces glaucoma by lowering in"
+  },
+  {
+    "provider": "groq",
+    "model": "qwen/qwen3.8-27b",
+    "latency": 311.4,
+    "sample": "Reduces intraocular pressure by inhibiting ca"
+  },
+  {
+    "provider": "groq",
+    "model": "groq/compound",
+    "latency": 3912.0,
+    "sample": "**Reasoning**  Acetazolamide is a carbon"
+  }
+]

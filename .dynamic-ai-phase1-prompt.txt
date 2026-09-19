@@ -1,0 +1,259 @@
+You are implementing PHASE 1 of the MEDBOT Dynamic AI Orchestrator.
+
+IMPORTANT:
+- Work ONLY inside ~/MEDBOT.
+- Audit before modifying anything.
+- Preserve all existing working functionality.
+- Do NOT wipe, recreate, reset, or migrate away existing MEDBOT data.
+- Do NOT reinstall packages/tools.
+- Do NOT inspect ~/.local/share/opencode/auth.json.
+- NEVER print, expose, copy, or log API keys, tokens, cookies, or secrets.
+- Do NOT invent credentials or claim unavailable providers are usable.
+- Do NOT make OpenCode a permanent runtime dependency.
+- OpenCode may be used only as a discovery/diagnostic source.
+- Preserve the IPv4 workaround in main.py.
+- Preserve run_bot.sh/watchdog.
+- Preserve contributions and all existing database content.
+- Do not modify search_engine.py unless absolutely required.
+- Do not redesign Telegram UX in this phase.
+
+CURRENT REALITY:
+- GEMINI_API_KEY is configured.
+- OPENROUTER_API_KEY is currently NOT configured.
+- OPENAI_API_KEY is currently NOT configured.
+- OpenCode discovers many Google/OpenRouter models, but discovery does NOT mean MEDBOT runtime availability.
+- google/gemini-3.6-flash has been independently verified through OpenCode, but it MUST NOT become the hard-coded primary runtime model.
+- Existing ai_router.py already has Gemini/OpenRouter/OpenAI adapters and failover. Extend/refactor rather than blindly replacing it.
+- Existing ai_registry contains duplicate identities:
+  google_gemini + gemini-flash-lite-latest + same endpoint appears 3 times.
+  google_gemini + gemma-4-26b-a4b-it + same endpoint appears 3 times.
+- Existing source files must be backed up before modification.
+
+OBJECTIVE:
+Turn the existing AI layer into a genuinely dynamic provider/model orchestration foundation.
+
+PHASE 1 SCOPE:
+
+1. BACKUP
+Create a timestamped backup of:
+main.py
+database.py
+search_engine.py
+ai_router.py
+ai_discovery.py
+medbot_v2.sqlite3
+
+2. REGISTRY IDEMPOTENCY
+Implement canonical AI identity:
+(provider, model, endpoint)
+
+The same identity must never create another duplicate registry row.
+
+Implement an idempotent upsert operation:
+- update an existing canonical row when identity exists
+- insert only when identity does not exist
+- preserve non-null historical values when a new update contains NULL
+- preserve useful last_success/last_failure/last_test history
+- never erase successful history with an incomplete discovery result
+
+Add a UNIQUE constraint/index for the canonical identity if safe for the existing schema.
+
+Before adding uniqueness:
+- detect current duplicates
+- merge them safely
+- preserve the best available verified/health/history information
+- then enforce uniqueness
+
+Do NOT recreate the database.
+
+3. PROVIDER MODEL ABSTRACTION
+Make the architecture capable of supporting multiple providers/models dynamically.
+
+At minimum retain/support:
+- Google Gemini direct API
+- OpenRouter API
+- OpenAI-compatible API
+
+Prepare clean adapter structure so additional providers can be added without changing router logic.
+
+Potential future providers may include:
+Anthropic
+Mistral
+Groq
+Together
+DeepSeek
+Cohere
+etc.
+
+Do NOT claim any of them are configured now.
+
+4. CONFIGURATION DISCOVERY
+Read only safe environment variable NAMES.
+
+Support provider credentials when present, for example:
+GEMINI_API_KEY
+OPENROUTER_API_KEY
+OPENAI_API_KEY
+ANTHROPIC_API_KEY
+MISTRAL_API_KEY
+GROQ_API_KEY
+TOGETHER_API_KEY
+DEEPSEEK_API_KEY
+COHERE_API_KEY
+
+Never print their values.
+
+Missing credentials must result in a clear NOT_CONFIGURED state.
+
+5. MODEL DISCOVERY
+Separate:
+DISCOVERED
+CONFIGURED
+AUTHENTICATED
+VERIFIED
+HEALTHY
+UNAVAILABLE
+RATE_LIMITED
+COOLDOWN
+AUTH_FAILED
+UPSTREAM_ERROR
+TIMEOUT
+
+Do not treat a model merely appearing in OpenCode's model list as a usable MEDBOT runtime model.
+
+6. DYNAMIC MODEL POOLS
+The router must not hard-code:
+"gemini-flash-lite-latest is always primary"
+
+Instead:
+- build candidates dynamically
+- use registry health
+- use verified status
+- use recent success rate
+- use latency
+- use cooldown state
+- use error state
+- use provider availability
+- use task suitability/capabilities
+
+7. DYNAMIC SCORING
+Implement a transparent internal score based on:
+- verified status
+- recent success rate
+- latency
+- health
+- cooldown
+- error state
+- capability/task suitability
+
+Do NOT optimize solely for model intelligence.
+
+Do NOT permanently rank Gemini 3.6 first.
+
+A limited model may be used when healthy.
+A temporarily unavailable model must automatically leave the active pool.
+A recovered model may automatically return.
+
+8. FAILURE HANDLING
+Keep the existing distinction.
+
+TRANSIENT:
+- timeout
+- 429
+- temporary network
+- 5xx/upstream temporary
+
+PERMANENT:
+- invalid key
+- authentication failure
+- invalid endpoint
+- unavailable model/configuration
+
+Transient failures:
+- update registry
+- apply cooldown/backoff
+- try another healthy candidate
+
+Permanent failures:
+- mark the candidate appropriately
+- do not endlessly retry it
+
+9. HEALTH/COOLDOWN
+Add practical cooldown timestamps/state if needed.
+
+Requirements:
+- repeated failure should temporarily reduce/remove a candidate
+- successful requests should restore confidence
+- the system must be able to recover a provider automatically later
+- no permanent lockout caused by one failure
+
+10. REGISTRY CLEANUP
+After implementation:
+- duplicate identities must be zero
+- registry must contain canonical rows only
+- existing useful health/history must remain
+
+11. COMPATIBILITY
+Preserve existing public functions used by main.py and ai_discovery.py wherever practical.
+
+Do not break:
+ai_generate()
+ai_generate_grounded()
+run_discovery()
+AIRouter
+GeminiProvider
+OpenRouterProvider
+OpenAIProvider
+
+If signatures must change, update all callers safely.
+
+12. TESTS
+Run:
+- Python compile
+- SQLite integrity_check
+- foreign key test through application DB connection
+- registry duplicate test
+- registry upsert test
+- provider discovery test
+- router construction test
+- scoring test
+- transient failure classification test
+- permanent failure classification test
+- cooldown test
+- existing search regression tests
+- existing contribution state tests
+- existing admin authorization tests
+
+Live AI tests are allowed ONLY for actually configured credentials.
+
+Do not consume unnecessary Gemini requests.
+Prefer local/unit tests for routing logic.
+
+13. REPORT
+Create:
+logs/dynamic-ai-phase1-report-${STAMP}.txt
+
+Sections:
+IMPLEMENTED
+REGISTRY
+PROVIDERS
+ROUTING
+FAILOVER
+COOLDOWN
+TESTED
+DATABASE
+WARNINGS
+REMAINING
+FINAL_STATUS
+
+FINAL_STATUS must be exactly one of:
+COMPLETE
+COMPLETE_WITH_WARNINGS
+BLOCKED
+
+At the end print:
+PHASE1_FINAL_STATUS=<value>
+
+Do not continue into Telegram UX redesign or unrelated features.
+Do not start another long-running autonomous phase.
+Stop after Phase 1 implementation + tests + report.

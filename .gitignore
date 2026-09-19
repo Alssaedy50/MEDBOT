@@ -1,0 +1,79 @@
+# Secrets
+.env
+.env.*
+*.key
+*.pem
+secrets*
+*secret*
+*token*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Databases
+*.sqlite3
+*.sqlite
+*.db
+*.bak
+*.backup
+*.backup-*
+*.sqlite3.bak
+*.sqlite3.backup*
+*.db.bak
+
+# Backups
+backups/
+backup/
+*.bak-*
+*.pre-*.bak
+*.backup-*
+
+# Logs
+logs/
+*.log
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+
+# Temporary
+tmp/
+temp/
+*.tmp
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Any backup / generated historical variants
+*.bak_*
+*.pre-*
+*-backup-*
+*_backup_*
+*-before-*
+*-candidate*
+
+# Secrets / local environment
+.env
+.env.*
+!.env.example
+
+# Runtime data
+logs/
+backups/
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.sqlite3
+*.sqlite3-*
+*.db
+*.zip
