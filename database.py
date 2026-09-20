@@ -2,6 +2,7 @@ import aiosqlite
 import logging
 
 from datetime import datetime, date
+from typing import Tuple
 logger = logging.getLogger(__name__)
 DB_NAME = "medbot_v2.sqlite3"
 
@@ -924,7 +925,7 @@ async def add_sub_admin_by_any(identifier: str) -> tuple[bool, str]:
         if identifier.isdigit():
             tid = int(identifier)
             # محاولة جلب الاسم إن كان مسجلاً في البوت
-            async with db.execute("SELECT full_name FROM users WHERE telegram_id = ?", (tid,)) as cur:
+            async with db.execute("SELECT full_name FROM users WHERE user_id = ?", (tid,)) as cur:
                 row = await cur.fetchone()
             uname = row[0] if row else ""
             await db.execute("INSERT OR REPLACE INTO admins (telegram_id, username) VALUES (?, ?)", (tid, uname))
@@ -932,7 +933,7 @@ async def add_sub_admin_by_any(identifier: str) -> tuple[bool, str]:
             return True, f"تمت إضافة المشرف بنجاح (ID: {tid})"
         else:
             # البحث باليوزر في جدول المستخدمين
-            async with db.execute("SELECT telegram_id, full_name FROM users WHERE full_name LIKE ? OR telegram_id = ?", (f"%{identifier}%", identifier)) as cur:
+            async with db.execute("SELECT user_id, full_name FROM users WHERE full_name LIKE ? OR user_id = ?", (f"%{identifier}%", identifier)) as cur:
                 row = await cur.fetchone()
             if row:
                 tid = row[0]
@@ -984,29 +985,53 @@ async def get_pending_contributions_list():
         await db.close()
 
 async def check_and_increment_quota(user_id: int, max_limit: int = 20) -> Tuple[bool, int]:
+    """
+    Atomically consume one daily AI request.
+
+    BEGIN IMMEDIATE serializes concurrent quota updates so two requests
+    cannot both read the same old count and exceed max_limit.
+    """
     today = date.today().isoformat()
     db = await get_db()
+
     try:
+        await db.execute("BEGIN IMMEDIATE")
+
         cursor = await db.execute(
-            "SELECT request_count FROM daily_ai_usage WHERE user_id = ? AND usage_date = ?",
-            (user_id, today)
+            "SELECT request_count FROM daily_ai_usage "
+            "WHERE user_id = ? AND usage_date = ?",
+            (user_id, today),
         )
         row = await cursor.fetchone()
         current_count = row[0] if row else 0
 
         if current_count >= max_limit:
+            await db.rollback()
             return False, 0
 
         new_count = current_count + 1
 
-        await db.execute("""
-            INSERT INTO daily_ai_usage (user_id, usage_date, request_count)
+        await db.execute(
+            """
+            INSERT INTO daily_ai_usage (
+                user_id,
+                usage_date,
+                request_count
+            )
             VALUES (?, ?, ?)
-            ON CONFLICT(user_id, usage_date) DO UPDATE SET request_count = ?
-        """, (user_id, today, new_count, new_count))
+            ON CONFLICT(user_id, usage_date)
+            DO UPDATE SET request_count = excluded.request_count
+            """,
+            (user_id, today, new_count),
+        )
 
         await db.commit()
         return True, max_limit - new_count
+
+    except Exception:
+        await db.rollback()
+        raise
+
     finally:
         await db.close()
 

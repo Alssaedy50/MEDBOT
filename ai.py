@@ -2,6 +2,7 @@ import os
 import socket
 import logging
 import time
+from random import SystemRandom
 
 import httpx
 from dotenv import load_dotenv
@@ -65,31 +66,7 @@ _DISCOVERY_LAST_RUN = {}
 DISCOVERY_TTL_SECONDS = 900
 
 
-FALLBACKS = (
-    [
-    {
-        "provider": "google_gemini",
-        "model": model,
-        "endpoint": (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent"
-        ),
-    }
-    for model in KNOWN_GOOD_MODELS["google_gemini"]
-]
-    + [
-        {
-            "provider": "groq",
-            "model": "groq/compound",
-            "endpoint": "https://api.groq.com/openai/v1/chat/completions",
-        },
-        {
-            "provider": "openrouter",
-            "model": "nex-agi/nex-n2.5-pro:free",
-            "endpoint": "https://openrouter.ai/api/v1/chat/completions",
-        },
-    ]
-)
+FALLBACKS = ()
 
 
 def _key_for(provider: str) -> str:
@@ -176,17 +153,10 @@ async def _discover_gemini_models(client):
     except Exception as exc:
         logger.warning("Gemini discovery failed: %s", exc)
 
-    return [
-        {
-            "provider": "google_gemini",
-            "model": model,
-            "endpoint": (
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model}:generateContent"
-            ),
-        }
-        for model in KNOWN_GOOD_MODELS["google_gemini"]
-    ]
+    logger.warning(
+        "Gemini discovery unavailable; no speculative fallback models will be used"
+    )
+    return []
 
 
 async def _discover_groq_models(client):
@@ -248,13 +218,25 @@ async def _discover_groq_models(client):
 
 
 async def _discover_openrouter_models(client):
+    """Discover text-generation models that are explicitly free on OpenRouter.
+
+    A model is accepted only when:
+    - it is a text-capable model,
+    - it is not an excluded modality,
+    - and OpenRouter reports zero prompt/completion pricing OR
+      the model ID explicitly uses the :free suffix.
+    """
     if not OR_KEY:
         return []
 
     now = time.time()
     cached = _DISCOVERY_CACHE.get("openrouter")
 
-    if cached and now - _DISCOVERY_LAST_RUN.get("openrouter", 0) < DISCOVERY_TTL_SECONDS:
+    if (
+        cached
+        and now - _DISCOVERY_LAST_RUN.get("openrouter", 0)
+        < DISCOVERY_TTL_SECONDS
+    ):
         return cached
 
     endpoint = "https://openrouter.ai/api/v1/models"
@@ -282,10 +264,13 @@ async def _discover_openrouter_models(client):
             "tts",
             "image",
             "vision",
+            "audio",
+            "transcribe",
+            "speech",
         )
 
         for model in data.get("data", []):
-            model_id = model.get("id", "")
+            model_id = str(model.get("id") or "").strip()
 
             if not model_id:
                 continue
@@ -301,22 +286,47 @@ async def _discover_openrouter_models(client):
             if input_modalities and "text" not in input_modalities:
                 continue
 
+            pricing = model.get("pricing") or {}
+            prompt_price = pricing.get("prompt")
+            completion_price = pricing.get("completion")
+
+            explicitly_free = lowered.endswith(":free")
+
+            try:
+                pricing_free = (
+                    prompt_price is not None
+                    and completion_price is not None
+                    and float(prompt_price) == 0.0
+                    and float(completion_price) == 0.0
+                )
+            except (TypeError, ValueError):
+                pricing_free = False
+
+            if not (explicitly_free or pricing_free):
+                continue
+
             discovered.append({
                 "provider": "openrouter",
                 "model": model_id,
-                "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+                "endpoint": (
+                    "https://openrouter.ai/api/v1/chat/completions"
+                ),
             })
 
         if discovered:
             _DISCOVERY_CACHE["openrouter"] = discovered
             _DISCOVERY_LAST_RUN["openrouter"] = now
+
             logger.info(
-                "OpenRouter discovery found %d candidate models",
+                "OpenRouter free discovery found %d models",
                 len(discovered),
             )
+
             return discovered
 
-        logger.warning("OpenRouter discovery returned no usable models")
+        logger.warning(
+            "OpenRouter discovery returned no explicitly free models"
+        )
 
     except Exception as exc:
         logger.warning("OpenRouter discovery failed: %s", exc)
@@ -462,33 +472,42 @@ async def _probe_model(item):
 
 
 async def _build_active_pool(candidates):
-    """Build a balanced request-time pool from broad discovery."""
+    """Build a request pool using VERIFIED models only.
 
-    if not candidates:
+    Provider diversity is preserved where possible, then the remaining
+    verified models are randomized to avoid deterministic preference for
+    the first model returned by discovery.
+    """
+    verified = [
+        item
+        for item in candidates
+        if item.get("availability") == "VERIFIED"
+        and item.get("provider")
+        and item.get("model")
+        and item.get("endpoint")
+        and not _is_in_cooldown(item)
+        and not (
+            item.get("provider") == "openrouter"
+            and not str(item.get("model")).lower().endswith(":free")
+        )
+    ]
+
+    if not verified:
+        logger.warning("AI active pool: no VERIFIED models available")
         return []
 
-    MAX_POOL = ACTIVE_POOL_SIZE
-    MIN_PER_PROVIDER = 2
+    max_pool = ACTIVE_POOL_SIZE
+    min_per_provider = 2
+
+    rng = SystemRandom()
 
     groups = {}
+    for item in verified:
+        groups.setdefault(item["provider"], []).append(item)
 
-    for item in candidates:
-        provider = item.get("provider", "")
-        groups.setdefault(provider, []).append(item)
-
-    def score(item):
-        availability = item.get("availability", "DISCOVERED")
-
-        return (
-            0 if availability == "VERIFIED" else
-            1 if availability == "AVAILABLE" else
-            2,
-            -(item.get("success_rate") or 0.0),
-            item.get("latency_ms") or 999999,
-        )
-
+    # Randomize within each provider first.
     for items in groups.values():
-        items.sort(key=score)
+        rng.shuffle(items)
 
     pool = []
     seen = set()
@@ -496,51 +515,66 @@ async def _build_active_pool(candidates):
     def add(item):
         key = _model_key(item)
 
-        if key in seen:
+        if key in seen or len(pool) >= max_pool:
             return False
 
         seen.add(key)
         pool.append(item)
         return True
 
-    # First guarantee representation from every provider that has candidates.
-    for provider, items in groups.items():
-        for item in items[:MIN_PER_PROVIDER]:
-            if len(pool) >= MAX_POOL:
+    # Preserve provider diversity.
+    providers = list(groups.keys())
+    rng.shuffle(providers)
+
+    for provider in providers:
+        items = groups[provider]
+
+        for item in items[:min_per_provider]:
+            if len(pool) >= max_pool:
                 break
             add(item)
 
-    # Then fill remaining slots globally by health/performance.
+    # Fill remaining slots randomly from all remaining VERIFIED models.
     remaining = []
 
-    for provider, items in groups.items():
-        for item in items[MIN_PER_PROVIDER:]:
-            remaining.append(item)
+    for items in groups.values():
+        remaining.extend(items[min_per_provider:])
 
-    remaining.sort(key=score)
+    rng.shuffle(remaining)
 
     for item in remaining:
-        if len(pool) >= MAX_POOL:
+        if len(pool) >= max_pool:
             break
         add(item)
 
     logger.info(
-        "AI active pool contains %d/%d models",
+        "AI active pool contains %d VERIFIED models from %d providers",
         len(pool),
-        len(candidates),
+        len({item["provider"] for item in pool}),
     )
 
     return pool
 
 
-
 async def _refresh_discovered_models(candidates):
-    """Probe a tiny rotating sample of the least recently tested models."""
+    """Probe a small rotating sample while preserving provider diversity.
+
+    The old implementation probed the first two DISCOVERED models globally.
+    Because discovery is ordered by provider, that could spend the entire
+    probe budget on Gemini and never verify Groq/OpenRouter.
+
+    We therefore select up to two candidates per provider, with a hard
+    global limit, prioritizing models that have never been tested or were
+    tested least recently.
+    """
     discovered = [
         item
         for item in candidates
         if item.get("availability") == "DISCOVERED"
+        and not _is_in_cooldown(item)
+        and item.get("provider")
     ]
+
     if not discovered:
         return candidates
 
@@ -554,50 +588,102 @@ async def _refresh_discovered_models(candidates):
         logger.exception("Could not load AI registry test timestamps")
         last_test_by_id = {}
 
-    discovered.sort(
-        key=lambda item: (
-            last_test_by_id.get(item.get("id")) is not None,
-            last_test_by_id.get(item.get("id")) or "",
+    groups = {}
+    for item in discovered:
+        groups.setdefault(item["provider"], []).append(item)
+
+    for items in groups.values():
+        items.sort(
+            key=lambda item: (
+                last_test_by_id.get(item.get("id")) is not None,
+                last_test_by_id.get(item.get("id")) or "",
+            )
         )
+
+    # Keep probing bounded to protect provider quotas while ensuring that
+    # available providers get an opportunity to enter the VERIFIED pool.
+    MAX_PROBES_PER_PROVIDER = 2
+    MAX_TOTAL_PROBES = 6
+
+    providers = list(groups.keys())
+    rng = SystemRandom()
+    rng.shuffle(providers)
+
+    selected = []
+
+    # First pass: one candidate from every discovered provider.
+    for provider in providers:
+        if len(selected) >= MAX_TOTAL_PROBES:
+            break
+
+        items = groups[provider]
+        if items:
+            selected.append(items[0])
+
+    # Second pass: one additional candidate per provider.
+    for provider in providers:
+        if len(selected) >= MAX_TOTAL_PROBES:
+            break
+
+        items = groups[provider]
+        if len(items) >= MAX_PROBES_PER_PROVIDER:
+            selected.append(items[1])
+
+    logger.info(
+        "AI probe rotation: selected=%d providers=%d",
+        len(selected),
+        len(providers),
     )
 
-    # At most two probes per refresh to protect provider quotas.
-    for item in discovered[:2]:
+    for item in selected:
         await _probe_model(item)
 
     return candidates
 
 async def _get_candidates():
+    """Discover, register, verify, and build the active AI pool.
+
+    Lifecycle:
+        DISCOVERED -> probe -> VERIFIED -> active pool
+
+    AVAILABLE/UNKNOWN/DISCOVERED models are never used directly.
+    """
     candidates = []
 
+    # --------------------------------------------------------
+    # A. Fresh provider discovery
+    # --------------------------------------------------------
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as discovery_client:
             discovered = await _discover_gemini_models(discovery_client)
             discovered += await _discover_groq_models(discovery_client)
-            discovered += await _discover_openrouter_models(discovery_client)
+            discovered += await _discover_openrouter_models(
+                discovery_client
+            )
 
         for item in discovered:
             if _is_model_suitable_for_medbot(item):
+                item["availability"] = item.get(
+                    "availability",
+                    "DISCOVERED",
+                )
                 candidates.append(item)
 
     except Exception:
         logger.exception("AI discovery stage failed")
 
+    # --------------------------------------------------------
+    # B. Merge persisted registry health
+    # --------------------------------------------------------
     try:
         rows = await database.ai_registry_get_healthy()
 
-        # Prefer VERIFIED over merely AVAILABLE.
-        rows = sorted(
-            rows,
-            key=lambda r: (
-                0 if r[4] == "VERIFIED" else 1,
-                -(r[7] or 0.0),
-                r[6] if r[6] is not None else 999999,
-            ),
-        )
-
         seen = {
-            (x["provider"], x["model"], x["endpoint"])
+            (
+                x["provider"],
+                x["model"],
+                x["endpoint"],
+            )
             for x in candidates
         }
 
@@ -607,10 +693,19 @@ async def _get_candidates():
             if not item["provider"] or not item["model"]:
                 continue
 
-            if not _is_healthy(item["availability"]):
+            if not _key_for(item["provider"]):
                 continue
 
-            if not _key_for(item["provider"]):
+            if not _is_model_suitable_for_medbot(item):
+                continue
+
+            # OpenRouter registry rows do not persist pricing metadata.
+            # Therefore only explicit :free models may survive from
+            # persisted registry data into the active candidate pipeline.
+            if (
+                item["provider"] == "openrouter"
+                and not str(item["model"]).lower().endswith(":free")
+            ):
                 continue
 
             identity = (
@@ -620,61 +715,56 @@ async def _get_candidates():
             )
 
             if identity in seen:
-                # Merge verified/available registry health into the
-                # freshly discovered candidate instead of discarding it.
                 for existing in candidates:
-                    if (
+                    existing_identity = (
                         existing["provider"],
                         existing["model"],
                         existing["endpoint"],
-                    ) == identity:
+                    )
+
+                    if existing_identity == identity:
                         existing.update(item)
-                        existing["availability"] = item["availability"]
-                        existing["id"] = item.get("id")
-                        existing["latency_ms"] = row[6]
-                        existing["success_rate"] = row[7]
                         break
+
                 continue
 
             seen.add(identity)
-            item["latency_ms"] = row[6]
-            item["success_rate"] = row[7]
             candidates.append(item)
 
     except Exception:
         logger.exception("Could not load AI Registry")
 
-    # Always preserve operational fallbacks.
-    seen = {
-        (x["provider"], x["model"], x["endpoint"])
-        for x in candidates
-    }
-
-    for item in FALLBACKS:
-        if not _key_for(item["provider"]):
-            continue
-
-        identity = (
-            item["provider"],
-            item["model"],
-            item["endpoint"],
-        )
-
-        if identity not in seen:
-            candidates.append(item)
-            seen.add(identity)
-
-    candidates = _filter_runtime_healthy(candidates)
+    # --------------------------------------------------------
+    # C. Register candidates without promoting them.
+    # --------------------------------------------------------
     candidates = await _ensure_candidate_registry_ids(candidates)
 
-    candidates = await _build_active_pool(candidates)
+    # --------------------------------------------------------
+    # D. Probe a very small number of unverified candidates.
+    # --------------------------------------------------------
+    candidates = await _refresh_discovered_models(candidates)
+
+    # --------------------------------------------------------
+    # E. Only VERIFIED models are allowed into the pool.
+    # --------------------------------------------------------
+    verified = [
+        item
+        for item in candidates
+        if item.get("availability") == "VERIFIED"
+        and _key_for(item.get("provider"))
+        and not _is_in_cooldown(item)
+    ]
+
+    active_pool = await _build_active_pool(verified)
 
     logger.info(
-        "AI candidate pool contains %d active models",
+        "AI candidate pipeline: discovered=%d verified=%d active=%d",
         len(candidates),
+        len(verified),
+        len(active_pool),
     )
 
-    return candidates
+    return active_pool
 
 
 async def _gemini_request(client, item, prompt):
