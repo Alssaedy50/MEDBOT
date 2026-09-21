@@ -138,7 +138,6 @@ def home_keyboard():
         [
             [
                 btn("📚 MEDBOT Resources", "library:0"),
-                btn("🔎 Search", "search"),
             ],
             [
                 btn("🤖 MEDBOT Assistant", "assistant"),
