@@ -136,7 +136,7 @@ def home_keyboard():
     return InlineKeyboardMarkup(
         [
             [
-                btn("📚 Study Library", "library:0"),
+                btn("📚 MEDBOT Resources", "library:0"),
                 btn("🔎 Search", "search"),
             ],
             [
@@ -200,6 +200,43 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 
+def resource_icon(node_type):
+    """Return a stable icon for a MEDBOT folder/resource type."""
+    value = str(node_type or "").strip().lower()
+
+    return {
+        "book": "📚",
+        "books": "📚",
+        "video": "🎥",
+        "audio": "🎧",
+        "mcq": "📝",
+        "summary": "📑",
+        "summaries": "📑",
+        "image": "🖼",
+        "photo": "🖼",
+        "document": "📄",
+        "doc": "📄",
+        "general": "📁",
+    }.get(value, "📁")
+
+
+def content_icon(file_type):
+    """Return a Telegram-friendly icon for a registered resource."""
+    value = str(file_type or "").strip().lower()
+
+    if value in ("photo", "image", "jpg", "jpeg", "png", "webp"):
+        return "🖼"
+    if value in ("video", "mp4", "mkv", "mov"):
+        return "🎥"
+    if value in ("audio", "mp3", "m4a", "wav"):
+        return "🎧"
+    if value in ("mcq", "quiz"):
+        return "📝"
+    if value in ("pdf",):
+        return "📕"
+    return "📄"
+
+
 def folder_keyboard(folders, parent_id=0):
     rows = []
 
@@ -209,27 +246,19 @@ def folder_keyboard(folders, parent_id=0):
         except Exception:
             continue
 
-        icon = {
-            "books": "📚",
-            "audio": "🎧",
-            "video": "🎥",
-            "MCQ": "📝",
-            "mcq": "📝",
-            "summaries": "📑",
-            "general": "📁",
-        }.get(str(node_type), "📁")
+        icon = resource_icon(node_type)
 
         rows.append(
             [
                 btn(
-                    f"{icon} {str(name)[:35]}",
+                    f"{icon} {str(name)[:40]}",
                     f"folder:{folder_id}",
                 )
             ]
         )
 
     if parent_id != 0:
-        rows.append([btn("⬅️ رجوع", f"library_parent:{parent_id}")])
+        rows.append([btn("⬅️ رجوع", f"library:{parent_id}")])
 
     rows.append([btn("🏠 الرئيسية", "home")])
 
@@ -243,19 +272,30 @@ async def show_library(query, parent_id=0):
         logger.exception("get_folders failed")
         await edit_safe(
             query,
-            f"⚠️ تعذر فتح المكتبة حالياً.\n\n`{exc}`",
+            f"⚠️ تعذر فتح الموارد حالياً.\n\n`{exc}`",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
         return
 
-    title = (
-        "📚 *Study Library*\n\n" "اختر القسم الذي تريد الدخول إليه:"
-        if parent_id == 0
-        else "📚 *Study Library*\n\n" "اختر المجلد:"
-    )
+    if parent_id == 0:
+        title = (
+            "📚 *MEDBOT Resources*\n\n"
+            "اختر السنة أو القسم الذي تريد الدخول إليه:"
+        )
+    else:
+        try:
+            breadcrumb = await database.get_breadcrumbs(parent_id)
+        except Exception:
+            breadcrumb = "📚 MEDBOT Resources"
+
+        title = (
+            "📚 *MEDBOT Resources*\n\n"
+            f"📍 {breadcrumb}\n\n"
+            "اختر القسم:"
+        )
 
     if not folders:
-        title += "\n\nلا توجد مجلدات مسجلة في هذا المستوى حالياً."
+        title += "\n\nℹ️ لا توجد أقسام مسجلة في هذا المستوى حالياً."
 
     await edit_safe(
         query,
@@ -268,36 +308,30 @@ async def show_folder(query, folder_id):
     try:
         folders = await database.get_folders(folder_id)
         files = await database.get_files(folder_id)
+        parent_id = await database.get_parent_id(folder_id)
+        breadcrumb = await database.get_breadcrumbs(folder_id)
+        folder = await database.get_folder(folder_id)
     except Exception as exc:
         logger.exception("Folder loading failed")
         await edit_safe(
             query,
-            "⚠️ تعذر تحميل محتوى المجلد حالياً.",
+            "⚠️ تعذر تحميل محتوى القسم حالياً.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
         return
 
     rows = []
 
-    for folder in folders:
+    # Child folders
+    for folder_item in folders:
         try:
-            child_id, name, node_type, accepts = folder[:4]
-            icon = "📁"
-            if str(node_type) == "books":
-                icon = "📚"
-            elif str(node_type) == "audio":
-                icon = "🎧"
-            elif str(node_type) == "video":
-                icon = "🎥"
-            elif str(node_type).lower() == "mcq":
-                icon = "📝"
-            elif str(node_type) == "summaries":
-                icon = "📑"
+            child_id, name, node_type, accepts = folder_item[:4]
+            icon = resource_icon(node_type)
 
             rows.append(
                 [
                     btn(
-                        f"{icon} {str(name)[:35]}",
+                        f"{icon} {str(name)[:40]}",
                         f"folder:{child_id}",
                     )
                 ]
@@ -305,14 +339,18 @@ async def show_folder(query, folder_id):
         except Exception:
             continue
 
+    # Registered resources
     for item in files:
         try:
             content_id = item[0]
             title = item[1]
+            file_type = item[3]
+            icon = content_icon(file_type)
+
             rows.append(
                 [
                     btn(
-                        f"📄 {str(title)[:35]}",
+                        f"{icon} {str(title)[:40]}",
                         f"file:{content_id}",
                     )
                 ]
@@ -320,17 +358,28 @@ async def show_folder(query, folder_id):
         except Exception:
             continue
 
+    folder_name = folder[2] if folder else "القسم"
+
     if not rows:
-        rows.append([btn("ℹ️ لا توجد موارد هنا", f"noop")])
+        body = (
+            f"📂 *{str(folder_name)[:80]}*\n\n"
+            f"📍 {breadcrumb}\n\n"
+            "ℹ️ لا توجد أقسام أو موارد مسجلة هنا حالياً."
+        )
+    else:
+        body = (
+            f"📂 *{str(folder_name)[:80]}*\n\n"
+            f"📍 {breadcrumb}\n\n"
+            "اختر القسم أو المورد:"
+        )
 
-    rows.append([btn("⬅️ رجوع", "library:0")])
+    # Correct parent-aware navigation.
+    rows.append([btn("⬅️ رجوع", f"library:{parent_id or 0}")])
     rows.append([btn("🏠 الرئيسية", "home")])
-
-    text = "📂 *MEDBOT Library*\n\nاختر مجلداً أو مورداً:"
 
     await edit_safe(
         query,
-        text,
+        body,
         InlineKeyboardMarkup(rows),
     )
 
@@ -347,7 +396,7 @@ async def open_file(query, context, content_id):
             "⚠️ المورد غير موجود أو لم يعد مسجلاً في MEDBOT.",
             InlineKeyboardMarkup(
                 [
-                    [btn("📚 المكتبة", "library:0")],
+                    [btn("📚 MEDBOT Resources", "library:0")],
                     [btn("🏠 الرئيسية", "home")],
                 ]
             ),
@@ -362,7 +411,7 @@ async def open_file(query, context, content_id):
             "⚠️ تعذر قراءة سجل المورد.",
             InlineKeyboardMarkup(
                 [
-                    [btn("📚 المكتبة", "library:0")],
+                    [btn("📚 MEDBOT Resources", "library:0")],
                     [btn("🏠 الرئيسية", "home")],
                 ]
             ),
@@ -377,7 +426,7 @@ async def open_file(query, context, content_id):
             "لكن لا يوجد ملف قابل للإرسال حالياً.",
             InlineKeyboardMarkup(
                 [
-                    [btn("📚 المكتبة", "library:0")],
+                    [btn("📚 MEDBOT Resources", "library:0")],
                     [btn("🏠 الرئيسية", "home")],
                 ]
             ),
@@ -393,7 +442,7 @@ async def open_file(query, context, content_id):
             await context.bot.send_photo(
                 chat_id=chat_id,
                 photo=file_id,
-                caption=f"📄 {title}",
+                caption=f"🖼 {title}",
             )
         elif ft in ("audio", "mp3", "m4a", "wav"):
             await context.bot.send_audio(
@@ -419,7 +468,7 @@ async def open_file(query, context, content_id):
             text="📚 يمكنك العودة إلى المكتبة من هنا:",
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [btn("📚 Study Library", "library:0")],
+                    [btn("📚 MEDBOT Resources", "library:0")],
                     [btn("🏠 الرئيسية", "home")],
                 ]
             ),
@@ -435,7 +484,7 @@ async def open_file(query, context, content_id):
             ),
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [btn("📚 المكتبة", "library:0")],
+                    [btn("📚 MEDBOT Resources", "library:0")],
                     [btn("🏠 الرئيسية", "home")],
                 ]
             ),
