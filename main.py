@@ -51,6 +51,7 @@ from telegram.ext import (
 
 import database
 from ai import generate_medical_ai_response
+from search_engine import search_library_summary
 
 load_dotenv()
 
@@ -498,13 +499,27 @@ async def open_file(query, context, content_id):
 
 async def search_content(query_text):
     """
-    Unified search entry point.
+    Canonical MEDBOT resource search entry point.
 
-    The actual search logic lives in database.search_content().
-    This wrapper keeps main.py backward-compatible while avoiding
-    a second, inconsistent search implementation.
+    search_engine.search_library_summary() returns a stable
+    response object. This wrapper preserves the legacy main.py
+    contract by returning only the result list.
     """
-    return await database.search_content(query_text)
+    response = await search_library_summary(query_text, limit=15)
+
+    if not isinstance(response, dict):
+        raise TypeError(
+            f"Unexpected search response type: {type(response).__name__}"
+        )
+
+    results = response.get("results", [])
+
+    if not isinstance(results, list):
+        raise TypeError(
+            f"Unexpected search results type: {type(results).__name__}"
+        )
+
+    return results
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -522,7 +537,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def run_search(update: Update, query_text):
     try:
         results = await search_content(query_text)
-    except Exception as exc:
+    except Exception:
         logger.exception("Search failed")
         await update.message.reply_text(
             "⚠️ حدث خطأ أثناء البحث.",
@@ -530,62 +545,65 @@ async def run_search(update: Update, query_text):
         )
         return
 
-    context_text = []
-
     if not results:
         await update.message.reply_text(
-            "🔎 *نتيجة البحث*\n\n" "المورد المطلوب غير مسجل حالياً في MEDBOT.",
+            "🔎 *نتيجة البحث*\\n\\n"
+            "المورد المطلوب غير مسجل حالياً في MEDBOT.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=home_keyboard(),
         )
         return
 
+    lines = ["🔎 *نتائج البحث داخل MEDBOT*\\n"]
     buttons = []
 
-    for row in results:
-        try:
-            (
-                content_id,
-                title,
-                file_type,
-                folder_id,
-                folder_name,
-                full_path,
-            ) = row
-        except ValueError:
-            # Backward compatibility with the old 5-column search result.
-            (
-                content_id,
-                title,
-                file_type,
-                folder_id,
-                folder_name,
-            ) = row
-            full_path = folder_name or ""
+    for item in results:
+        result_type = item.get("result_type")
+        item_id = item.get("id")
+        title = item.get("title") or item.get("name") or "بدون عنوان"
+        path = item.get("path") or "بدون مسار"
+        file_type = item.get("file_type")
+        content_count = item.get("content_count", 0)
 
-        context_text.append(f"• {title} — {folder_name or 'بدون قسم'}")
+        if result_type == "FOLDER":
+            icon = "📁"
+            lines.append(
+                f"{icon} *{title}*\\n"
+                f"   🧭 {path}\\n"
+                f"   📄 الموارد: {content_count}"
+            )
+            buttons.append(
+                [btn(f"📁 {str(title)[:35]}", f"folder:{item_id}")]
+            )
 
-        buttons.append(
-            [
-                btn(
-                    f"📄 {str(title)[:35]}",
-                    f"file:{content_id}",
-                )
-            ]
-        )
+        elif result_type == "CONTENT":
+            icon = content_icon(file_type)
+            lines.append(
+                f"{icon} *{title}*\\n"
+                f"   🧭 {path}"
+            )
+            buttons.append(
+                [btn(f"{icon} {str(title)[:35]}", f"file:{item_id}")]
+            )
 
+        elif result_type == "EMPTY_FOLDER":
+            lines.append(
+                f"📁 *{title}*\\n"
+                f"   🧭 {path}\\n"
+                f"   لا توجد موارد مسجلة حالياً."
+            )
+            buttons.append(
+                [btn(f"📁 {str(title)[:35]}", f"folder:{item_id}")]
+            )
+
+    buttons.append([btn("🤖 العودة للمساعد", "assistant")])
     buttons.append([btn("🏠 الرئيسية", "home")])
 
     await update.message.reply_text(
-        "🔎 *نتائج البحث*\n\n" + "\n".join(context_text),
+        "\\n".join(lines),
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(buttons),
     )
-
-
-# ============================================================
-# ACCOUNT / ABOUT
-# ============================================================
 
 
 async def show_account(query):
@@ -1554,6 +1572,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data or ""
 
     if data == "home":
+        context.user_data["search_mode"] = False
+        context.user_data["assistant_mode"] = None
         await show_home(update)
         return
 
@@ -1619,13 +1639,57 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "assistant":
         context.user_data["search_mode"] = False
+        context.user_data["assistant_mode"] = None
         await edit_safe(
             query,
             "🤖 *MEDBOT Assistant*\n\n"
-            "اكتب سؤالك الطبي الآن.\n\n"
-            "سيتم استخدام نظام MEDBOT AI ضمن القواعد والمصادر المسجلة في النظام.",
+            "اختر نوع المساعدة التي تريد استخدامها:\n\n"
+            "📚 *البحث داخل MEDBOT*\n"
+            "ابحث في الكتب والمحاضرات والملخصات وMCQs "
+            "والملفات المسجلة داخل المنصة فقط.\n\n"
+            "🩺 *المساعد الطبي العام*\n"
+            "اسأل عن أي موضوع طبي للدراسة والشرح والفهم.",
             InlineKeyboardMarkup(
                 [
+                    [btn("📚 البحث داخل MEDBOT", "assistant_search")],
+                    [btn("🩺 المساعد الطبي العام", "assistant_medical")],
+                    [btn("📊 Quota", "account")],
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
+        )
+        return
+
+    if data == "assistant_search":
+        context.user_data["search_mode"] = True
+        context.user_data["assistant_mode"] = "resource"
+        await edit_safe(
+            query,
+            "📚 *البحث داخل MEDBOT*\n\n"
+            "اكتب اسم الكتاب أو المحاضرة أو الملف أو الموضوع "
+            "الذي تريد البحث عنه.\n\n"
+            "🔒 سيتم البحث فقط داخل الموارد المسجلة في MEDBOT.",
+            InlineKeyboardMarkup(
+                [
+                    [btn("🤖 العودة للمساعد", "assistant")],
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
+        )
+        return
+
+    if data == "assistant_medical":
+        context.user_data["search_mode"] = False
+        context.user_data["assistant_mode"] = "medical"
+        await edit_safe(
+            query,
+            "🩺 *المساعد الطبي العام*\n\n"
+            "اكتب سؤالك الطبي الآن.\n\n"
+            "يمكنك طلب شرح المفاهيم الطبية، المقارنات، "
+            "الآليات المرضية، الفسيولوجيا، التشريح وغيرها.",
+            InlineKeyboardMarkup(
+                [
+                    [btn("📚 بحث داخل MEDBOT", "assistant_search")],
                     [btn("📊 Quota", "account")],
                     [btn("🏠 الرئيسية", "home")],
                 ]
@@ -1835,19 +1899,50 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if handled:
             return
 
-    # Search mode has priority over AI.
+    # MEDBOT resource-search mode has priority over general AI.
     if context.user_data.get("search_mode"):
         context.user_data["search_mode"] = False
+        context.user_data["assistant_mode"] = None
         await run_search(update, query)
         return
 
+    # Explicit /ask always means Medical AI.
     if query.startswith("/ask"):
         query = query.replace("/ask", "", 1).strip()
+        context.user_data["assistant_mode"] = "medical"
+
+    # If the user is inside the Assistant gateway, route according
+    # to the selected assistant mode instead of guessing the intent.
+    assistant_mode = context.user_data.get("assistant_mode")
+
+    if assistant_mode is None:
+        await update.message.reply_text(
+            "🤖 *MEDBOT Assistant*\n\n"
+            "اختر أولاً نوع المساعدة التي تريد استخدامها:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [btn("📚 البحث داخل MEDBOT", "assistant_search")],
+                    [btn("🩺 المساعد الطبي العام", "assistant_medical")],
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
+        )
+        return
 
     if not query:
         await update.message.reply_text(
             "يرجى كتابة السؤال بعد الأمر مباشرة.",
             parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # Only the General Medical AI mode consumes the daily AI quota.
+    if context.user_data.get("assistant_mode") != "medical":
+        await update.message.reply_text(
+            "⚠️ لم يتم تحديد وضع المساعد بشكل صحيح.\n\n"
+            "يرجى اختيار أحد المسارين من 🤖 MEDBOT Assistant.",
+            reply_markup=home_keyboard(),
         )
         return
 

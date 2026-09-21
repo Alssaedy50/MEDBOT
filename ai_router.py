@@ -38,15 +38,34 @@ SYSTEM_PROMPT = """أنت المساعد الطبي الذكي لمنصة MEDBOT
 4. إذا كان السؤال يحتاج تشخيصاً أو علاجاً شخصياً، وضّح أن الإجابة تعليمية وليست بديلاً عن الطبيب.
 """
 
-GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GROQ_KEY = os.getenv("GROQ_API_KEY", "").strip()
-OR_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+def _clean_api_key(name: str) -> str:
+    value = os.getenv(name, "").strip()
+
+    # Reject obvious placeholders.
+    if not value or value.upper() in {
+        "YOUR_KEY",
+        "YOUR_API_KEY",
+        "CHANGE_ME",
+        "REPLACE_ME",
+        "YOUR_GEMINI_API_KEY",
+        "YOUR_GROQ_API_KEY",
+        "YOUR_OPENROUTER_API_KEY",
+    }:
+        return ""
+
+    return value
+
+
+GEMINI_KEY = _clean_api_key("GEMINI_API_KEY")
+GROQ_KEY = _clean_api_key("GROQ_API_KEY")
+OR_KEY = _clean_api_key("OPENROUTER_API_KEY")
 
 TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
 # Fallback models used only when Registry data is unavailable
 # or the registered provider cannot be reached.
 FALLBACKS = [
+    # Gemini fallback is only enabled when a real Gemini key exists.
     {
         "provider": "google_gemini",
         "model": "gemini-flash-lite-latest",
@@ -54,16 +73,6 @@ FALLBACKS = [
             "https://generativelanguage.googleapis.com/v1beta/models/"
             "gemini-flash-lite-latest:generateContent"
         ),
-    },
-    {
-        "provider": "groq",
-        "model": "groq/compound",
-        "endpoint": "https://api.groq.com/openai/v1/chat/completions",
-    },
-    {
-        "provider": "openrouter",
-        "model": "groq/compound",
-        "endpoint": "https://openrouter.ai/api/v1/chat/completions",
     },
 ]
 
