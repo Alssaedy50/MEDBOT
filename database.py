@@ -317,21 +317,89 @@ async def add_folder(parent_id: int, name: str, node_type: str, accepts_contribu
     return True
 
 async def delete_folder(folder_id: int) -> bool:
+    """Delete an empty folder only. Non-existent or non-empty folders are refused."""
     db = await get_db()
     try:
+        async with db.execute(
+            "SELECT 1 FROM folders WHERE id = ?",
+            (folder_id,),
+        ) as cur:
+            if not await cur.fetchone():
+                return False
+
+        async with db.execute(
+            "SELECT COUNT(*) FROM folders WHERE parent_id = ?",
+            (folder_id,),
+        ) as cur:
+            child_row = await cur.fetchone()
+
+        if child_row and int(child_row[0]) > 0:
+            return False
+
+        async with db.execute(
+            "SELECT COUNT(*) FROM content WHERE folder_id = ?",
+            (folder_id,),
+        ) as cur:
+            content_row = await cur.fetchone()
+
+        if content_row and int(content_row[0]) > 0:
+            return False
+
+        # Contributions reference the folder with ON DELETE CASCADE; deleting
+        # the folder would silently discard student submissions.
+        async with db.execute(
+            "SELECT COUNT(*) FROM contributions WHERE folder_id = ?",
+            (folder_id,),
+        ) as cur:
+            contribution_row = await cur.fetchone()
+
+        if contribution_row and int(contribution_row[0]) > 0:
+            return False
+
         await db.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
         await db.commit()
         return True
     except Exception:
+        logger.exception("delete_folder failed for id=%s", folder_id)
         return False
+    finally:
+        await db.close()
+
+async def get_folder_children_count(folder_id: int) -> int:
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT COUNT(*) FROM folders WHERE parent_id = ?",
+            (folder_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
     finally:
         await db.close()
 
 async def update_folder_name(folder_id: int, new_name: str):
     db = await get_db()
-    await db.execute("UPDATE folders SET name = ? WHERE id = ?", (new_name, folder_id))
-    await db.commit()
-    await db.close()
+    try:
+        cursor = await db.execute(
+            "UPDATE folders SET name = ? WHERE id = ?",
+            (new_name, folder_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+    finally:
+        await db.close()
+
+async def update_folder_type(folder_id: int, node_type: str) -> bool:
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "UPDATE folders SET node_type = ? WHERE id = ?",
+            (node_type, folder_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+    finally:
+        await db.close()
 
 async def update_folder_accepts_contributions(folder_id: int, value: int):
     db = await get_db()
@@ -411,24 +479,42 @@ async def add_content(folder_id: int, title: str, file_id: str, file_type: str, 
     await db.close()
     return cid
 
-async def delete_file(content_id: int):
-    db = await get_db()
-    await db.execute("DELETE FROM content WHERE id = ?", (content_id,))
-    await db.commit()
-    await db.close()
-
 async def get_file_record(content_id: int):
     db = await get_db()
-    async with db.execute("SELECT title, file_id, file_type, source_type, source_contribution_id FROM content WHERE id = ?", (content_id,)) as cur:
-        res = await cur.fetchone()
-    await db.close()
-    return res
+    try:
+        async with db.execute(
+            "SELECT id, folder_id, title, file_id, file_type, source_type, "
+            "source_contribution_id, created_by FROM content WHERE id = ?",
+            (content_id,),
+        ) as cur:
+            res = await cur.fetchone()
+        return res
+    finally:
+        await db.close()
 
 async def update_file_title(content_id: int, new_title: str):
     db = await get_db()
-    await db.execute("UPDATE content SET title = ? WHERE id = ?", (new_title, content_id))
-    await db.commit()
-    await db.close()
+    try:
+        cursor = await db.execute(
+            "UPDATE content SET title = ? WHERE id = ?",
+            (new_title, content_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+    finally:
+        await db.close()
+
+async def update_content_type(content_id: int, file_type: str) -> bool:
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "UPDATE content SET file_type = ? WHERE id = ?",
+            (file_type, content_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+    finally:
+        await db.close()
 
 async def move_content(content_id: int, new_folder_id: int) -> tuple[bool, str]:
     db = await get_db()
@@ -444,6 +530,15 @@ async def move_content(content_id: int, new_folder_id: int) -> tuple[bool, str]:
         return True, "تم نقل الملف بنجاح"
     except Exception as e:
         return False, f"خطأ: {e}"
+    finally:
+        await db.close()
+
+async def delete_file(content_id: int) -> bool:
+    db = await get_db()
+    try:
+        cursor = await db.execute("DELETE FROM content WHERE id = ?", (content_id,))
+        await db.commit()
+        return cursor.rowcount > 0
     finally:
         await db.close()
 
