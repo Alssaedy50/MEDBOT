@@ -54,12 +54,30 @@ class _FakeBot:
     def __init__(self):
         self.sent = []
         self.documents = []
+        self.photos = []
+        self.audios = []
+        self.videos = []
+        self.sent_methods = []
 
     async def send_message(self, **kwargs):
         self.sent.append(kwargs)
+        self.sent_methods.append("send_message")
 
     async def send_document(self, **kwargs):
         self.documents.append(kwargs)
+        self.sent_methods.append("send_document")
+
+    async def send_photo(self, **kwargs):
+        self.photos.append(kwargs)
+        self.sent_methods.append("send_photo")
+
+    async def send_audio(self, **kwargs):
+        self.audios.append(kwargs)
+        self.sent_methods.append("send_audio")
+
+    async def send_video(self, **kwargs):
+        self.videos.append(kwargs)
+        self.sent_methods.append("send_video")
 
 
 class _FakeUpdate:
@@ -625,6 +643,115 @@ class AdminNavigationTests(unittest.IsolatedAsyncioTestCase):
         query = await self._open(self.year_id, user_id=999)
         self.assertIn("غير مصرح", query.last_text)
 
+    async def test_create_child_folder_end_to_end(self):
+        ctx = _FakeContext()
+
+        # Open the child-creation flow for Pathology.
+        start = _FakeQuery(500, f"admin_folder_child:{self.path_id}")
+        await main.callback_router(_FakeUpdate(start), ctx)
+        self.assertTrue(ctx.user_data.get("admin_folder_create"))
+        self.assertEqual(ctx.user_data.get("admin_folder_parent"), self.path_id)
+
+        # Type the name, choose a type, then confirm contribution policy.
+        typed = _TextMessage("New Branch")
+        self.assertTrue(
+            await main.request_admin_folder_name(_MediaUpdate(500, typed), ctx)
+        )
+
+        type_btn = _FakeQuery(500, "admin_folder_type:summaries")
+        await main.callback_router(_FakeUpdate(type_btn), ctx)
+
+        finish = _FakeQuery(500, "admin_folder_accepts:1")
+        await main.callback_router(_FakeUpdate(finish), ctx)
+
+        children = await database.get_folders(self.path_id)
+        created = [c for c in children if c[1] == "New Branch"]
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0][2], "summaries")
+        self.assertEqual(created[0][3], 1)
+        self.assertFalse(ctx.user_data.get("admin_folder_create"))
+        self.assertIsNone(ctx.user_data.get("admin_folder_name"))
+
+    async def test_create_folder_survives_text_after_state_cleared(self):
+        ctx = _FakeContext()
+        start = _FakeQuery(500, f"admin_folder_child:{self.path_id}")
+        await main.callback_router(_FakeUpdate(start), ctx)
+
+        # Admin presses the in-flow "❌ إلغاء" button (-> admin_folders).
+        cancel = _FakeQuery(500, "admin_folders")
+        await main.callback_router(_FakeUpdate(cancel), ctx)
+        self.assertFalse(ctx.user_data.get("admin_folder_create"))
+
+        # A later stray text must not create a folder.
+        before = len(await database.get_folders(self.path_id))
+        typed = _TextMessage("Ghost Folder")
+        handled = await main.request_admin_folder_name(_MediaUpdate(500, typed), ctx)
+        self.assertFalse(handled)
+        after = len(await database.get_folders(self.path_id))
+        self.assertEqual(before, after)
+
+    async def test_leaving_rename_state_via_folder_view_cancels(self):
+        ctx = _FakeContext()
+
+        rename = _FakeQuery(500, f"admin_folder_rename:{self.leaf_id}")
+        await main.callback_router(_FakeUpdate(rename), ctx)
+        self.assertTrue(ctx.user_data.get("admin_folder_rename"))
+
+        # Navigate back into a folder view instead of typing a name.
+        leave = _FakeQuery(500, f"admin_folder:{self.path_id}")
+        await main.callback_router(_FakeUpdate(leave), ctx)
+        self.assertFalse(ctx.user_data.get("admin_folder_rename"))
+
+        # The original name is untouched.
+        self.assertEqual((await database.get_folder(self.leaf_id))[2], "Summaries")
+
+    async def test_toggle_contributions_persists(self):
+        ctx = _FakeContext()
+
+        self.assertEqual(
+            await database.folder_accepts_contributions(self.leaf_id), 0
+        )
+
+        toggle = _FakeQuery(500, f"admin_folder_toggle:{self.leaf_id}")
+        await main.callback_router(_FakeUpdate(toggle), ctx)
+
+        self.assertEqual(
+            await database.folder_accepts_contributions(self.leaf_id), 1
+        )
+
+        # Toggling again flips it back.
+        toggle = _FakeQuery(500, f"admin_folder_toggle:{self.leaf_id}")
+        await main.callback_router(_FakeUpdate(toggle), ctx)
+        self.assertEqual(
+            await database.folder_accepts_contributions(self.leaf_id), 0
+        )
+
+    async def test_move_folder_to_valid_parent_succeeds(self):
+        ctx = _FakeContext()
+
+        # Move the leaf out of Pathology and up to Second Year.
+        move = _FakeQuery(500, f"admin_folder_move_to:{self.leaf_id}:{self.year_id}")
+        await main.callback_router(_FakeUpdate(move), ctx)
+
+        self.assertEqual(
+            await database.get_parent_id(self.leaf_id), self.year_id
+        )
+        # Its resource travels with it.
+        files = await database.get_files(self.leaf_id)
+        self.assertEqual([f[0] for f in files], [self.content_id])
+
+    async def test_delete_empty_folder_via_router(self):
+        ctx = _FakeContext()
+        await database.add_folder(self.path_id, "Doomed", "general")
+        doomed_id = [
+            f[0] for f in await database.get_folders(self.path_id) if f[1] == "Doomed"
+        ][0]
+
+        delete = _FakeQuery(500, f"admin_folder_delete:{doomed_id}")
+        await main.callback_router(_FakeUpdate(delete), ctx)
+
+        self.assertIsNone(await database.get_folder(doomed_id))
+
 
 # ============================================================
 # Contextual contribution breadcrumbs
@@ -632,6 +759,8 @@ class AdminNavigationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ContributionBreadcrumbTests(unittest.IsolatedAsyncioTestCase):
+    """Hierarchical contribution navigation + contextual labels."""
+
     async def asyncSetUp(self):
         self.tmp_dir = tempfile.mkdtemp(prefix="medbot-contrib-")
         self.db_path = os.path.join(self.tmp_dir, "test.sqlite3")
@@ -654,35 +783,111 @@ class ContributionBreadcrumbTests(unittest.IsolatedAsyncioTestCase):
                 pass
         os.rmdir(self.tmp_dir)
 
-    async def _labels(self):
+    async def _open_contributions(self, context=None):
+        context = context or _FakeContext()
         query = _FakeQuery(999, "contribute")
-        await main.callback_router(_FakeUpdate(query), _FakeContext())
+        await main.callback_router(_FakeUpdate(query), context)
+        return query, context
+
+    def _buttons(self, query):
         return [
-            button.text
+            (button.text, button.callback_data)
             for row in query.last_markup.inline_keyboard
             for button in row
         ]
 
-    async def test_contribution_label_includes_parent(self):
-        labels = await self._labels()
-        self.assertTrue(
-            any("باطنة" in label and "عملي" in label for label in labels),
-            labels,
+    async def test_contribute_enables_contribution_mode(self):
+        _, context = await self._open_contributions()
+        self.assertTrue(context.user_data.get("contribution_mode"))
+
+    async def test_root_level_shows_only_root_folders(self):
+        query, _ = await self._open_contributions()
+        texts = [text for text, _ in self._buttons(query)]
+
+        self.assertTrue(any("باطنة" in text for text in texts), texts)
+        # The opted-in child is not listed at the root level any more.
+        self.assertFalse(any("عملي" in text for text in texts), texts)
+
+    async def test_drill_down_reaches_opted_in_leaf(self):
+        context = _FakeContext()
+
+        # Root -> parent shows the child.
+        parent_query = _FakeQuery(999, f"contrib_folder:{self.parent_id}")
+        await main.callback_router(_FakeUpdate(parent_query), context)
+
+        labels = self._buttons(parent_query)
+        texts = [text for text, _ in labels]
+        self.assertTrue(any("عملي" in text for text in texts), texts)
+
+        # Parent -> child: opted-in leaf becomes the send target.
+        child_query = _FakeQuery(999, f"contrib_folder:{self.child_id}")
+        await main.callback_router(_FakeUpdate(child_query), context)
+
+        self.assertEqual(
+            context.user_data.get("contribution_folder"), self.child_id
         )
+
+    async def test_leaf_accepting_folder_shows_send_button(self):
+        await database.update_folder_accepts_contributions(self.parent_id, 1)
+
+        query = _FakeQuery(999, f"contrib_folder:{self.parent_id}")
+        context = _FakeContext()
+        await main.callback_router(_FakeUpdate(query), context)
+
+        callbacks = [cb for _, cb in self._buttons(query)]
+        self.assertIn(f"contrib_submit_here:{self.parent_id}", callbacks)
+
+    async def test_submit_here_sets_target_folder(self):
+        await database.update_folder_accepts_contributions(self.parent_id, 1)
+
+        query = _FakeQuery(999, f"contrib_submit_here:{self.parent_id}")
+        context = _FakeContext()
+        await main.callback_router(_FakeUpdate(query), context)
+
+        self.assertEqual(
+            context.user_data.get("contribution_folder"), self.parent_id
+        )
+
+    async def test_navigation_back_to_root(self):
+        context = _FakeContext()
+        query = _FakeQuery(999, f"contrib_folder:{self.parent_id}")
+        await main.callback_router(_FakeUpdate(query), context)
+
+        root_query = _FakeQuery(999, "contribute_root")
+        await main.callback_router(_FakeUpdate(root_query), context)
+
+        texts = [text for text, _ in self._buttons(root_query)]
+        self.assertTrue(any("باطنة" in text for text in texts), texts)
 
     async def test_contribution_label_respects_length_limit(self):
-        await database.add_folder(
-            self.parent_id, "ط" * 60, "general", 1
-        )
-        labels = await self._labels()
-        for label in labels:
-            body = label.replace("📥 ", "")
-            self.assertLessEqual(len(body), 40, label)
+        await database.add_folder(self.parent_id, "ط" * 60, "general", 1)
 
-    async def test_contribution_label_handles_root_folder(self):
-        await database.add_folder(0, "مستقل", "general", 1)
-        labels = await self._labels()
-        self.assertTrue(any("مستقل" in label for label in labels), labels)
+        query = _FakeQuery(999, f"contrib_folder:{self.parent_id}")
+        await main.callback_router(_FakeUpdate(query), _FakeContext())
+
+        for text, _ in self._buttons(query):
+            body = text.replace("📁 ", "").replace("📥 ", "")
+            self.assertLessEqual(len(body), 40, text)
+
+    async def test_missing_folder_does_not_crash_or_keep_state(self):
+        context = _FakeContext()
+        query = _FakeQuery(999, "contrib_folder:999999")
+        await main.callback_router(_FakeUpdate(query), context)
+
+        self.assertFalse(context.user_data.get("contribution_folder"))
+        self.assertTrue(query.answered)
+
+    async def test_media_submission_clears_contribution_state(self):
+        context = _FakeContext()
+        context.user_data["contribution_folder"] = self.child_id
+        context.user_data["contribution_mode"] = True
+
+        msg = _MediaMessage(document=_FakeDoc("fid-contrib", "note.pdf"))
+        await main.media_router(_MediaUpdate(999, msg), context)
+
+        self.assertFalse(context.user_data.get("contribution_folder"))
+        self.assertFalse(context.user_data.get("contribution_mode"))
+        self.assertTrue(msg.replies)
 
 
 # ============================================================
@@ -1041,6 +1246,1075 @@ class OwnerToolsTests(unittest.IsolatedAsyncioTestCase):
         recipients = await database.get_all_user_ids()
         await main._dispatch_broadcast(ctx, recipients, "hello", 700)
         self.assertTrue(ctx.bot.sent)
+
+
+# ============================================================
+# Advanced suite — MCQ, leaderboard, filters, notifications
+# ============================================================
+
+
+class AdvancedSuiteTests(unittest.IsolatedAsyncioTestCase):
+    """Shared isolated database for the advanced feature set."""
+
+    async def asyncSetUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="medbot-adv-")
+        self.db_path = os.path.join(self.tmp_dir, "test.sqlite3")
+        self._old = database.DB_NAME
+        self._old_search = __import__("search_engine").DB_NAME
+        database.DB_NAME = self.db_path
+        __import__("search_engine").DB_NAME = self.db_path
+        await database.init_db()
+
+        self.admin_id = 500
+        await database.add_sub_admin(self.admin_id, "admin")
+        await database.register_user(self.admin_id, "admin", "Admin User")
+
+        await database.add_folder(0, "Block A", "general")
+        self.root_id = (await database.get_folders(0))[0][0]
+
+        await database.add_folder(self.root_id, "Theory", "mcq")
+        self.sub_id = (await database.get_folders(self.root_id))[0][0]
+
+    async def asyncTearDown(self):
+        database.DB_NAME = self._old
+        __import__("search_engine").DB_NAME = self._old_search
+        for name in os.listdir(self.tmp_dir):
+            try:
+                os.remove(os.path.join(self.tmp_dir, name))
+            except OSError:
+                pass
+        os.rmdir(self.tmp_dir)
+
+    def _buttons(self, query):
+        return [
+            (button.text, button.callback_data)
+            for row in query.last_markup.inline_keyboard
+            for button in row
+        ]
+
+    # ---------------- MCQ grading logic ----------------
+
+    async def test_mcq_grading_logic_direct(self):
+        import mcq_engine
+
+        question = {
+            "id": 1,
+            "options": ["A", "B", "C"],
+            "correct_index": 1,
+            "explanation": "e",
+        }
+
+        self.assertTrue(mcq_engine.is_correct(question, 1))
+        self.assertFalse(mcq_engine.is_correct(question, 2))
+        self.assertFalse(mcq_engine.is_correct(question, "not-a-number"))
+        self.assertFalse(mcq_engine.is_correct(question, -1))
+
+    async def test_mcq_malformed_question_never_raises(self):
+        import mcq_engine
+
+        # Out-of-range correct index.
+        self.assertFalse(
+            mcq_engine.is_correct({"options": ["A"], "correct_index": 5}, 0)
+        )
+        # Missing options.
+        self.assertFalse(mcq_engine.is_correct({"correct_index": 0}, 0))
+        # Non-dict.
+        self.assertFalse(mcq_engine.is_correct(None, 0))
+
+    async def test_mcq_session_score_and_summary(self):
+        import mcq_engine
+
+        questions = [
+            {"id": 1, "options": ["A", "B"], "correct_index": 0, "explanation": ""},
+            {"id": 2, "options": ["A", "B"], "correct_index": 1, "explanation": ""},
+        ]
+
+        session = mcq_engine.fresh_session(questions)
+        self.assertEqual(session["total"], 2)
+
+        first = mcq_engine.record_answer(session, 0)  # correct
+        self.assertTrue(first["correct"])
+        self.assertTrue(mcq_engine.advance(session))
+
+        second = mcq_engine.record_answer(session, 1)  # correct
+        self.assertTrue(second["correct"])
+        self.assertFalse(mcq_engine.advance(session))
+
+        summary = mcq_engine.score_summary(session)
+        self.assertEqual(summary["score"], 2)
+        self.assertEqual(summary["percentage"], 100.0)
+
+    async def test_mcq_empty_bank_shows_no_start_button(self):
+        query = _FakeQuery(999, "mcq_menu")
+        await main.callback_router(_FakeUpdate(query), _FakeContext())
+
+        callbacks = [cb for _, cb in self._buttons(query)]
+        self.assertNotIn("mcq_start", callbacks)
+        self.assertIn("home", callbacks)
+
+    async def test_mcq_full_flow_grades_and_scores(self):
+        await database.add_mcq_question(
+            self.sub_id, "Q one?", ["alpha", "beta"], 0, "because alpha"
+        )
+        await database.add_mcq_question(
+            self.sub_id, "Q two?", ["gamma", "delta"], 1, "because delta"
+        )
+
+        context = _FakeContext()
+
+        menu = _FakeQuery(999, "mcq_menu")
+        await main.callback_router(_FakeUpdate(menu), context)
+        self.assertIn("mcq_start", [cb for _, cb in self._buttons(menu)])
+
+        start = _FakeQuery(999, "mcq_start")
+        await main.callback_router(_FakeUpdate(start), context)
+        session = context.user_data.get("mcq_session")
+        self.assertEqual(session["total"], 2)
+
+        question_id = session["questions"][0]["id"]
+
+        answer = _FakeQuery(999, f"mcq_answer:{question_id}:0")
+        await main.callback_router(_FakeUpdate(answer), context)
+        self.assertEqual(context.user_data["mcq_session"]["score"], 1)
+
+        nxt = _FakeQuery(999, "mcq_next")
+        await main.callback_router(_FakeUpdate(nxt), context)
+
+        second_id = context.user_data["mcq_session"]["questions"][1]["id"]
+        answer2 = _FakeQuery(999, f"mcq_answer:{second_id}:0")
+        await main.callback_router(_FakeUpdate(answer2), context)
+
+        finish = _FakeQuery(999, "mcq_finish")
+        await main.callback_router(_FakeUpdate(finish), context)
+
+        self.assertIn("1", finish.last_text)
+        self.assertNotIn("mcq_session", context.user_data)
+
+    async def test_mcq_stale_answer_does_not_change_score(self):
+        await database.add_mcq_question(
+            self.sub_id, "Only Q?", ["a", "b"], 0, ""
+        )
+
+        context = _FakeContext()
+        start = _FakeQuery(999, "mcq_start")
+        await main.callback_router(_FakeUpdate(start), context)
+
+        # Wrong question key: must be ignored without scoring.
+        stale = _FakeQuery(999, "mcq_answer:99999:0")
+        await main.callback_router(_FakeUpdate(stale), context)
+
+        self.assertEqual(context.user_data["mcq_session"]["score"], 0)
+
+    async def test_mcq_exit_clears_session(self):
+        await database.add_mcq_question(self.sub_id, "Q?", ["a", "b"], 0, "")
+
+        context = _FakeContext()
+        await main.callback_router(
+            _FakeUpdate(_FakeQuery(999, "mcq_start")), context
+        )
+        await main.callback_router(
+            _FakeUpdate(_FakeQuery(999, "mcq_exit")), context
+        )
+
+        self.assertNotIn("mcq_session", context.user_data)
+
+    async def test_mcq_malformed_answer_callback_survives(self):
+        for data in ("mcq_answer:", "mcq_answer:abc", "mcq_answer:1:x"):
+            query = _FakeQuery(999, data)
+            await main.callback_router(_FakeUpdate(query), _FakeContext())
+            self.assertTrue(query.answered, data)
+
+    # ---------------- MCQ admin registration + security ----------------
+
+    async def test_admin_mcq_requires_ai_permission(self):
+        await database.add_folder(0, "Temp", "general")
+
+        # A non-admin must never reach the MCQ admin surface.
+        query = _FakeQuery(999, "admin_mcq")
+        await main.callback_router(_FakeUpdate(query), _FakeContext())
+        self.assertIn("غير مصرح", query.last_text)
+
+    async def test_subadmin_without_ai_permission_blocked(self):
+        await database.add_sub_admin(777, "sub")
+        await database.add_sub_admin_record(
+            777,
+            permissions={
+                "can_folders": True,
+                "can_content": False,
+                "can_contributions": False,
+                "can_ai": False,
+            },
+        )
+
+        query = _FakeQuery(777, "admin_mcq")
+        await main.callback_router(_FakeUpdate(query), _FakeContext())
+        self.assertIn("لا تملك الصلاحية", query.last_text)
+
+    async def test_admin_mcq_registration_full_flow(self):
+        context = _FakeContext()
+
+        start = _FakeQuery(self.admin_id, "admin_mcq_add")
+        await main.callback_router(_FakeUpdate(start), context)
+        self.assertEqual(context.user_data.get("admin_mcq_step"), "folder")
+
+        pick = _FakeQuery(self.admin_id, f"admin_mcq_folder:{self.sub_id}")
+        await main.callback_router(_FakeUpdate(pick), context)
+        self.assertEqual(context.user_data.get("admin_mcq_step"), "text")
+
+        text_msg = _TextMessage("Which enzyme is deficient?")
+        handled = await main.handle_mcq_text_input(
+            _MediaUpdate(self.admin_id, text_msg), context
+        )
+        self.assertTrue(handled)
+        self.assertEqual(context.user_data.get("admin_mcq_step"), "options")
+
+        options_msg = _TextMessage("Option One\nOption Two\nOption Three")
+        handled = await main.handle_mcq_text_input(
+            _MediaUpdate(self.admin_id, options_msg), context
+        )
+        self.assertTrue(handled)
+        self.assertEqual(context.user_data.get("admin_mcq_step"), "correct")
+
+        correct = _FakeQuery(self.admin_id, "admin_mcq_correct:1")
+        await main.callback_router(_FakeUpdate(correct), context)
+        self.assertEqual(context.user_data.get("admin_mcq_step"), "explanation")
+
+        skip = _FakeQuery(self.admin_id, "admin_mcq_skip_explanation")
+        await main.callback_router(_FakeUpdate(skip), context)
+
+        questions = await database.get_mcq_questions(self.sub_id)
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(questions[0]["correct_index"], 1)
+        self.assertEqual(len(questions[0]["options"]), 3)
+
+        # State fully cleared.
+        for key in ("admin_mcq_step", "admin_mcq_text", "admin_mcq_correct"):
+            self.assertNotIn(key, context.user_data)
+
+    async def test_mcq_option_validation_rejects_single_option(self):
+        context = _FakeContext()
+        context.user_data["admin_mcq_step"] = "options"
+
+        msg = _TextMessage("Only one option")
+        handled = await main.handle_mcq_text_input(
+            _MediaUpdate(self.admin_id, msg), context
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(context.user_data.get("admin_mcq_step"), "options")
+        self.assertTrue(msg.replies)
+
+    async def test_mcq_media_during_text_step_does_not_corrupt(self):
+        context = _FakeContext()
+        context.user_data["admin_mcq_step"] = "text"
+
+        msg = _MediaMessage(document=_FakeDoc("fid", "file.pdf"))
+        handled = await main.handle_mcq_text_input(
+            _MediaUpdate(self.admin_id, msg), context
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(context.user_data.get("admin_mcq_step"), "text")
+        self.assertNotIn("admin_mcq_text", context.user_data)
+
+    async def test_cancel_clears_mcq_state(self):
+        context = _FakeContext()
+        context.user_data["admin_mcq_step"] = "text"
+
+        msg = _TextMessage("/cancel")
+        await main.cancel_command(_MediaUpdate(self.admin_id, msg), context)
+
+        self.assertNotIn("admin_mcq_step", context.user_data)
+
+    # ---------------- Leaderboard ----------------
+
+    async def test_leaderboard_open_uses_approved_only(self):
+        for uid, name in ((101, "Student One"), (102, "Student Two"), (103, "Student Three")):
+            await database.register_user(uid, f"u{uid}", name)
+
+        approved_a = await database.add_contribution(
+            101, "Student One", self.root_id, "T", "f1", "document"
+        )
+        approved_b = await database.add_contribution(
+            101, "Student One", self.root_id, "T", "f2", "document"
+        )
+        approved_c = await database.add_contribution(
+            102, "Student Two", self.root_id, "T", "f3", "document"
+        )
+        rejected = await database.add_contribution(
+            103, "Student Three", self.root_id, "T", "f4", "document"
+        )
+        pending = await database.add_contribution(
+            103, "Student Three", self.root_id, "T", "f5", "document"
+        )
+
+        await database.approve_contribution(approved_a)
+        await database.approve_contribution(approved_b)
+        await database.approve_contribution(approved_c)
+        await database.reject_contribution(rejected)
+        # 'pending' intentionally left pending.
+
+        top = await database.get_top_contributors(limit=10)
+
+        self.assertEqual(len(top), 2)
+        self.assertEqual(top[0]["user_id"], 101)
+        self.assertEqual(top[0]["approved_count"], 2)
+        self.assertEqual(top[1]["user_id"], 102)
+        self.assertEqual(top[1]["approved_count"], 1)
+
+        # The rejected/pending-only contributor must not appear.
+        self.assertNotIn(103, [entry["user_id"] for entry in top])
+
+    async def test_leaderboard_render_shows_contributors(self):
+        await database.register_user(101, "stud1", "Student One")
+        cid = await database.add_contribution(
+            101, "Student One", self.root_id, "T", "f1", "document"
+        )
+        await database.approve_contribution(cid)
+
+        query = _FakeQuery(999, "leaderboard")
+        await main.callback_router(_FakeUpdate(query), _FakeContext())
+
+        self.assertIn("Student One", query.last_text)
+        self.assertIn("لوحة المتصدرين", query.last_text)
+
+    async def test_leaderboard_empty_state(self):
+        query = _FakeQuery(999, "leaderboard")
+        await main.callback_router(_FakeUpdate(query), _FakeContext())
+
+        self.assertIn("لا يوجد متصدرون", query.last_text)
+
+    async def test_leaderboard_limit_respected(self):
+        for uid in range(200, 215):
+            await database.register_user(uid, f"u{uid}", f"Student {uid}")
+            cid = await database.add_contribution(
+                uid, f"Student {uid}", self.root_id, "T", f"f{uid}", "document"
+            )
+            await database.approve_contribution(cid)
+
+        top = await database.get_top_contributors(limit=10)
+        self.assertEqual(len(top), 10)
+
+    # ---------------- Search filters ----------------
+
+    async def test_search_type_filter_restricts_results(self):
+        await database.add_content(
+            self.root_id, "Heart Lecture #ExamTrap", "f1", "document"
+        )
+        await database.add_content(self.root_id, "Heart Diagram", "f2", "photo")
+        await database.add_content(self.root_id, "Heart Sounds", "f3", "audio")
+
+        docs = await main.search_content("Heart", types=["document"])
+        self.assertEqual([r["title"] for r in docs], ["Heart Lecture #ExamTrap"])
+
+        photos = await main.search_content("Heart", types=["photo"])
+        self.assertEqual([r["title"] for r in photos], ["Heart Diagram"])
+
+        media = await main.search_content("Heart", types=["audio", "video"])
+        self.assertEqual([r["title"] for r in media], ["Heart Sounds"])
+
+    async def test_search_tag_filter(self):
+        await database.add_content(
+            self.root_id, "Tagged Resource #ClinicalRelevance", "f1", "document"
+        )
+        await database.add_content(self.root_id, "Plain Resource", "f2", "document")
+
+        tagged = await main.search_content("Resource", tag="#ClinicalRelevance")
+        self.assertEqual(len(tagged), 1)
+        self.assertIn("#ClinicalRelevance", tagged[0]["title"])
+
+    async def test_search_mcq_type_filter(self):
+        await database.add_mcq_question(
+            self.sub_id, "Heart anatomy question", ["a", "b"], 0, ""
+        )
+
+        mcqs = await main.search_content("Heart", types=["mcq"])
+        self.assertEqual(len(mcqs), 1)
+        self.assertEqual(mcqs[0]["result_type"], "MCQ")
+
+    async def test_search_filter_toggle_reruns_last_search(self):
+        await database.add_content(self.root_id, "Heart Lecture", "f1", "document")
+        await database.add_content(self.root_id, "Heart Diagram", "f2", "photo")
+
+        context = _FakeContext()
+
+        # Results screen populates last_search.
+        msg = _TextMessage("Heart")
+        context.user_data["search_mode"] = True
+        await main.run_search(_MediaUpdate(999, msg), "Heart", context)
+        self.assertEqual(context.user_data.get("last_search"), "Heart")
+
+        # Toggling the document filter re-renders into a callback message.
+        toggle = _FakeQuery(999, "search_type:document")
+        await main.callback_router(_FakeUpdate(toggle), context)
+
+        self.assertEqual(context.user_data.get("search_types"), ["document"])
+        self.assertIn("Heart Lecture", toggle.last_text)
+        self.assertNotIn("Heart Diagram", toggle.last_text)
+
+    async def test_search_filters_clear(self):
+        context = _FakeContext()
+        context.user_data["search_types"] = ["document"]
+        context.user_data["search_tag"] = "#ExamTrap"
+
+        query = _FakeQuery(999, "search_filters_clear")
+        await main.callback_router(_FakeUpdate(query), context)
+
+        self.assertNotIn("search_types", context.user_data)
+        self.assertNotIn("search_tag", context.user_data)
+
+    async def test_search_tag_toggle(self):
+        await database.add_content(
+            self.root_id, "Resource #HighYield", "f1", "document"
+        )
+
+        context = _FakeContext()
+        msg = _TextMessage("Resource")
+        await main.run_search(_MediaUpdate(999, msg), "Resource", context)
+
+        on = _FakeQuery(999, "search_tag:#HighYield")
+        await main.callback_router(_FakeUpdate(on), context)
+        self.assertEqual(context.user_data.get("search_tag"), "#HighYield")
+
+        off = _FakeQuery(999, "search_tag:#HighYield")
+        await main.callback_router(_FakeUpdate(off), context)
+        self.assertNotIn("search_tag", context.user_data)
+
+    async def test_malformed_filter_callbacks_never_crash(self):
+        for data in ("search_type:", "search_type:zzz", "search_tag:",
+                     "search_type:document:extra"):
+            query = _FakeQuery(999, data)
+            await main.callback_router(_FakeUpdate(query), _FakeContext())
+            self.assertTrue(query.answered, data)
+
+    # ---------------- Notifications ----------------
+
+    async def test_publication_alert_only_from_stored_metadata(self):
+        folder = await database.get_folder(self.root_id)
+        text = main._build_publication_alert("Real Title", folder[2], "test")
+
+        self.assertIn("Real Title", text)
+        self.assertIn(folder[2], text)
+
+    async def test_notification_recipients_exclude_optouts(self):
+        await database.register_user(601, "a", "A")
+        await database.register_user(602, "b", "B")
+
+        recipients = await database.get_notification_recipients()
+        self.assertIn(601, recipients)
+        self.assertIn(602, recipients)
+
+        await database.set_notifications_enabled(602, False)
+        recipients = await database.get_notification_recipients()
+
+        self.assertIn(601, recipients)
+        self.assertNotIn(602, recipients)
+
+    async def test_notify_new_resource_sends_to_subscribers(self):
+        await database.register_user(601, "a", "A")
+        await database.register_user(602, "b", "B")
+
+        context = _FakeContext()
+        sent = await main.notify_new_resource(
+            context, "Heart Lecture", self.root_id
+        )
+
+        chat_ids = [call["chat_id"] for call in context.bot.sent]
+        self.assertIn(601, chat_ids)
+        self.assertIn(602, chat_ids)
+        self.assertEqual(sent, len(chat_ids))
+        self.assertGreaterEqual(sent, 2)
+
+    async def test_notify_new_resource_survives_send_failures(self):
+        class _FlakyBot:
+            def __init__(self):
+                self.sent = []
+
+            async def send_message(self, **kwargs):
+                if kwargs["chat_id"] == 601:
+                    raise RuntimeError("Forbidden: bot was blocked by the user")
+                self.sent.append(kwargs)
+
+        await database.register_user(601, "a", "A")
+        await database.register_user(602, "b", "B")
+
+        context = _FakeContext()
+        context.bot = _FlakyBot()
+
+        sent = await main.notify_new_resource(context, "Title", self.root_id)
+
+        # The blocked recipient is skipped; the rest still receive the alert.
+        self.assertNotIn(601, [call["chat_id"] for call in context.bot.sent])
+        self.assertIn(602, [call["chat_id"] for call in context.bot.sent])
+        self.assertEqual(sent, len(context.bot.sent))
+
+    async def test_notify_new_resource_never_raises_without_recipients(self):
+        # Opt every registered user out of publication alerts.
+        for user_id in await database.get_all_user_ids():
+            await database.set_notifications_enabled(user_id, False)
+
+        context = _FakeContext()
+        sent = await main.notify_new_resource(context, "Title", self.root_id)
+        self.assertEqual(sent, 0)
+        self.assertEqual(context.bot.sent, [])
+
+    async def test_account_notification_toggle_round_trip(self):
+        await database.register_user(999, "stu", "Student Nine")
+
+        context = _FakeContext()
+        account = _FakeQuery(999, "account")
+        await main.callback_router(_FakeUpdate(account), context)
+        self.assertIn("مفعّلة", account.last_text)
+
+        toggle = _FakeQuery(999, "toggle_notifications")
+        await main.callback_router(_FakeUpdate(toggle), context)
+        self.assertIn("معطّلة", toggle.last_text)
+        self.assertFalse(await database.notifications_enabled(999))
+
+        again = _FakeQuery(999, "toggle_notifications")
+        await main.callback_router(_FakeUpdate(again), context)
+        self.assertTrue(await database.notifications_enabled(999))
+
+    async def test_approval_schedules_publication_notification(self):
+        await database.register_user(601, "a", "A")
+        cid = await database.add_contribution(
+            601, "A", self.root_id, "Approved Resource", "f1", "document"
+        )
+
+        context = _FakeContext()
+        query = _FakeQuery(self.admin_id, f"approve:{cid}")
+        await main.callback_router(_FakeUpdate(query), context)
+
+        # Scheduled via the application task queue, not awaited inline.
+        self.assertEqual(len(context.application.tasks), 1)
+
+    async def test_rejection_does_not_schedule_notification(self):
+        cid = await database.add_contribution(
+            601, "A", self.root_id, "Rejected Resource", "f1", "document"
+        )
+
+        context = _FakeContext()
+        query = _FakeQuery(self.admin_id, f"reject:{cid}")
+        await main.callback_router(_FakeUpdate(query), context)
+
+        self.assertEqual(len(context.application.tasks), 0)
+
+    async def test_duplicate_approval_does_not_republish(self):
+        cid = await database.add_contribution(
+            601, "A", self.root_id, "Once Only", "f1", "document"
+        )
+
+        context = _FakeContext()
+        first = _FakeQuery(self.admin_id, f"approve:{cid}")
+        await main.callback_router(_FakeUpdate(first), context)
+
+        second = _FakeQuery(self.admin_id, f"approve:{cid}")
+        await main.callback_router(_FakeUpdate(second), context)
+
+        # Exactly one publication occurred.
+        self.assertEqual(len(context.application.tasks), 1)
+        files = await database.get_files(self.root_id)
+        self.assertEqual(len(files), 1)
+
+
+# ============================================================
+# Malformed callback fuzzing — the router must never raise
+# ============================================================
+
+
+class CallbackFuzzTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="medbot-fuzz-")
+        self.db_path = os.path.join(self.tmp_dir, "test.sqlite3")
+        self._old = database.DB_NAME
+        database.DB_NAME = self.db_path
+        await database.init_db()
+
+        self.admin_id = 500
+        await database.add_sub_admin(self.admin_id, "admin")
+        await database.register_user(self.admin_id, "admin", "Admin User")
+
+        await database.add_folder(0, "Root", "general")
+        self.root_id = (await database.get_folders(0))[0][0]
+
+    async def asyncTearDown(self):
+        database.DB_NAME = self._old
+        for name in os.listdir(self.tmp_dir):
+            try:
+                os.remove(os.path.join(self.tmp_dir, name))
+            except OSError:
+                pass
+        os.rmdir(self.tmp_dir)
+
+    MALFORMED = [
+        "",
+        "::::",
+        "admin_folder:",
+        "admin_folder:abc",
+        "admin_folder:999999",
+        "admin_folder:-1",
+        "admin_folder:1.5",
+        "admin_folder_rename:",
+        "admin_folder_rename:abc",
+        "admin_folder_rename:999999",
+        "admin_folder_toggle:999999",
+        "admin_folder_toggle:abc",
+        "admin_folder_settype:999999:general",
+        "admin_folder_settype:abc:general",
+        "admin_folder_settype:1:not_a_type",
+        "admin_folder_settype:1",
+        "admin_folder_move:999999",
+        "admin_folder_move:abc",
+        "admin_folder_delete:999999",
+        "admin_folder_delete:abc",
+        "folder:999999",
+        "folder:abc",
+        "library:999999",
+        "library:abc",
+        "open_file:999999",
+        "open_file:abc",
+        "contrib_folder:999999",
+        "contrib_folder:abc",
+        "review:999999",
+        "review:abc",
+        "approve:999999",
+        "approve:abc",
+        "reject:999999",
+        "reject:abc",
+        "admin_file_rename:999999",
+        "admin_file_delete:999999",
+        "admin_file_move:999999",
+        "mcq_answer:999999:999",
+        "mcq_answer:abc:abc",
+        "admin_mcq_delete:999999",
+        "admin_mcq_delete:abc",
+        "search_type:not_a_type",
+        "search_tag:not_a_tag",
+        "unknown_prefix_that_does_not_exist",
+    ]
+
+    async def test_malformed_callbacks_never_raise(self):
+        context = _FakeContext()
+
+        for data in self.MALFORMED:
+            for user_id in (self.admin_id, 999):
+                query = _FakeQuery(user_id, data)
+                try:
+                    await main.callback_router(_FakeUpdate(query), context)
+                except Exception as exc:  # pragma: no cover - failure path
+                    self.fail(
+                        f"callback_router raised for data={data!r} "
+                        f"user={user_id}: {exc!r}"
+                    )
+
+    async def test_non_admin_cannot_mutate_folders(self):
+        # A normal user replaying an admin callback must be refused and
+        # must not change the tree.
+        before = await database.get_folders(0)
+
+        for data in (
+            f"admin_folder_delete:{self.root_id}",
+            f"admin_folder_rename:{self.root_id}",
+            f"admin_folder_move:{self.root_id}",
+            f"admin_folder_settype:{self.root_id}:audio",
+            f"admin_folder_toggle:{self.root_id}",
+        ):
+            query = _FakeQuery(999, data)
+            await main.callback_router(_FakeUpdate(query), context := _FakeContext())
+            self.assertIn("غير مصرح", query.last_text or "")
+
+        after = await database.get_folders(0)
+        self.assertEqual([f[0] for f in before], [f[0] for f in after])
+        self.assertTrue(await database.get_folder(self.root_id))
+
+    async def test_folder_delete_refuses_non_empty_folder(self):
+        await database.add_folder(self.root_id, "Child", "general")
+        await database.add_content(self.root_id, "Doc", "fid", "document")
+
+        context = _FakeContext()
+        query = _FakeQuery(self.admin_id, f"admin_folder_delete:{self.root_id}")
+        await main.callback_router(_FakeUpdate(query), context)
+
+        # The folder survives because it still holds children/resources.
+        self.assertTrue(await database.get_folder(self.root_id))
+
+    async def test_move_into_own_descendant_is_refused(self):
+        await database.add_folder(self.root_id, "Child", "general")
+        child_id = (await database.get_folders(self.root_id))[0][0]
+
+        # Attempt: move Root into its own Child → would create a cycle.
+        moved, _message = await database.move_folder(self.root_id, child_id)
+
+        self.assertFalse(moved)
+        self.assertEqual(await database.get_parent_id(self.root_id), 0)
+        self.assertEqual(await database.get_parent_id(child_id), self.root_id)
+
+    async def test_invalid_ids_do_not_touch_database(self):
+        # Deleting a non-existent folder must be a no-op.
+        self.assertFalse(await database.delete_folder(999999))
+        self.assertFalse(await database.delete_folder(-1))
+
+        # Unknown resource IDs must not raise.
+        self.assertFalse(await database.update_file_title(999999, "x"))
+
+        moved, _message = await database.move_content(999999, self.root_id)
+        self.assertFalse(moved)
+
+    async def test_move_folder_into_itself_is_refused(self):
+        moved, _message = await database.move_folder(self.root_id, self.root_id)
+        self.assertFalse(moved)
+        self.assertEqual(await database.get_parent_id(self.root_id), 0)
+
+
+# ============================================================
+# Resource lifecycle — register / open / rename / move / delete
+# ============================================================
+
+
+class ResourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="medbot-res-")
+        self.db_path = os.path.join(self.tmp_dir, "test.sqlite3")
+        self._old = database.DB_NAME
+        database.DB_NAME = self.db_path
+        await database.init_db()
+
+        self.admin_id = 500
+        await database.add_sub_admin(self.admin_id, "admin")
+        await database.register_user(self.admin_id, "admin", "Admin User")
+
+        await database.add_folder(0, "Root", "general")
+        self.root_id = (await database.get_folders(0))[0][0]
+
+        await database.add_folder(self.root_id, "Child", "general")
+        self.child_id = (await database.get_folders(self.root_id))[0][0]
+
+    async def asyncTearDown(self):
+        database.DB_NAME = self._old
+        for name in os.listdir(self.tmp_dir):
+            try:
+                os.remove(os.path.join(self.tmp_dir, name))
+            except OSError:
+                pass
+        os.rmdir(self.tmp_dir)
+
+    async def test_register_and_retrieve_all_media_types(self):
+        samples = {
+            "document": "file-id-doc",
+            "photo": "file-id-photo",
+            "audio": "file-id-audio",
+            "video": "file-id-video",
+        }
+
+        for file_type, file_id in samples.items():
+            await database.add_content(
+                self.child_id, f"Title {file_type}", file_id, file_type
+            )
+
+        files = await database.get_files(self.child_id)
+        self.assertEqual(len(files), len(samples))
+
+        by_type = {}
+        for item in files:
+            by_type[item[3]] = item
+
+        for file_type, file_id in samples.items():
+            self.assertIn(file_type, by_type)
+            record = await database.get_file_record(by_type[file_type][0])
+            self.assertEqual(record[3], file_id)
+            self.assertEqual(record[4], file_type)
+
+    async def test_open_file_sends_correct_telegram_media(self):
+        expected = {
+            "document": "send_document",
+            "photo": "send_photo",
+            "audio": "send_audio",
+            "video": "send_video",
+        }
+
+        for file_type, method in expected.items():
+            content_id = await database.add_content(
+                self.root_id, f"T {file_type}", f"fid-{file_type}", file_type
+            )
+
+            context = _FakeContext()
+            query = _FakeQuery(self.admin_id, f"file:{content_id}")
+            await main.open_file(query, context, content_id)
+
+            self.assertTrue(
+                any(method in call for call in context.bot.sent_methods),
+                f"{file_type} should be sent via {method}; got "
+                f"{context.bot.sent_methods}",
+            )
+
+    async def test_open_missing_resource_reports_gracefully(self):
+        context = _FakeContext()
+        query = _FakeQuery(self.admin_id, "file:999999")
+
+        await main.open_file(query, context, 999999)
+
+        # No media is sent, and no exception escapes.
+        self.assertEqual(context.bot.sent_methods, [])
+        self.assertIn("غير موجود", query.last_text or "")
+
+    async def test_resource_rename_move_delete_persist(self):
+        content_id = await database.add_content(
+            self.root_id, "Old Title", "fid", "document"
+        )
+
+        # Rename
+        self.assertTrue(await database.update_file_title(content_id, "New Title"))
+        self.assertEqual((await database.get_file_record(content_id))[2], "New Title")
+
+        # Move
+        moved, _message = await database.move_content(content_id, self.child_id)
+        self.assertTrue(moved)
+        self.assertEqual((await database.get_file_record(content_id))[1], self.child_id)
+
+        # Delete
+        self.assertTrue(await database.delete_file(content_id))
+        self.assertIsNone(await database.get_file_record(content_id))
+
+    async def test_resources_stay_in_their_own_folder(self):
+        a = await database.add_content(self.root_id, "A", "fa", "document")
+        b = await database.add_content(self.child_id, "B", "fb", "document")
+
+        root_files = await database.get_files(self.root_id)
+        child_files = await database.get_files(self.child_id)
+
+        self.assertEqual([f[0] for f in root_files], [a])
+        self.assertEqual([f[0] for f in child_files], [b])
+
+    async def test_move_content_to_invalid_folder_is_refused(self):
+        content_id = await database.add_content(
+            self.root_id, "T", "fid", "document"
+        )
+
+        moved, _message = await database.move_content(content_id, 999999)
+        self.assertFalse(moved)
+
+        # The resource must not have been detached from its folder.
+        self.assertEqual((await database.get_file_record(content_id))[1], self.root_id)
+
+
+# ============================================================
+# Contribution targeting — media must land in the chosen folder
+# ============================================================
+
+
+class ContributionTargetingTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="medbot-ctar-")
+        self.db_path = os.path.join(self.tmp_dir, "test.sqlite3")
+        self._old = database.DB_NAME
+        database.DB_NAME = self.db_path
+        await database.init_db()
+
+        # parent (accepts) -> child (accepts) -> leaf, plus a sibling
+        await database.add_folder(0, "Parent", "general", 1)
+        self.parent_id = (await database.get_folders(0))[0][0]
+
+        await database.add_folder(self.parent_id, "Child", "general", 1)
+        self.child_id = (await database.get_folders(self.parent_id))[0][0]
+
+        await database.add_folder(0, "Other", "general", 1)
+        self.other_id = (await database.get_folders(0))[1][0]
+
+    async def asyncTearDown(self):
+        database.DB_NAME = self._old
+        for name in os.listdir(self.tmp_dir):
+            try:
+                os.remove(os.path.join(self.tmp_dir, name))
+            except OSError:
+                pass
+        os.rmdir(self.tmp_dir)
+
+    def _buttons(self, query):
+        return [
+            (button.text, button.callback_data)
+            for row in query.last_markup.inline_keyboard
+            for button in row
+        ]
+
+    async def test_drill_down_does_not_leave_stale_send_target(self):
+        context = _FakeContext()
+
+        # 1. Open contributions and drill into the parent.
+        query = _FakeQuery(999, "contribute")
+        await main.callback_router(_FakeUpdate(query), context)
+
+        drill = _FakeQuery(999, f"contrib_folder:{self.parent_id}")
+        await main.callback_router(_FakeUpdate(drill), context)
+
+        # Drilling shows the child level, which must not arm a send target.
+        self.assertNotIn(
+            "contribution_folder",
+            context.user_data,
+            "Browsing a container must not arm a send target for it",
+        )
+
+    async def test_media_after_drill_lands_in_explicit_target_only(self):
+        context = _FakeContext()
+
+        query = _FakeQuery(999, "contribute")
+        await main.callback_router(_FakeUpdate(query), context)
+
+        drill = _FakeQuery(999, f"contrib_folder:{self.parent_id}")
+        await main.callback_router(_FakeUpdate(drill), context)
+
+        # Browsing only: a media upload here must NOT be recorded.
+        media = _MediaUpdate(
+            999, _MediaMessage(document=_FakeDoc("fid-browse", "browse.pdf"))
+        )
+        await main.media_router(media, context)
+
+        contributions = await database.get_pending_contributions()
+        self.assertEqual(
+            contributions,
+            [],
+            "Media sent while merely browsing must not create a contribution",
+        )
+
+        # Explicitly choose the child as the target, then upload.
+        target = _FakeQuery(999, f"contrib_submit_here:{self.child_id}")
+        await main.callback_router(_FakeUpdate(target), context)
+        self.assertEqual(context.user_data.get("contribution_folder"), self.child_id)
+
+        media = _MediaUpdate(
+            999, _MediaMessage(document=_FakeDoc("fid-send", "send.pdf"))
+        )
+        handled = await main.media_router(media, context)
+        self.assertTrue(handled)
+        contributions = await database.get_pending_contributions()
+        self.assertEqual(len(contributions), 1)
+        self.assertEqual(contributions[0][3], self.child_id)
+
+    async def test_navigating_away_clears_armed_target(self):
+        """An armed send target must not survive subsequent tree navigation."""
+        context = _FakeContext()
+
+        query = _FakeQuery(999, "contribute")
+        await main.callback_router(_FakeUpdate(query), context)
+
+        # Arm the child folder as the explicit send target.
+        target = _FakeQuery(999, f"contrib_submit_here:{self.child_id}")
+        await main.callback_router(_FakeUpdate(target), context)
+        self.assertEqual(context.user_data.get("contribution_folder"), self.child_id)
+
+        # Now navigate back up to the parent level (browsing, not sending).
+        back = _FakeQuery(999, f"contrib_folder:{self.parent_id}")
+        await main.callback_router(_FakeUpdate(back), context)
+
+        # Sending media now must not silently publish to the old target.
+        media = _MediaUpdate(
+            999, _MediaMessage(document=_FakeDoc("fid-stale", "stale.pdf"))
+        )
+        await main.media_router(media, context)
+
+        contributions = await database.get_pending_contributions()
+        self.assertEqual(
+            contributions,
+            [],
+            "Stale armed target must not capture media after navigating away",
+        )
+
+
+class UserNavigationLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    """Library ❯ folder ❯ resource browsing and actual media delivery."""
+
+    async def asyncSetUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="medbot-user-")
+        self.db_path = os.path.join(self.tmp_dir, "test.sqlite3")
+        self._old = database.DB_NAME
+        database.DB_NAME = self.db_path
+        await database.init_db()
+
+        await database.add_folder(0, "Year 1", "general")
+        self.year_id = (await database.get_folders(0))[0][0]
+
+        await database.add_folder(self.year_id, "Anatomy", "general")
+        self.anat_id = (await database.get_folders(self.year_id))[0][0]
+
+        await database.add_content(
+            self.anat_id, "Lecture 1", "fid-lecture-1", "document"
+        )
+        self.content_id = (await database.get_files(self.anat_id))[0][0]
+
+    async def asyncTearDown(self):
+        database.DB_NAME = self._old
+        for name in os.listdir(self.tmp_dir):
+            try:
+                os.remove(os.path.join(self.tmp_dir, name))
+            except OSError:
+                pass
+        os.rmdir(self.tmp_dir)
+
+    def _callbacks(self, query):
+        return [
+            button.callback_data
+            for row in query.last_markup.inline_keyboard
+            for button in row
+        ]
+
+    async def test_full_drill_down_and_back(self):
+        ctx = _FakeContext()
+
+        root = _FakeQuery(999, "library:0")
+        await main.callback_router(_FakeUpdate(root), ctx)
+        self.assertIn(f"folder:{self.year_id}", self._callbacks(root))
+
+        year = _FakeQuery(999, f"folder:{self.year_id}")
+        await main.callback_router(_FakeUpdate(year), ctx)
+        self.assertIn(f"folder:{self.anat_id}", self._callbacks(year))
+        # Back button returns to library root.
+        self.assertIn("library:0", self._callbacks(year))
+
+        anat = _FakeQuery(999, f"folder:{self.anat_id}")
+        await main.callback_router(_FakeUpdate(anat), ctx)
+        self.assertIn(f"file:{self.content_id}", self._callbacks(anat))
+        # Back returns to the parent (Year 1).
+        self.assertIn(f"library:{self.year_id}", self._callbacks(anat))
+
+    async def test_empty_folder_renders_gracefully(self):
+        ctx = _FakeContext()
+        await database.add_folder(self.year_id, "Empty", "general")
+        empty_id = [
+            f[0] for f in await database.get_folders(self.year_id) if f[1] == "Empty"
+        ][0]
+
+        query = _FakeQuery(999, f"folder:{empty_id}")
+        await main.callback_router(_FakeUpdate(query), ctx)
+
+        self.assertIn("لا توجد", query.last_text or "")
+
+    async def test_opening_resource_delivers_actual_media(self):
+        ctx = _FakeContext()
+        query = _FakeQuery(999, f"file:{self.content_id}")
+
+        await main.callback_router(_FakeUpdate(query), ctx)
+
+        # The registered Telegram document is actually sent.
+        self.assertEqual(len(ctx.bot.documents), 1)
+        self.assertEqual(ctx.bot.documents[0]["document"], "fid-lecture-1")
+
+        # And the user is offered a way back to the folder.
+        back_callbacks = [
+            button.callback_data
+            for call in ctx.bot.sent
+            for row in (call.get("reply_markup").inline_keyboard if call.get("reply_markup") else [])
+            for button in row
+        ]
+        self.assertIn(f"folder:{self.anat_id}", back_callbacks)
+
+    async def test_invalid_folder_and_file_do_not_crash(self):
+        ctx = _FakeContext()
+
+        for data in ("folder:999999", "file:999999", "library:-1"):
+            query = _FakeQuery(999, data)
+            try:
+                await main.callback_router(_FakeUpdate(query), ctx)
+            except Exception as exc:  # pragma: no cover - failure path
+                self.fail(f"{data} raised {exc!r}")
 
 
 if __name__ == "__main__":

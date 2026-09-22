@@ -50,8 +50,15 @@ from telegram.ext import (
 )
 
 import database
+import mcq_engine
 from ai import generate_medical_ai_response
-from search_engine import search_library_summary
+from search_engine import (
+    HIGH_YIELD_TAGS,
+    SEARCH_TYPES,
+    TYPE_LABELS,
+    normalize_resource_type as _normalize_resource_type,
+    search_library_summary,
+)
 
 load_dotenv()
 
@@ -141,6 +148,10 @@ def home_keyboard():
             [
                 btn("🤖 MEDBOT Assistant", "assistant"),
                 btn("📤 Student Contributions", "contribute"),
+            ],
+            [
+                btn("🧠 بنك الأسئلة والتدريب", "mcq_menu"),
+                btn("🏆 لوحة المتصدرين", "leaderboard"),
             ],
             [
                 btn("📊 My Account", "account"),
@@ -267,11 +278,11 @@ def folder_keyboard(folders, parent_id=0):
 async def show_library(query, parent_id=0):
     try:
         folders = await database.get_folders(parent_id)
-    except Exception as exc:
+    except Exception:
         logger.exception("get_folders failed")
         await edit_safe(
             query,
-            f"⚠️ تعذر فتح الموارد حالياً.\n\n`{exc}`",
+            "⚠️ تعذر فتح الموارد حالياً. حاول مرة أخرى بعد قليل.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
         return
@@ -500,7 +511,7 @@ async def open_file(query, context, content_id):
 # ============================================================
 
 
-async def search_content(query_text):
+async def search_content(query_text, types=None, tag=None):
     """
     Canonical MEDBOT resource search entry point.
 
@@ -508,7 +519,9 @@ async def search_content(query_text):
     response object. This wrapper preserves the legacy main.py
     contract by returning only the result list.
     """
-    response = await search_library_summary(query_text, limit=15)
+    response = await search_library_summary(
+        query_text, limit=15, types=types, tag=tag
+    )
 
     if not isinstance(response, dict):
         raise TypeError(
@@ -528,18 +541,31 @@ async def search_content(query_text):
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["search_mode"] = True
 
+    keyboard_rows = _search_filter_rows(context) + [[btn("❌ إلغاء البحث", "home")]]
+
     await update.message.reply_text(
         "🔎 *MEDBOT Search*\n\n"
         "اكتب اسم الكتاب أو المحاضرة أو الملف الذي تريد البحث عنه.\n\n"
+        "يمكنك تضييق البحث عبر فلاتر النوع أو الوسوم الطبية أدناه.\n\n"
         "سيتم البحث فقط داخل الموارد المسجلة في MEDBOT.",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([[btn("❌ إلغاء البحث", "home")]]),
+        reply_markup=InlineKeyboardMarkup(keyboard_rows),
     )
 
 
-async def run_search(update: Update, query_text):
+async def run_search(update, query_text, context=None):
+    """Execute a MEDBOT search honouring any active type/tag filters."""
+    search_types = None
+    search_tag = None
+
+    if context is not None:
+        search_types = context.user_data.get("search_types") or None
+        search_tag = context.user_data.get("search_tag") or None
+
     try:
-        results = await search_content(query_text)
+        results = await search_content(
+            query_text, types=search_types, tag=search_tag
+        )
     except Exception:
         logger.exception("Search failed")
         await update.message.reply_text(
@@ -548,12 +574,17 @@ async def run_search(update: Update, query_text):
         )
         return
 
+    if context is not None:
+        context.user_data["last_search"] = query_text
+
     if not results:
         await update.message.reply_text(
             "🔎 *نتيجة البحث*\n\n"
             "المورد المطلوب غير مسجل حالياً في MEDBOT.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=home_keyboard(),
+            reply_markup=InlineKeyboardMarkup(
+                _search_filter_rows(context) + [[btn("🏠 الرئيسية", "home")]]
+            ),
         )
         return
 
@@ -589,6 +620,15 @@ async def run_search(update: Update, query_text):
                 [btn(f"{icon} {str(title)[:35]}", f"file:{item_id}")]
             )
 
+        elif result_type == "MCQ":
+            lines.append(
+                f"📝 *{str(title)[:60]}*\n"
+                f"   🧭 {path}"
+            )
+            buttons.append(
+                [btn(f"📝 {str(title)[:35]}", "mcq_menu")]
+            )
+
         elif result_type == "EMPTY_FOLDER":
             lines.append(
                 f"📁 *{title}*\n"
@@ -599,6 +639,7 @@ async def run_search(update: Update, query_text):
                 [btn(f"📁 {str(title)[:35]}", f"folder:{item_id}")]
             )
 
+    buttons.extend(_search_filter_rows(context))
     buttons.append([btn("🤖 العودة للمساعد", "assistant")])
     buttons.append([btn("🏠 الرئيسية", "home")])
 
@@ -607,6 +648,169 @@ async def run_search(update: Update, query_text):
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(buttons),
     )
+
+
+def _search_filter_rows(context) -> list:
+    """Build the media-type / tag filter rows for the results screen."""
+    active_types = set()
+    active_tag = None
+
+    if context is not None:
+        active_types = set(context.user_data.get("search_types") or [])
+        active_tag = context.user_data.get("search_tag")
+
+    type_row = []
+
+    for media_type in search_engine_types():
+        label = search_engine_type_label(media_type)
+        mark = "✅ " if media_type in active_types else ""
+
+        type_row.append(btn(f"{mark}{label}", f"search_type:{media_type}"))
+
+    rows = [type_row]
+
+    first_tag_row = []
+
+    for tag in high_yield_tags():
+        mark = "✅ " if active_tag and tag == active_tag else ""
+        first_tag_row.append(btn(f"{mark}{tag}", f"search_tag:{tag}"))
+
+    rows.append(first_tag_row[:3])
+    rows.append(first_tag_row[3:])
+
+    rows.append([btn("🧹 إلغاء الفلاتر", "search_filters_clear")])
+
+    return [row for row in rows if row]
+
+
+async def apply_search_type_filter(query, context, type_token):
+    """Toggle a media-type filter and re-run the last search if possible."""
+    type_token = str(type_token or "").strip().lower()
+
+    canonical = normalize_resource_type(type_token)
+
+    active = set(context.user_data.get("search_types") or [])
+
+    if canonical in active:
+        active.discard(canonical)
+    else:
+        active.add(canonical)
+
+    if active:
+        context.user_data["search_types"] = sorted(active)
+    else:
+        context.user_data.pop("search_types", None)
+
+    await _rerun_or_prompt(query, context)
+
+
+async def apply_search_tag_filter(query, context, tag_token):
+    """Toggle a high-yield tag filter and re-run the last search if possible."""
+    tag_token = str(tag_token or "").strip()
+
+    if not tag_token:
+        await _rerun_or_prompt(query, context)
+        return
+
+    if not tag_token.startswith("#"):
+        tag_token = "#" + tag_token
+
+    current = context.user_data.get("search_tag")
+
+    if current and current.lower() == tag_token.lower():
+        context.user_data.pop("search_tag", None)
+    else:
+        context.user_data["search_tag"] = tag_token
+
+    await _rerun_or_prompt(query, context)
+
+
+async def _rerun_or_prompt(query, context):
+    """Re-run the previous search, or prompt for a keyword if there was none."""
+    last = context.user_data.get("last_search")
+
+    if not last:
+        await edit_safe(
+            query,
+            "🔎 *Search*\n\n"
+            "اكتب الآن كلمة البحث. سيتم تطبيق الفلاتر المختارة تلقائياً.",
+            InlineKeyboardMarkup([[btn("❌ إلغاء", "home")]]),
+        )
+        return
+
+    try:
+        await _render_search_results_to_query(query, context, last)
+    except Exception:
+        logger.exception("Filtered search failed")
+        await edit_safe(
+            query,
+            "⚠️ تعذر تطبيق الفلتر حالياً.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+
+
+async def _render_search_results_to_query(query, context, query_text):
+    """Render search results into an existing callback message."""
+    search_types = context.user_data.get("search_types") or None
+    search_tag = context.user_data.get("search_tag") or None
+
+    results = await search_content(query_text, types=search_types, tag=search_tag)
+
+    if not results:
+        await edit_safe(
+            query,
+            "🔎 *نتيجة البحث*\n\n"
+            "لا توجد نتائج مطابقة للفلاتر الحالية.",
+            InlineKeyboardMarkup(
+                _search_filter_rows(context) + [[btn("🏠 الرئيسية", "home")]]
+            ),
+        )
+        return
+
+    lines = ["🔎 *نتائج البحث داخل MEDBOT*\n"]
+    buttons = []
+
+    for item in results:
+        result_type = item.get("result_type")
+        item_id = item.get("id")
+        title = item.get("title") or item.get("name") or "بدون عنوان"
+        path = item.get("path") or "بدون مسار"
+
+        if result_type in ("FOLDER", "EMPTY_FOLDER"):
+            lines.append(f"📁 *{str(title)[:60]}*\n   🧭 {path}")
+            buttons.append([btn(f"📁 {str(title)[:35]}", f"folder:{item_id}")])
+        elif result_type == "MCQ":
+            lines.append(f"📝 *{str(title)[:60]}*\n   🧭 {path}")
+            buttons.append([btn(f"📝 {str(title)[:35]}", "mcq_menu")])
+        else:
+            icon = content_icon(item.get("file_type"))
+            lines.append(f"{icon} *{str(title)[:60]}*\n   🧭 {path}")
+            buttons.append([btn(f"{icon} {str(title)[:35]}", f"file:{item_id}")])
+
+    buttons.extend(_search_filter_rows(context))
+    buttons.append([btn("🏠 الرئيسية", "home")])
+
+    await edit_safe(
+        query,
+        "\n".join(lines),
+        InlineKeyboardMarkup(buttons),
+    )
+
+
+def search_engine_types():
+    return SEARCH_TYPES
+
+
+def search_engine_type_label(media_type):
+    return TYPE_LABELS.get(media_type, media_type)
+
+
+def high_yield_tags():
+    return HIGH_YIELD_TAGS
+
+
+def normalize_resource_type(value):
+    return _normalize_resource_type(value)
 
 
 async def show_account(query):
@@ -620,11 +824,19 @@ async def show_account(query):
     except Exception:
         remaining = "غير متاح"
 
+    try:
+        notifications_on = await database.notifications_enabled(user.id)
+    except Exception:
+        notifications_on = True
+
+    status = "✅ مفعّلة" if notifications_on else "🔕 معطّلة"
+
     text = (
         "📊 *My Account*\n\n"
         f"👤 الاسم: {user.full_name}\n"
         f"🆔 Telegram ID: `{user.id}`\n\n"
-        f"🤖 رصيد AI اليومي: {remaining}/{DAILY_LIMIT}\n\n"
+        f"🤖 رصيد AI اليومي: {remaining}/{DAILY_LIMIT}\n"
+        f"📢 إشعارات الموارد الجديدة: {status}\n\n"
         "يتم تجديد الرصيد تلقائياً مع بداية يوم جديد."
     )
 
@@ -633,10 +845,24 @@ async def show_account(query):
         text,
         InlineKeyboardMarkup(
             [
+                [btn("🔔 تغيير حالة الإشعارات", "toggle_notifications")],
                 [btn("🏠 الرئيسية", "home")],
             ]
         ),
     )
+
+
+async def toggle_notifications(query, context=None):
+    """Flip the caller's publication-alert preference and redraw the account."""
+    user_id = query.from_user.id
+
+    try:
+        current = await database.notifications_enabled(user_id)
+        await database.set_notifications_enabled(user_id, not current)
+    except Exception:
+        logger.exception("Notification preference update failed")
+
+    await show_account(query)
 
 
 async def show_about(query):
@@ -665,23 +891,6 @@ async def show_about(query):
 # ============================================================
 # STUDENT CONTRIBUTIONS
 # ============================================================
-
-
-async def contribution_folders():
-    db = await database.get_db()
-
-    try:
-        sql = """
-            SELECT id, name, node_type
-            FROM folders
-            WHERE accepts_contributions = 1
-            ORDER BY id ASC
-        """
-
-        async with db.execute(sql) as cursor:
-            return await cursor.fetchall()
-    finally:
-        await db.close()
 
 
 async def _contribution_label(folder_id: int, name: str) -> str:
@@ -719,17 +928,49 @@ async def _contribution_label(folder_id: int, name: str) -> str:
     return label
 
 
-async def show_contribute(query):
+async def show_contribute(query, context=None):
+    """Entry point for student contributions.
+
+    Enables hierarchical tree navigation root ❯ subfolder ❯ leaf, matching the
+    main library. Folders that accept contributions are reachable at their own
+    level even when they also have children, so an opted-in leaf is never
+    hidden behind an uninterested parent.
+    """
+    if context is not None:
+        context.user_data["contribution_mode"] = True
+        context.user_data.pop("contribution_folder", None)
+        context.user_data.pop("contribution_path", None)
+
+    await show_contribution_tree(query, context, 0)
+
+
+async def show_contribution_tree(query, context, parent_id=0):
+    """Render one level of the contribution tree.
+
+    Browsing is not sending: any previously armed send target is dropped here so
+    media sent after navigating away can never land in a stale folder.
+    """
+    if context is not None:
+        context.user_data.pop("contribution_folder", None)
+        context.user_data.pop("contribution_path", None)
+
     try:
-        folders = await contribution_folders()
+        folders = await database.get_folders(parent_id) if parent_id else await database.get_folders(0)
     except Exception:
+        logger.exception("Contribution tree load failed")
         folders = []
 
-    buttons = []
+    # An opted-in folder is selectable at this level and also expands.
+    try:
+        accepts_here = bool(parent_id) and await database.folder_accepts_contributions(parent_id)
+    except Exception:
+        accepts_here = False
+
+    rows = []
 
     for folder in folders:
         try:
-            folder_id, name, node_type = folder[:3]
+            folder_id, name, node_type, accepts = folder[:4]
         except Exception:
             continue
 
@@ -738,45 +979,76 @@ async def show_contribute(query):
         except Exception:
             label = str(name)[:40]
 
-        buttons.append(
-            [
-                btn(
-                    f"📥 {label}",
-                    f"contrib_folder:{folder_id}",
-                )
-            ]
+        icon = resource_icon(node_type)
+        rows.append(
+            [btn(f"{icon} {label}", f"contrib_folder:{folder_id}")]
         )
 
-    if not buttons:
-        text = (
-            "📤 *Student Contributions*\n\n"
-            "لا توجد حالياً مجلدات مفتوحة لاستقبال مساهمات الطلاب."
+    # Sending target for the current level.
+    if accepts_here:
+        rows.append(
+            [btn("📥 إرسال المساهمة إلى هذا القسم", f"contrib_submit_here:{parent_id}")]
         )
+
+    if parent_id:
+        rows.append([btn("⬅️ رجوع", f"contrib_folder:{await _safe_parent(parent_id)}")])
     else:
-        text = (
-            "📤 *Student Contributions*\n\n" "اختر القسم الذي تريد إرسال المورد إليه:"
-        )
+        rows.append([btn("⬅️ رجوع", "contribute_root")])
 
-    buttons.append([btn("🏠 الرئيسية", "home")])
+    rows.append([btn("🏠 الرئيسية", "home")])
 
-    await edit_safe(
-        query,
-        text,
-        InlineKeyboardMarkup(buttons),
-    )
+    heading = "📤 *Student Contributions*\n\n"
+
+    if parent_id:
+        try:
+            breadcrumb = await database.get_breadcrumbs(parent_id)
+        except Exception:
+            breadcrumb = "📚 MEDBOT Resources"
+
+        body = f"📍 {breadcrumb}\n\nاختر القسم أو أرسل مساهمتك هنا:"
+    else:
+        body = "اختر القسم الذي تريد إرسال المورد إليه:"
+
+    if not folders and not accepts_here:
+        body = "لا توجد حالياً أقسام متاحة هنا لاستقبال مساهمات الطلاب."
+
+    await edit_safe(query, heading + body, InlineKeyboardMarkup(rows))
+
+
+def _clear_contribution_state(context):
+    context.user_data.pop("contribution_folder", None)
+    context.user_data.pop("contribution_path", None)
+    context.user_data.pop("contribution_mode", None)
+
+
+def contribution_is_active(context) -> bool:
+    """Whether the student is currently inside the contribution workflow."""
+    return bool(context.user_data.get("contribution_mode"))
 
 
 async def select_contribution_folder(query, context, folder_id):
-    try:
-        accepts = await database.folder_accepts_contributions(folder_id)
-    except Exception:
-        accepts = False
+    """Navigate into a contribution folder or select it as the send target.
 
-    if not accepts:
+    Hierarchical rules:
+      - opted-in folder with no children -> send target
+      - opted-in folder with children     -> tree view offering both drill
+                                             and 'send here'
+      - non-opted folder with children    -> drill one level deeper
+      - non-opted leaf                    -> clear refusal
+
+    The secure pending-submission contract is unchanged: nothing is published
+    until an admin approves it.
+    """
+    try:
+        folder = await database.get_folder(folder_id)
+    except Exception:
+        folder = None
+
+    if not folder:
         _clear_contribution_state(context)
         await edit_safe(
             query,
-            "⚠️ هذا القسم غير متاح لاستقبال المساهمات حالياً.",
+            "⚠️ القسم غير موجود.",
             InlineKeyboardMarkup(
                 [
                     [btn("📤 Student Contributions", "contribute")],
@@ -786,25 +1058,69 @@ async def select_contribution_folder(query, context, folder_id):
         )
         return
 
-    context.user_data["contribution_folder"] = folder_id
+    try:
+        accepts = await database.folder_accepts_contributions(folder_id)
+    except Exception:
+        accepts = False
 
+    try:
+        children = await database.get_folders(folder_id)
+    except Exception:
+        children = []
+
+    if accepts and not children:
+        await prepare_contribution_target(query, context, folder_id)
+        return
+
+    if children:
+        await show_contribution_tree(query, context, folder_id)
+        return
+
+    # Leaf that does not accept contributions.
+    _clear_contribution_state(context)
     await edit_safe(
         query,
-        "📤 *إرسال مساهمة*\n\n"
-        "تم اختيار القسم.\n\n"
-        "أرسل الآن الملف كـ Document أو Audio أو Video أو Photo.\n\n"
-        "سيتم تسجيله كمساهمة *pending* ولن يظهر في المكتبة حتى تتم مراجعته واعتماده.",
+        "⚠️ هذا القسم غير متاح لاستقبال المساهمات حالياً.",
         InlineKeyboardMarkup(
             [
-                [btn("❌ إلغاء", "contribute")],
+                [btn("📤 Student Contributions", "contribute")],
                 [btn("🏠 الرئيسية", "home")],
             ]
         ),
     )
 
 
-def _clear_contribution_state(context):
-    context.user_data.pop("contribution_folder", None)
+async def prepare_contribution_target(query, context, folder_id):
+    """Enter send mode for a validated contribution folder."""
+    context.user_data["contribution_mode"] = True
+    context.user_data["contribution_folder"] = folder_id
+    context.user_data["contribution_path"] = folder_id
+
+    try:
+        breadcrumb = await database.get_breadcrumbs(folder_id)
+    except Exception:
+        breadcrumb = "القسم المحدد"
+
+    await edit_safe(
+        query,
+        "📤 *إرسال مساهمة*\n\n"
+        f"📍 {breadcrumb}\n\n"
+        "أرسل الآن الملف كـ Document أو Audio أو Video أو Photo.\n\n"
+        "سيتم تسجيله كمساهمة *pending* ولن يظهر في المكتبة حتى تتم مراجعته واعتماده.",
+        InlineKeyboardMarkup(
+            [
+                [btn("⬅️ رجوع", f"contrib_folder:{await _safe_parent(folder_id)}")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
+async def _safe_parent(folder_id: int) -> int:
+    try:
+        return await database.get_parent_id(folder_id) or 0
+    except Exception:
+        return 0
 
 
 async def contribution_media_handler(
@@ -855,7 +1171,7 @@ async def contribution_media_handler(
             file_type,
         )
 
-        context.user_data.pop("contribution_folder", None)
+        _clear_contribution_state(context)
 
         await update.message.reply_text(
             "✅ *تم استلام مساهمتك بنجاح.*\n\n"
@@ -874,6 +1190,756 @@ async def contribution_media_handler(
         )
 
     return True
+
+
+# ============================================================
+# MCQ — quiz bank UI (content comes from the database only)
+# ============================================================
+
+
+def _mcq_key(question) -> str:
+    """Stable identifier for one MCQ question in callback data."""
+    return str(question.get("id"))
+
+
+async def _mcq_menu_text_and_rows(context):
+    """Build the shared question-bank menu text and buttons."""
+    try:
+        total = await database.get_mcq_count()
+    except Exception:
+        logger.exception("MCQ count failed")
+        total = 0
+
+    rows = []
+
+    if total > 0:
+        rows.append([btn("▶️ بدء التدريب", "mcq_start")])
+
+    rows.append([btn("🏠 الرئيسية", "home")])
+
+    if total <= 0:
+        text = (
+            "🧠 *بنك الأسئلة والتدريب*\n\n"
+            "لا توجد أسئلة مسجلة حالياً في بنك الأسئلة.\n\n"
+            "ℹ️ يتم تسجيل الأسئلة من قبل المشرفين فقط."
+        )
+    else:
+        text = (
+            "🧠 *بنك الأسئلة والتدريب*\n\n"
+            f"📊 عدد الأسئلة المتاحة: *{total}*\n\n"
+            "اختبار تفاعلي مع تصحيح فوري وشرح لكل إجابة."
+        )
+
+    return text, rows
+
+
+async def show_mcq_menu(query, context):
+    """Entry screen for the question bank. Never fabricates questions."""
+    context.user_data.pop("mcq_session", None)
+
+    text, rows = await _mcq_menu_text_and_rows(context)
+
+    await edit_safe(query, text, InlineKeyboardMarkup(rows))
+
+
+async def start_mcq_session(query, context):
+    """Load verified questions and show the first one."""
+    try:
+        questions = await database.get_mcq_questions(limit=20)
+    except Exception:
+        logger.exception("MCQ load failed")
+        questions = []
+
+    if not questions:
+        await edit_safe(
+            query,
+            "🧠 *بنك الأسئلة والتدريب*\n\n"
+            "لا توجد أسئلة مسجلة حالياً في بنك الأسئلة.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    context.user_data["mcq_session"] = mcq_engine.fresh_session(questions)
+
+    await render_mcq_question(query, context)
+
+
+async def render_mcq_question(query, context):
+    """Render the active question with its answer buttons."""
+    session = context.user_data.get("mcq_session")
+
+    if not isinstance(session, dict):
+        await edit_safe(
+            query,
+            "🧠 انتهت جلسة الأسئلة. ابدأ من جديد.",
+            InlineKeyboardMarkup(
+                [[btn("🧠 بنك الأسئلة", "mcq_menu")], [btn("🏠 الرئيسية", "home")]]
+            ),
+        )
+        return
+
+    question = mcq_engine.current_question(session)
+
+    if question is None:
+        await render_mcq_summary(query, context)
+        return
+
+    total = session.get("total", 0)
+    position = mcq_engine.normalize_index(session.get("idx")) + 1
+
+    try:
+        folder = await database.get_folder(question.get("folder_id"))
+        subject = folder[2] if folder else "عام"
+    except Exception:
+        subject = "عام"
+
+    text = (
+        "🧠 *بنك الأسئلة والتدريب*\n"
+        f"📚 *القسم:* {mcq_engine_escape(subject)}\n"
+        f"📊 *السؤال:* {position} من {total}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"❓ {mcq_engine_escape(question.get('question_text'))}"
+    )
+
+    rows = []
+
+    for label, callback in mcq_engine.build_option_buttons(
+        question, _mcq_key(question)
+    ):
+        rows.append([btn(label, callback)])
+
+    rows.append([btn("❌ إنهاء الاختبار", "mcq_exit")])
+
+    await edit_safe(query, text, InlineKeyboardMarkup(rows))
+
+
+async def answer_mcq_question(query, context, question_key, chosen_index):
+    """Grade the answered question and show the explanation."""
+    session = context.user_data.get("mcq_session")
+
+    if not isinstance(session, dict):
+        await edit_safe(
+            query,
+            "🧠 انتهت جلسة الأسئلة. ابدأ من جديد.",
+            InlineKeyboardMarkup(
+                [[btn("🧠 بنك الأسئلة", "mcq_menu")], [btn("🏠 الرئيسية", "home")]]
+            ),
+        )
+        return
+
+    question = mcq_engine.current_question(session)
+
+    # Guard against stale/duplicated taps: the callback must match the active
+    # question, otherwise the tap is ignored without changing the score.
+    if question is None or _mcq_key(question) != str(question_key):
+        return
+
+    result = mcq_engine.record_answer(session, chosen_index)
+
+    if not result.get("ok"):
+        return
+
+    if result["correct"]:
+        header = "✅ *إجابة صحيحة! أحسنت دكتور* 👏"
+    else:
+        header = "❌ *إجابة غير صحيحة*"
+
+    explanation = result.get("explanation") or ""
+
+    text = (
+        f"{header}\n\n"
+        f"🎯 *الإجابة الصحيحة:* {mcq_engine_escape(result.get('correct_option'))}\n\n"
+    )
+
+    if explanation:
+        text += f"{mcq_engine_escape(explanation)}\n"
+
+    text += "━━━━━━━━━━━━━━━━━━━━"
+
+    rows = []
+
+    if mcq_engine.advance(session):
+        rows.append([btn("⬅️ السؤال التالي", "mcq_next")])
+    else:
+        rows.append([btn("🏁 عرض النتيجة", "mcq_finish")])
+
+    await edit_safe(query, text, InlineKeyboardMarkup(rows))
+
+
+async def next_mcq_question(query, context):
+    session = context.user_data.get("mcq_session")
+
+    if not isinstance(session, dict):
+        await edit_safe(
+            query,
+            "🧠 انتهت جلسة الأسئلة.",
+            InlineKeyboardMarkup([[btn("🧠 بنك الأسئلة", "mcq_menu")]]),
+        )
+        return
+
+    await render_mcq_question(query, context)
+
+
+async def render_mcq_summary(query, context):
+    """Final score report; clears the session afterwards."""
+    session = context.user_data.pop("mcq_session", None)
+
+    if not isinstance(session, dict):
+        await edit_safe(
+            query,
+            "🧠 لا توجد نتيجة متاحة.",
+            InlineKeyboardMarkup([[btn("🧠 بنك الأسئلة", "mcq_menu")]]),
+        )
+        return
+
+    summary = mcq_engine.score_summary(session)
+
+    text = (
+        "🏁 *التقرير النهائي للاختبار*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 *النتيجة:* {summary['score']} من {summary['total']}\n"
+        f"📈 *النسبة:* {summary['percentage']}%\n"
+        f"💬 *التقييم:* {summary['assessment']}\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    await edit_safe(
+        query,
+        text,
+        InlineKeyboardMarkup(
+            [
+                [btn("🔄 إعادة الاختبار", "mcq_start")],
+                [btn("🧠 بنك الأسئلة", "mcq_menu")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
+def mcq_engine_escape(value) -> str:
+    """Escape Markdown-significant characters in user/admin supplied text."""
+    text = str(value or "")
+    for char in ("_", "*", "`", "[", "]"):
+        text = text.replace(char, f"\\{char}")
+    return text
+
+
+# ============================================================
+# MCQ — admin registration flow (verified content only)
+# ============================================================
+
+
+def _clear_mcq_admin_state(context):
+    for key in (
+        "admin_mcq_step",
+        "admin_mcq_folder",
+        "admin_mcq_text",
+        "admin_mcq_options",
+        "admin_mcq_correct",
+    ):
+        context.user_data.pop(key, None)
+
+
+async def show_admin_mcq(query, context):
+    """Admin MCQ management entry screen."""
+    if not await _permission_check(query, "can_ai"):
+        return
+
+    _clear_mcq_admin_state(context)
+
+    try:
+        total = await database.get_mcq_count()
+    except Exception:
+        total = 0
+
+    text = (
+        "🧠 *إدارة بنك الأسئلة*\n\n"
+        f"📊 الأسئلة المسجلة: *{total}*\n\n"
+        "ℹ️ التسجيل يدوي بالكامل. لا يقوم النظام بإنشاء أسئلة أو حقائق طبية."
+    )
+
+    rows = [[btn("➕ تسجيل سؤال", "admin_mcq_add")]]
+
+    if total:
+        rows.append([btn("🧪 معاينة البنك", "mcq_menu")])
+
+    rows.append([btn("⬅️ Admin", "admin")])
+    rows.append([btn("🏠 الرئيسية", "home")])
+
+    await edit_safe(query, text, InlineKeyboardMarkup(rows))
+
+
+async def start_admin_mcq_add(query, context):
+    """Step 1: choose the folder the question belongs to."""
+    if not await _permission_check(query, "can_ai"):
+        return
+
+    _clear_mcq_admin_state(context)
+    context.user_data["admin_mcq_step"] = "folder"
+
+    try:
+        folders = await database.get_folders(0)
+    except Exception:
+        folders = []
+
+    rows = []
+
+    for folder in folders:
+        try:
+            folder_id, name, node_type, accepts = folder[:4]
+        except Exception:
+            continue
+
+        rows.append([btn(f"📁 {str(name)[:40]}", f"admin_mcq_folder:{folder_id}")])
+
+    rows.append([btn("🌐 بدون قسم (بنك عام)", "admin_mcq_folder_skip")])
+    rows.append([btn("❌ إلغاء", "admin_mcq")])
+
+    text = (
+        "➕ *تسجيل سؤال جديد*\n\n"
+        "الخطوة 1 من 4: اختر القسم الذي ينتمي إليه السؤال.\n\n"
+        "يمكنك اختيار قسم جذري أو المتابعة بدونه."
+    )
+
+    if not rows:
+        text = (
+            "➕ *تسجيل سؤال جديد*\n\n"
+            "الخطوة 1 من 4: لا توجد أقسام جذرية بعد.\n\n"
+            "تابع بدون قسم، أو أنشئ أقساماً أولاً."
+        )
+
+    await edit_safe(query, text, InlineKeyboardMarkup(rows))
+
+
+async def set_mcq_folder(query, context, folder_id):
+    """Step 1 result: folder chosen, ask for the question text."""
+    if not await _permission_check(query, "can_ai"):
+        return
+
+    if folder_id is not None:
+        try:
+            if not await database.get_folder(folder_id):
+                await edit_safe(
+                    query,
+                    "⚠️ القسم غير موجود.",
+                    InlineKeyboardMarkup([[btn("❌ إلغاء", "admin_mcq")]]),
+                )
+                return
+        except Exception:
+            pass
+
+    context.user_data["admin_mcq_folder"] = folder_id
+    context.user_data["admin_mcq_step"] = "text"
+
+    await edit_safe(
+        query,
+        "➕ *تسجيل سؤال جديد*\n\n"
+        "الخطوة 2 من 4: أرسل نص السؤال.\n\n"
+        "أرسل /cancel للإلغاء.",
+        InlineKeyboardMarkup([[btn("❌ إلغاء", "admin_mcq")]]),
+    )
+
+
+async def handle_mcq_text_input(update, context):
+    """Handle the text steps of the MCQ registration flow.
+
+    Returns True when the message belonged to the MCQ flow.
+    """
+    step = context.user_data.get("admin_mcq_step")
+
+    if not step:
+        return False
+
+    if not update.message or getattr(update.message, "text", None) is None:
+        # Media during a text step must never corrupt the pending question.
+        if getattr(update.message, "reply_text", None):
+            await update.message.reply_text(
+                "⚠️ أرسل نصاً في هذه الخطوة، أو /cancel للإلغاء."
+            )
+        return True
+
+    text = update.message.text.strip()
+
+    if not text:
+        await update.message.reply_text("⚠️ النص فارغ. أرسل نصاً صالحاً.")
+        return True
+
+    if step == "text":
+        if len(text) > 900:
+            await update.message.reply_text(
+                "⚠️ نص السؤال طويل جداً. اختصره قليلاً."
+            )
+            return True
+
+        context.user_data["admin_mcq_text"] = text
+        context.user_data["admin_mcq_step"] = "options"
+
+        await update.message.reply_text(
+            "➕ *تسجيل سؤال جديد*\n\n"
+            "الخطوة 3 من 4: أرسل الخيارات، كل خيار في سطر منفصل.\n\n"
+            "مثال:\n"
+            "`الخيار الأول`\n"
+            "`الخيار الثاني`\n\n"
+            "مطلوب خياران على الأقل.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return True
+
+    if step == "options":
+        options = [line.strip() for line in text.splitlines() if line.strip()]
+
+        if len(options) < 2:
+            await update.message.reply_text(
+                "⚠️ يجب إرسال خيارين على الأقل، كل خيار في سطر منفصل."
+            )
+            return True
+
+        if len(options) > 8:
+            await update.message.reply_text(
+                "⚠️ الحد الأقصى 8 خيارات."
+            )
+            return True
+
+        context.user_data["admin_mcq_options"] = options
+        context.user_data["admin_mcq_step"] = "correct"
+
+        letters = "ABCDEFGH"
+        rows = []
+
+        for index, option in enumerate(options):
+            letter = letters[index] if index < len(letters) else str(index + 1)
+            rows.append(
+                [btn(f"{letter}) {str(option)[:40]}", f"admin_mcq_correct:{index}")]
+            )
+
+        rows.append([btn("❌ إلغاء", "admin_mcq")])
+
+        await update.message.reply_text(
+            "➕ *تسجيل سؤال جديد*\n\n"
+            "الخطوة 4 من 4: اختر الإجابة الصحيحة.",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return True
+
+    if step == "explanation":
+        explanation = text
+
+        await _save_pending_mcq(update, context, explanation)
+        return True
+
+    return False
+
+
+async def choose_mcq_correct(query, context, correct_index):
+    """Record the correct answer, then ask for an optional explanation."""
+    if not await _permission_check(query, "can_ai"):
+        return
+
+    try:
+        correct_index = int(correct_index)
+    except (TypeError, ValueError):
+        return
+
+    options = context.user_data.get("admin_mcq_options") or []
+
+    if correct_index < 0 or correct_index >= len(options):
+        await edit_safe(
+            query,
+            "⚠️ خيار غير صالح.",
+            InlineKeyboardMarkup([[btn("❌ إلغاء", "admin_mcq")]]),
+        )
+        return
+
+    context.user_data["admin_mcq_correct"] = correct_index
+    context.user_data["admin_mcq_step"] = "explanation"
+
+    await edit_safe(
+        query,
+        "➕ *تسجيل سؤال جديد*\n\n"
+        "أرسل الشرح (اختياري)، أو تخطَّ هذه الخطوة.",
+        InlineKeyboardMarkup(
+            [
+                [btn("⏭ تخطي الشرح", "admin_mcq_skip_explanation")],
+                [btn("❌ إلغاء", "admin_mcq")],
+            ]
+        ),
+    )
+
+
+async def skip_mcq_explanation(query, context):
+    """Persist the question without an explanation."""
+    if not await _permission_check(query, "can_ai"):
+        return
+
+    await _save_pending_mcq_from_query(query, context, "")
+
+
+async def _save_pending_mcq_from_query(query, context, explanation):
+    """Persist a pending question that was completed via inline buttons."""
+    question_text = context.user_data.get("admin_mcq_text")
+    options = context.user_data.get("admin_mcq_options") or []
+    correct_index = context.user_data.get("admin_mcq_correct")
+    folder_id = context.user_data.get("admin_mcq_folder")
+
+    if not question_text or len(options) < 2 or correct_index is None:
+        _clear_mcq_admin_state(context)
+        await edit_safe(
+            query,
+            "⚠️ لا توجد بيانات كافية لحفظ السؤال.",
+            InlineKeyboardMarkup([[btn("🧠 إدارة بنك الأسئلة", "admin_mcq")]]),
+        )
+        return
+
+    try:
+        question_id = await database.add_mcq_question(
+            folder_id,
+            question_text,
+            options,
+            correct_index,
+            explanation or None,
+            query.from_user.id,
+        )
+    except Exception:
+        logger.exception("MCQ registration failed")
+        _clear_mcq_admin_state(context)
+        await edit_safe(
+            query,
+            "⚠️ تعذر حفظ السؤال. لم يتم تأكيد الإضافة.",
+            InlineKeyboardMarkup([[btn("🧠 إدارة بنك الأسئلة", "admin_mcq")]]),
+        )
+        return
+
+    _clear_mcq_admin_state(context)
+
+    await edit_safe(
+        query,
+        "✅ *تم تسجيل السؤال بنجاح.*\n\n"
+        f"🆔 رقم السؤال: `{question_id}`\n"
+        f"📊 عدد الخيارات: {len(options)}\n\n"
+        "سيظهر السؤال في بنك الأسئلة.",
+        InlineKeyboardMarkup(
+            [
+                [btn("➕ تسجيل سؤال آخر", "admin_mcq_add")],
+                [btn("🧠 إدارة بنك الأسئلة", "admin_mcq")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
+async def _save_pending_mcq(update, context, explanation):
+    """Persist the pending question for a text-message completion."""
+    question_text = context.user_data.get("admin_mcq_text")
+    options = context.user_data.get("admin_mcq_options") or []
+    correct_index = context.user_data.get("admin_mcq_correct")
+    folder_id = context.user_data.get("admin_mcq_folder")
+
+    if not question_text or len(options) < 2 or correct_index is None:
+        _clear_mcq_admin_state(context)
+        await update.message.reply_text("⚠️ لا توجد بيانات كافية لحفظ السؤال.")
+        return
+
+    user = update.effective_user
+
+    try:
+        question_id = await database.add_mcq_question(
+            folder_id,
+            question_text,
+            options,
+            correct_index,
+            explanation or None,
+            user.id if user else None,
+        )
+    except Exception:
+        logger.exception("MCQ registration failed")
+        _clear_mcq_admin_state(context)
+        await update.message.reply_text(
+            "⚠️ تعذر حفظ السؤال. لم يتم تأكيد الإضافة."
+        )
+        return
+
+    _clear_mcq_admin_state(context)
+
+    await update.message.reply_text(
+        "✅ *تم تسجيل السؤال بنجاح.*\n\n"
+        f"🆔 رقم السؤال: `{question_id}`\n"
+        f"📊 عدد الخيارات: {len(options)}\n\n"
+        "سيظهر السؤال في بنك الأسئلة.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=home_keyboard(),
+    )
+
+
+# ============================================================
+# LEADERBOARD — gamified contributor recognition
+# ============================================================
+
+
+def _leaderboard_text(top) -> str:
+    """Format the contributor board from approved-contribution aggregates."""
+    if not top:
+        return (
+            "🏆 *لوحة المتصدرين للمساهمين*\n\n"
+            "لا يوجد متصدرون بعد.\n\n"
+            "📤 أرسل مساهمة معتمدة لتظهر في اللوحة."
+        )
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 *لوحة المتصدرين للمساهمين*\n"]
+
+    for position, entry in enumerate(top, start=1):
+        icon = medals[position - 1] if position <= 3 else f"{position}."
+        username = entry.get("username")
+        handle = f" (@{username})" if username else ""
+
+        lines.append(
+            f"{icon} {mcq_engine_escape(entry.get('name'))}{handle}\n"
+            f"   ✅ مساهمات معتمدة: {entry.get('approved_count')}"
+        )
+
+    return "\n".join(lines)
+
+
+async def show_leaderboard(query, context=None):
+    """Public top-contributor board. Reads approved contributions only."""
+    try:
+        top = await database.get_top_contributors(limit=10)
+    except Exception:
+        logger.exception("Leaderboard query failed")
+        top = []
+
+    await edit_safe(
+        query,
+        _leaderboard_text(top),
+        InlineKeyboardMarkup(
+            [
+                [btn("📤 Student Contributions", "contribute")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
+async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/quiz — start the question bank from a message."""
+    if not update.message:
+        return
+
+    text, rows = await _mcq_menu_text_and_rows(context)
+
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/leaderboard — show the contributor board from a message."""
+    if not update.message:
+        return
+
+    try:
+        top = await database.get_top_contributors(limit=10)
+    except Exception:
+        logger.exception("Leaderboard query failed")
+        top = []
+
+    await update.message.reply_text(
+        _leaderboard_text(top),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [btn("🧠 بنك الأسئلة", "mcq_menu")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
+# ============================================================
+# NOTIFICATIONS — publication alerts
+# ============================================================
+
+
+def _build_publication_alert(title, folder_name, source_label):
+    """Compose the publication alert text sent to subscribers.
+
+    Only resource metadata that already exists in the database is included;
+    no content is generated.
+    """
+    return (
+        "📢 *مورد أكاديمي جديد في MEDBOT*\n\n"
+        f"📄 *العنوان:* {title}\n"
+        f"📁 *القسم:* {folder_name}\n"
+        f"🏷 *المصدر:* {source_label}\n\n"
+        "افتح المكتبة للاطلاع على المورد."
+    )
+
+
+async def notify_new_resource(context, title, folder_id):
+    """Notify subscribers about a newly published resource.
+
+    Failures are counted and never propagate: a Telegram block or a network
+    error must not crash the approval/resource workflow.
+    """
+    try:
+        folder_name = "غير محدد"
+        try:
+            folder = await database.get_folder(folder_id)
+            if folder:
+                folder_name = str(folder[2])[:60]
+        except Exception:
+            pass
+
+        try:
+            recipients = await database.get_notification_recipients()
+        except Exception:
+            logger.exception("Notification recipient lookup failed")
+            return 0
+
+        if not recipients:
+            return 0
+
+        text = _build_publication_alert(
+            str(title)[:120],
+            folder_name,
+            "مساهمة طالب معتمدة",
+        )
+
+        sent = await _dispatch_broadcast(context, recipients, text, None)
+
+        logger.info(
+            "Publication notification sent to %s/%s subscribers",
+            sent,
+            len(recipients),
+        )
+
+        return sent
+
+    except Exception:
+        logger.exception("Publication notification failed")
+        return 0
+
+
+def schedule_publication_notification(context, title, folder_id):
+    """Queue a publication alert without blocking the admin's handler.
+
+    Uses the application task queue when available so the approval UI responds
+    immediately. Falls back to a direct await-free task creation otherwise.
+    """
+    coro = notify_new_resource(context, title, folder_id)
+
+    application = getattr(context, "application", None)
+
+    if application is not None and hasattr(application, "create_task"):
+        application.create_task(coro)
+        return
+
+    try:
+        asyncio.get_event_loop().create_task(coro)
+    except Exception:
+        logger.exception("Could not schedule publication notification")
 
 
 # ============================================================
@@ -1693,35 +2759,41 @@ async def start_admin_upload(query, context, folder_id):
     )
 
 
+_ADMIN_STATE_KEYS = (
+    "admin_folder_create",
+    "admin_folder_parent",
+    "admin_folder_name",
+    "admin_folder_type",
+    "admin_folder_rename",
+    "admin_folder_rename_id",
+    "admin_folder_retype_id",
+    "admin_folder_move",
+    "admin_folder_move_id",
+    "admin_upload",
+    "admin_upload_folder",
+    "admin_upload_preview",
+    "admin_upload_waiting_title",
+    "admin_upload_title",
+    "admin_file_rename",
+    "admin_file_rename_id",
+    "admin_file_rename_waiting",
+    "admin_file_move",
+    "admin_file_move_id",
+    "admin_subadmin_add",
+    "admin_broadcast",
+    "admin_broadcast_text",
+    "admin_broadcast_confirm",
+    "admin_mcq_step",
+    "admin_mcq_folder",
+    "admin_mcq_text",
+    "admin_mcq_options",
+    "admin_mcq_correct",
+)
+
+
 def _clear_admin_state(context, keep=None):
     """Remove all transient admin workflow keys from user_data."""
-    keys = [
-        "admin_folder_create",
-        "admin_folder_parent",
-        "admin_folder_name",
-        "admin_folder_type",
-        "admin_folder_rename",
-        "admin_folder_rename_id",
-        "admin_folder_retype_id",
-        "admin_folder_move",
-        "admin_folder_move_id",
-        "admin_upload",
-        "admin_upload_folder",
-        "admin_upload_preview",
-        "admin_upload_waiting_title",
-        "admin_upload_title",
-        "admin_file_rename",
-        "admin_file_rename_id",
-        "admin_file_rename_waiting",
-        "admin_file_move",
-        "admin_file_move_id",
-        "admin_subadmin_add",
-        "admin_broadcast",
-        "admin_broadcast_text",
-        "admin_broadcast_confirm",
-    ]
-
-    for key in keys:
+    for key in _ADMIN_STATE_KEYS:
         if keep and key in keep:
             continue
         context.user_data.pop(key, None)
@@ -2551,6 +3623,7 @@ async def show_admin(query):
 
     if permissions.get("can_ai"):
         rows.append([btn("🤖 AI Registry", "admin_ai")])
+        rows.append([btn("🧠 إدارة بنك الأسئلة", "admin_mcq")])
 
     rows.append([btn("📊 إحصائيات النظام", "admin_stats")])
     rows.append([btn("📊 Runtime", "admin_runtime")])
@@ -2827,7 +3900,11 @@ async def confirm_admin_broadcast(query, context):
 
 
 async def _dispatch_broadcast(context, recipients, text, owner_id):
-    """Send the announcement with pacing to respect Telegram rate limits."""
+    """Send an announcement with pacing to respect Telegram rate limits.
+
+    Returns the number of successful sends. A failure for one recipient never
+    aborts the loop, so a blocked bot cannot stop the remaining deliveries.
+    """
     sent = 0
     failed = 0
 
@@ -2844,18 +3921,21 @@ async def _dispatch_broadcast(context, recipients, text, owner_id):
 
         await asyncio.sleep(0.05)
 
-    try:
-        await context.bot.send_message(
-            chat_id=owner_id,
-            text=(
-                "✅ *اكتمل إرسال التعميم*\n\n"
-                f"✔️ نجح: {sent}\n"
-                f"⚠️ فشل: {failed}"
-            ),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except Exception:
-        logger.exception("Broadcast summary send failed")
+    if owner_id is not None:
+        try:
+            await context.bot.send_message(
+                chat_id=owner_id,
+                text=(
+                    "✅ *اكتمل إرسال التعميم*\n\n"
+                    f"✔️ نجح: {sent}\n"
+                    f"⚠️ فشل: {failed}"
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            logger.exception("Broadcast summary send failed")
+
+    return sent
 
 
 # ============================================================
@@ -3348,7 +4428,7 @@ async def review_contribution(query, context, contribution_id):
     )
 
 
-async def process_approval(query, contribution_id, approve):
+async def process_approval(query, contribution_id, approve, context=None):
     try:
         is_admin = await database.is_user_admin(query.from_user.id)
     except Exception:
@@ -3414,6 +4494,14 @@ async def process_approval(query, contribution_id, approve):
                 )
         except Exception:
             pass
+
+        # Publication alert to subscribers — only on a successful approval.
+        if approve and result and context is not None:
+            schedule_publication_notification(
+                context,
+                result[1] if len(result) > 1 else "",
+                result[0] if result else None,
+            )
 
     except Exception as exc:
         logger.exception("Contribution approval/rejection failed")
@@ -3548,7 +4636,7 @@ _ADMIN_CONTENT_PREFIXES = (
 )
 
 # Callbacks that require the AI registry permission.
-_ADMIN_AI_CALLBACKS = ("admin_ai", "ai_registry")
+_ADMIN_AI_CALLBACKS = ("admin_ai", "ai_registry", "admin_mcq")
 
 # Contribution-review surfaces.
 _ADMIN_CONTRIBUTION_CALLBACKS = ("review:", "approve:", "reject:")
@@ -3598,7 +4686,7 @@ async def _admin_route_allowed(query, data: str) -> bool:
         required = "can_folders"
     elif data.startswith(_ADMIN_CONTENT_PREFIXES):
         required = "can_content"
-    elif data in _ADMIN_AI_CALLBACKS:
+    elif data.startswith(_ADMIN_AI_CALLBACKS):
         required = "can_ai"
     elif data.startswith(_ADMIN_CONTRIBUTION_CALLBACKS):
         required = "can_contributions"
@@ -3659,6 +4747,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "home":
         context.user_data["search_mode"] = False
         context.user_data["assistant_mode"] = None
+        context.user_data.pop("search_types", None)
+        context.user_data.pop("search_tag", None)
+        context.user_data.pop("last_search", None)
+        context.user_data.pop("mcq_session", None)
+        _clear_contribution_state(context)
+        _clear_mcq_admin_state(context)
         _clear_admin_state(context)
         await show_home(update)
         return
@@ -3787,13 +4881,20 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_account(query)
         return
 
+    if data == "toggle_notifications":
+        await toggle_notifications(query, context)
+        return
+
     if data == "about":
         await show_about(query)
         return
 
     if data == "contribute":
-        _clear_contribution_state(context)
-        await show_contribute(query)
+        await show_contribute(query, context)
+        return
+
+    if data == "contribute_root":
+        await show_contribution_tree(query, context, 0)
         return
 
     if data.startswith("contrib_folder:"):
@@ -3806,6 +4907,130 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⚠️ تعذر اختيار القسم.",
                 InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
             )
+        return
+
+    if data.startswith("contrib_submit_here:"):
+        try:
+            folder_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف القسم غير صالح.",
+                InlineKeyboardMarkup([[btn("📤 Student Contributions", "contribute")]]),
+            )
+            return
+        await prepare_contribution_target(query, context, folder_id)
+        return
+
+    # ---- MCQ question bank -----------------------------------
+    if data == "mcq_menu":
+        await show_mcq_menu(query, context)
+        return
+
+    if data == "mcq_start":
+        await start_mcq_session(query, context)
+        return
+
+    if data == "mcq_next":
+        await next_mcq_question(query, context)
+        return
+
+    if data == "mcq_finish":
+        await render_mcq_summary(query, context)
+        return
+
+    if data == "mcq_exit":
+        context.user_data.pop("mcq_session", None)
+        await edit_safe(
+            query,
+            "🚪 تم إنهاء الاختبار.",
+            InlineKeyboardMarkup(
+                [[btn("🧠 بنك الأسئلة", "mcq_menu")], [btn("🏠 الرئيسية", "home")]]
+            ),
+        )
+        return
+
+    if data.startswith("mcq_answer:"):
+        try:
+            _, q_key, chosen = data.split(":", 2)
+            await answer_mcq_question(query, context, q_key, chosen)
+        except (ValueError, TypeError):
+            pass
+        return
+
+    # ---- Leaderboard -----------------------------------------
+    if data == "leaderboard":
+        await show_leaderboard(query, context)
+        return
+
+    # ---- Admin MCQ bank management ---------------------------
+    if data == "admin_mcq":
+        await show_admin_mcq(query, context)
+        return
+
+    if data == "admin_mcq_add":
+        await start_admin_mcq_add(query, context)
+        return
+
+    if data == "admin_mcq_folder_skip":
+        await set_mcq_folder(query, context, None)
+        return
+
+    if data.startswith("admin_mcq_folder:"):
+        try:
+            folder_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف القسم غير صالح.",
+                InlineKeyboardMarkup([[btn("❌ إلغاء", "admin_mcq")]]),
+            )
+            return
+        await set_mcq_folder(query, context, folder_id)
+        return
+
+    if data.startswith("admin_mcq_correct:"):
+        try:
+            index = data.split(":", 1)[1]
+        except Exception:
+            index = None
+        await choose_mcq_correct(query, context, index)
+        return
+
+    if data == "admin_mcq_skip_explanation":
+        await skip_mcq_explanation(query, context)
+        return
+
+    # ---- Search type filters ---------------------------------
+    if data.startswith("search_type:"):
+        try:
+            type_token = data.split(":", 1)[1]
+        except Exception:
+            type_token = ""
+
+        await apply_search_type_filter(query, context, type_token)
+        return
+
+    if data.startswith("search_tag:"):
+        try:
+            tag_token = data.split(":", 1)[1]
+        except Exception:
+            tag_token = ""
+
+        await apply_search_tag_filter(query, context, tag_token)
+        return
+
+    if data == "search_filters_clear":
+        context.user_data.pop("search_types", None)
+        context.user_data.pop("search_tag", None)
+
+        await edit_safe(
+            query,
+            "🔎 تم إلغاء الفلاتر. اكتب كلمة البحث من جديد.",
+            InlineKeyboardMarkup(
+                [[btn("❌ إلغاء البحث", "home")]]
+            ),
+        )
         return
 
     if data == "admin":
@@ -4043,6 +5268,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("admin_file:"):
         try:
             content_id = int(data.split(":", 1)[1])
+            _clear_admin_state(context)
             await show_admin_file(query, content_id)
         except (TypeError, ValueError):
             await edit_safe(
@@ -4231,6 +5457,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("admin_folder:"):
         try:
             folder_id = int(data.split(":", 1)[1])
+            _clear_admin_state(context)
             await show_admin_folder(query, folder_id)
         except (TypeError, ValueError):
             await edit_safe(
@@ -4349,6 +5576,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "admin_folders":
+        _clear_admin_state(context)
         await show_admin_folders(query)
         return
 
@@ -4431,17 +5659,27 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("approve:"):
         try:
             contribution_id = int(data.split(":", 1)[1])
-            await process_approval(query, contribution_id, True)
-        except Exception:
-            pass
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف المساهمة غير صالح.",
+                InlineKeyboardMarkup([[btn("📥 Pending", "admin_pending")]]),
+            )
+            return
+        await process_approval(query, contribution_id, True, context)
         return
 
     if data.startswith("reject:"):
         try:
             contribution_id = int(data.split(":", 1)[1])
-            await process_approval(query, contribution_id, False)
-        except Exception:
-            pass
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف المساهمة غير صالح.",
+                InlineKeyboardMarkup([[btn("📥 Pending", "admin_pending")]]),
+            )
+            return
+        await process_approval(query, contribution_id, False, context)
         return
 
     if data == "admin_ai" or data == "ai_registry":
@@ -4547,21 +5785,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
-    active = any(
-        context.user_data.get(key)
-        for key in (
-            "admin_folder_create",
-            "admin_folder_rename",
-            "admin_folder_retype_id",
-            "admin_folder_move",
-            "admin_upload",
-            "admin_upload_waiting_title",
-            "admin_file_rename",
-            "admin_file_move",
-            "admin_subadmin_add",
-            "admin_broadcast",
-        )
-    )
+    active = any(context.user_data.get(key) for key in _ADMIN_STATE_KEYS)
 
     _clear_admin_state(context)
 
@@ -4613,6 +5837,12 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if handled:
             return
 
+    # Admin MCQ registration text steps.
+    if context.user_data.get("admin_mcq_step"):
+        handled = await handle_mcq_text_input(update, context)
+        if handled:
+            return
+
     # Admin upload awaiting media: text input should not fall through to AI.
     if context.user_data.get("admin_upload"):
         folder_id = context.user_data.get("admin_upload_folder")
@@ -4645,7 +5875,7 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("search_mode"):
         context.user_data["search_mode"] = False
         context.user_data["assistant_mode"] = None
-        await run_search(update, query)
+        await run_search(update, query, context)
         return
 
     # Explicit /ask always means Medical AI.
@@ -4739,15 +5969,11 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Admin resource upload has priority over student contributions.
-    handled = await admin_upload_media_handler(update, context)
+    if await admin_upload_media_handler(update, context):
+        return True
 
-    if handled:
-        return
-
-    handled = await contribution_media_handler(update, context)
-
-    if handled:
-        return
+    if await contribution_media_handler(update, context):
+        return True
 
     # Unrecognized media with no active state: never crash, never corrupt.
     await update.message.reply_text(
@@ -4756,6 +5982,7 @@ async def media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "أو استخدم /start للعودة إلى الرئيسية.",
         reply_markup=home_keyboard(),
     )
+    return False
 
 
 # ============================================================
@@ -4797,6 +6024,8 @@ def main():
     app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("ask", ai_handler))
+    app.add_handler(CommandHandler("quiz", quiz_command))
+    app.add_handler(CommandHandler("leaderboard", leaderboard_command))
 
     # Inline UI
     app.add_handler(CallbackQueryHandler(callback_router))
@@ -4804,7 +6033,11 @@ def main():
     # Uploaded media / student contributions
     app.add_handler(
         MessageHandler(
-            filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VIDEO,
+            filters.Document.ALL
+            | filters.PHOTO
+            | filters.AUDIO
+            | filters.VIDEO
+            | filters.VOICE,
             media_router,
         )
     )
