@@ -684,6 +684,41 @@ async def contribution_folders():
         await db.close()
 
 
+async def _contribution_label(folder_id: int, name: str) -> str:
+    """Build a 'Parent ❯ Folder' label so generic folder names stay unambiguous.
+
+    Labels are capped at 40 characters to respect Telegram button limits.
+    """
+    label = str(name or "")
+
+    try:
+        parent_id = await database.get_parent_id(folder_id)
+    except Exception:
+        parent_id = None
+
+    if parent_id:
+        try:
+            parent = await database.get_folder(parent_id)
+        except Exception:
+            parent = None
+
+        if parent:
+            try:
+                parent_name = str(parent[2] or "").strip()
+            except Exception:
+                parent_name = ""
+
+            if parent_name:
+                label = f"{parent_name} ❯ {label}"
+
+    label = label.strip()
+
+    if len(label) > 40:
+        label = label[:39].rstrip() + "…"
+
+    return label
+
+
 async def show_contribute(query):
     try:
         folders = await contribution_folders()
@@ -693,11 +728,20 @@ async def show_contribute(query):
     buttons = []
 
     for folder in folders:
-        folder_id, name, node_type = folder
+        try:
+            folder_id, name, node_type = folder[:3]
+        except Exception:
+            continue
+
+        try:
+            label = await _contribution_label(folder_id, name)
+        except Exception:
+            label = str(name)[:40]
+
         buttons.append(
             [
                 btn(
-                    f"📤 {str(name)[:35]}",
+                    f"📥 {label}",
                     f"contrib_folder:{folder_id}",
                 )
             ]
@@ -845,14 +889,46 @@ async def _admin_check(query):
         return False
 
 
+async def _permission_check(query, permission: str, message: str = None) -> bool:
+    """Return True only when the admin holds the granular permission.
+
+    Draws the denial UI so a restricted sub-admin never gets a silent no-op.
+    """
+    try:
+        allowed = await database.user_has_permission(
+            query.from_user.id, permission
+        )
+    except Exception:
+        logger.exception("Permission check failed for %s", permission)
+        allowed = False
+
+    if allowed:
+        return True
+
+    await edit_safe(
+        query,
+        message or "🔒 لا تملك الصلاحية لتنفيذ هذا الإجراء.",
+        InlineKeyboardMarkup(
+            [
+                [btn("⬅️ Admin", "admin")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+    return False
+
+
 async def show_admin_folder(query, folder_id: int):
-    """Show management actions for one existing folder."""
+    """Show management actions for one existing folder, with drill-down."""
     if not await _admin_check(query):
         await edit_safe(
             query,
             "🔒 غير مصرح.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
+        return
+
+    if not await _permission_check(query, "can_folders"):
         return
 
     try:
@@ -883,35 +959,82 @@ async def show_admin_folder(query, folder_id: int):
     except Exception:
         children = []
 
-    accepts_text = "مفعّلة ✅" if accepts else "متوقفة ⛔"
+    accepts_text = "مفعّل ✅" if accepts else "معطّل ⛔"
 
-    rows = [
-        [btn("➕ إضافة قسم فرعي", f"admin_folder_child:{folder_id}")],
-        [btn("📤 رفع مورد (Resource)", f"admin_upload:{folder_id}")],
-        [btn("✏️ إعادة تسمية", f"admin_folder_rename:{folder_id}")],
-        [btn("📦 تغيير النوع", f"admin_folder_retype_existing:{folder_id}")],
-        [btn("📤 تغيير قبول المساهمات", f"admin_folder_toggle:{folder_id}")],
-        [btn("🚚 نقل القسم", f"admin_folder_move:{folder_id}")],
-    ]
+    rows = []
 
+    # Child folders first, so the admin can drill down to any leaf.
+    for child in children:
+        try:
+            child_id, child_name, child_type, _child_accepts = child[:4]
+        except Exception:
+            continue
+
+        rows.append(
+            [
+                btn(
+                    f"{resource_icon(child_type)} {str(child_name)[:40]}",
+                    f"admin_folder:{child_id}",
+                )
+            ]
+        )
+
+    # Registered resources inside this folder.
+    for item in files:
+        try:
+            content_id = item[0]
+            title = item[1]
+            file_type = item[3]
+        except Exception:
+            continue
+
+        rows.append(
+            [
+                btn(
+                    f"{content_icon(file_type)} {str(title)[:40]}",
+                    f"admin_file:{content_id}",
+                )
+            ]
+        )
+
+    # Folder actions.
+    rows.append([btn("📤 رفع مورد لهذا القسم", f"admin_upload:{folder_id}")])
+    rows.append([btn("➕ إضافة قسم فرعي", f"admin_folder_child:{folder_id}")])
+    rows.append([btn("✏️ إعادة تسمية", f"admin_folder_rename:{folder_id}")])
+    rows.append([btn("📦 تغيير النوع", f"admin_folder_retype_existing:{folder_id}")])
+    rows.append(
+        [
+            btn(
+                f"📤 قبول المساهمات: {accepts_text}",
+                f"admin_folder_toggle:{folder_id}",
+            )
+        ]
+    )
+    rows.append([btn("🚚 نقل القسم", f"admin_folder_move:{folder_id}")])
     rows.append([btn("🗑 حذف القسم", f"admin_folder_delete:{folder_id}")])
 
     if parent_id:
-        rows.append([btn("⬅️ القسم الأب", f"admin_folder:{parent_id}")])
+        rows.append([btn("⬅️ رجوع للأب", f"admin_folder:{parent_id}")])
     else:
         rows.append([btn("⬅️ إدارة الأقسام", "admin_folders")])
 
     rows.append([btn("🏠 الرئيسية", "home")])
 
+    try:
+        breadcrumb = await database.get_breadcrumbs(folder_id)
+    except Exception:
+        breadcrumb = "الرئيسية 🏠"
+
     await edit_safe(
         query,
         "🗂 *إدارة القسم*\n\n"
+        f"📍 {breadcrumb}\n\n"
         f"📁 *الاسم:* {name}\n"
         f"🏷 *النوع:* {node_type}\n"
         f"📤 *المساهمات:* {accepts_text}\n"
         f"📄 *الموارد:* {len(files)}\n"
         f"📂 *الأقسام الفرعية:* {len(children)}\n\n"
-        "اختر الإجراء المطلوب:",
+        "اختر قسماً فرعياً للنزول إليه، أو مورداً لإدارته، أو إجراءً:",
         InlineKeyboardMarkup(rows),
     )
 
@@ -924,6 +1047,9 @@ async def show_admin_folders(query):
             "🔒 غير مصرح.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
+        return
+
+    if not await _permission_check(query, "can_folders"):
         return
 
     try:
@@ -1589,6 +1715,10 @@ def _clear_admin_state(context, keep=None):
         "admin_file_rename_waiting",
         "admin_file_move",
         "admin_file_move_id",
+        "admin_subadmin_add",
+        "admin_broadcast",
+        "admin_broadcast_text",
+        "admin_broadcast_confirm",
     ]
 
     for key in keys:
@@ -2402,6 +2532,37 @@ async def show_admin(query):
         return
 
     try:
+        permissions = await database.get_admin_permissions(user_id)
+    except Exception:
+        permissions = {key: True for key in database.PERMISSION_KEYS}
+
+    try:
+        is_owner = await database.is_owner(user_id)
+    except Exception:
+        is_owner = False
+
+    rows = []
+
+    if permissions.get("can_folders"):
+        rows.append([btn("🗂 إدارة الأقسام والفروع", "admin_folders")])
+
+    if permissions.get("can_contributions"):
+        rows.append([btn("📥 مراجعة المساهمات", "admin_pending")])
+
+    if permissions.get("can_ai"):
+        rows.append([btn("🤖 AI Registry", "admin_ai")])
+
+    rows.append([btn("📊 إحصائيات النظام", "admin_stats")])
+    rows.append([btn("📊 Runtime", "admin_runtime")])
+
+    if is_owner:
+        rows.append([btn("👥 إدارة المشرفين والصلاحيات", "admin_subadmins")])
+        rows.append([btn("💾 نسخة احتياطية للقاعدة", "admin_db_backup")])
+        rows.append([btn("📢 إرسال تعميم للطلاب", "admin_broadcast")])
+
+    rows.append([btn("🏠 الرئيسية", "home")])
+
+    try:
         pending_count = await database.get_pending_contributions_count()
     except Exception:
         pending_count = 0
@@ -2409,18 +2570,629 @@ async def show_admin(query):
     await edit_safe(
         query,
         "🛠 *MEDBOT Admin Panel*\n\n"
-        f"📤 المساهمات المعلقة: {pending_count}\n\n"
+        f"📤 المساهمات المعلقة: {pending_count}\n"
+        f"🔑 الصلاحيات: {_permissions_summary(permissions)}\n\n"
         "اختر الإجراء:",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+def _permissions_summary(permissions: dict) -> str:
+    active = [
+        database.PERMISSION_LABELS.get(key, key)
+        for key in database.PERMISSION_KEYS
+        if permissions.get(key)
+    ]
+    return "، ".join(active) if active else "لا يوجد"
+
+
+async def show_admin_stats(query):
+    if not await _admin_check(query):
+        await edit_safe(
+            query,
+            "🔒 غير مصرح.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    try:
+        stats = await database.get_system_stats()
+    except Exception:
+        logger.exception("get_system_stats failed")
+        stats = {}
+
+    await edit_safe(
+        query,
+        "📊 *إحصائيات النظام*\n\n"
+        f"👥 إجمالي الطلاب المسجلين: {stats.get('total_users', 0)}\n"
+        f"🔥 المسجلون اليوم: {stats.get('active_today', 0)}\n"
+        f"🗂 إجمالي الأقسام: {stats.get('total_folders', 0)}\n"
+        f"📄 إجمالي الموارد المسجلة: {stats.get('total_resources', 0)}\n"
+        f"⏳ المساهمات المعلقة: {stats.get('pending_contributions', 0)}\n"
+        f"🛡 المشرفون: {stats.get('total_admins', 0)}",
         InlineKeyboardMarkup(
             [
-                [btn("🗂 إدارة الأقسام والفروع", "admin_folders")],
-                [btn("📥 مراجعة المساهمات", "admin_pending")],
-                [btn("🤖 AI Registry", "admin_ai")],
-                [btn("📊 Runtime", "admin_runtime")],
+                [btn("🔄 تحديث", "admin_stats")],
+                [btn("⬅️ Admin", "admin")],
                 [btn("🏠 الرئيسية", "home")],
             ]
         ),
     )
+
+
+# ============================================================
+# Owner power tools — backup & broadcast
+# ============================================================
+
+
+async def send_database_backup(query, context):
+    """Send the live SQLite database file to the owner only."""
+    user_id = query.from_user.id
+
+    try:
+        is_owner = await database.is_owner(user_id)
+    except Exception:
+        is_owner = False
+
+    if not is_owner:
+        await edit_safe(
+            query,
+            "🔒 هذه العملية مخصصة لمالك النظام فقط.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    path = getattr(database, "DB_NAME", "medbot_v2.sqlite3")
+
+    if not os.path.isfile(path):
+        await edit_safe(
+            query,
+            "⚠️ لم يتم العثور على ملف قاعدة البيانات.",
+            InlineKeyboardMarkup(
+                [
+                    [btn("⬅️ Admin", "admin")],
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
+        )
+        return
+
+    try:
+        with open(path, "rb") as handle:
+            await context.bot.send_document(
+                chat_id=query.from_user.id,
+                document=handle,
+                filename=os.path.basename(path),
+                caption="💾 نسخة احتياطية لقاعدة بيانات MEDBOT",
+            )
+        await edit_safe(
+            query,
+            "✅ تم إرسال النسخة الاحتياطية في المحادثة الخاصة.",
+            InlineKeyboardMarkup(
+                [
+                    [btn("⬅️ Admin", "admin")],
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
+        )
+    except Exception:
+        logger.exception("Database backup send failed")
+        await edit_safe(
+            query,
+            "⚠️ تعذر إرسال النسخة الاحتياطية.",
+            InlineKeyboardMarkup(
+                [
+                    [btn("⬅️ Admin", "admin")],
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
+        )
+
+
+async def start_admin_broadcast(query, context):
+    """Owner-only entry point for a mass announcement workflow."""
+    user_id = query.from_user.id
+
+    try:
+        is_owner = await database.is_owner(user_id)
+    except Exception:
+        is_owner = False
+
+    if not is_owner:
+        await edit_safe(
+            query,
+            "🔒 هذه العملية مخصصة لمالك النظام فقط.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    context.user_data["admin_broadcast"] = True
+    context.user_data.pop("admin_broadcast_text", None)
+
+    await edit_safe(
+        query,
+        "📢 *إرسال تعميم للطلاب*\n\n"
+        "أرسل الآن نص التعميم الذي تريد إرساله لجميع الطلاب.\n"
+        "يمكنك استخدام Markdown أو HTML.\n\n"
+        "لإلغاء العملية أرسل /cancel",
+        InlineKeyboardMarkup(
+            [
+                [btn("❌ إلغاء", "home")],
+            ]
+        ),
+    )
+
+
+async def handle_pending_broadcast_input(update, context):
+    """Capture the owner's announcement text, then ask for confirmation."""
+    if not context.user_data.get("admin_broadcast"):
+        return False
+
+    message = update.effective_message
+    if message is None or getattr(message, "text", None) is None:
+        return False
+
+    user_id = update.effective_user.id
+
+    try:
+        is_owner = await database.is_owner(user_id)
+    except Exception:
+        is_owner = False
+
+    if not is_owner:
+        context.user_data.pop("admin_broadcast", None)
+        return False
+
+    text = message.text.strip()
+
+    if not text:
+        await message.reply_text("⚠️ النص فارغ. أرسل نص التعميم أو /cancel.")
+        return True
+
+    context.user_data.pop("admin_broadcast", None)
+    context.user_data["admin_broadcast_confirm"] = text[:3500]
+
+    try:
+        recipients = len(await database.get_all_user_ids())
+    except Exception:
+        recipients = 0
+
+    preview = text[:3500]
+
+    await message.reply_text(
+        "📢 *تأكيد التعميم*\n\n"
+        f"👥 عدد المستلمين: {recipients}\n\n"
+        "――――――――――\n"
+        f"{preview}\n"
+        "――――――――――",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [btn("✅ إرسال الآن", "admin_broadcast_confirm")],
+                [btn("❌ إلغاء", "admin_broadcast_cancel")],
+            ]
+        ),
+    )
+    return True
+
+
+async def confirm_admin_broadcast(query, context):
+    user_id = query.from_user.id
+
+    try:
+        is_owner = await database.is_owner(user_id)
+    except Exception:
+        is_owner = False
+
+    if not is_owner:
+        await edit_safe(
+            query,
+            "🔒 هذه العملية مخصصة لمالك النظام فقط.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    text = context.user_data.pop("admin_broadcast_confirm", None)
+
+    if not text:
+        await edit_safe(
+            query,
+            "⚠️ لا يوجد تعميم بانتظار التأكيد.",
+            InlineKeyboardMarkup(
+                [
+                    [btn("📢 تعميم جديد", "admin_broadcast")],
+                    [btn("⬅️ Admin", "admin")],
+                ]
+            ),
+        )
+        return
+
+    try:
+        recipients = await database.get_all_user_ids()
+    except Exception:
+        recipients = []
+
+    await query.edit_message_text(
+        f"⏳ جارٍ إرسال التعميم إلى {len(recipients)} مستخدم...",
+    )
+
+    context.application.create_task(
+        _dispatch_broadcast(context, recipients, text, query.from_user.id)
+    )
+
+
+async def _dispatch_broadcast(context, recipients, text, owner_id):
+    """Send the announcement with pacing to respect Telegram rate limits."""
+    sent = 0
+    failed = 0
+
+    for user_id in recipients:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+
+        await asyncio.sleep(0.05)
+
+    try:
+        await context.bot.send_message(
+            chat_id=owner_id,
+            text=(
+                "✅ *اكتمل إرسال التعميم*\n\n"
+                f"✔️ نجح: {sent}\n"
+                f"⚠️ فشل: {failed}"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        logger.exception("Broadcast summary send failed")
+
+
+# ============================================================
+# Sub-admin management (owner only)
+# ============================================================
+
+
+async def show_subadmins(query):
+    user_id = query.from_user.id
+
+    try:
+        is_owner = await database.is_owner(user_id)
+    except Exception:
+        is_owner = False
+
+    if not is_owner:
+        await edit_safe(
+            query,
+            "🔒 هذه المنطقة مخصصة لمالك النظام فقط.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    try:
+        admins = await database.get_all_admins()
+    except Exception:
+        admins = []
+
+    rows = []
+    lines = ["👥 *إدارة المشرفين والصلاحيات*\n"]
+
+    if not admins:
+        lines.append("لا يوجد مشرفون مضافون حالياً (غير المالك).")
+    else:
+        for admin in admins:
+            try:
+                admin_id, admin_name, _added_at = admin[:3]
+            except Exception:
+                continue
+
+            try:
+                permissions = await database.get_admin_permissions(admin_id)
+            except Exception:
+                permissions = {}
+
+            owner_tag = (
+                " 👑"
+                if await database.is_owner(admin_id)
+                else ""
+            )
+
+            label = str(admin_name or admin_id)[:20]
+            lines.append(
+                f"• `{admin_id}`{owner_tag} — {_permissions_summary(permissions)}"
+            )
+
+            rows.append(
+                [
+                    btn(
+                        f"⚙️ {label}{owner_tag}",
+                        f"admin_subadmin_view:{admin_id}",
+                    ),
+                    btn("🗑", f"admin_subadmin_revoke:{admin_id}"),
+                ]
+            )
+
+    rows.append([btn("➕ إضافة مشرف جديد", "admin_subadmin_add")])
+    rows.append([btn("⬅️ Admin", "admin")])
+    rows.append([btn("🏠 الرئيسية", "home")])
+
+    await edit_safe(
+        query,
+        "\n".join(lines),
+        InlineKeyboardMarkup(rows),
+    )
+
+
+async def show_subadmin_detail(query, user_id: int):
+    """Permission toggles for a single sub-admin."""
+    requester = query.from_user.id
+
+    try:
+        is_owner = await database.is_owner(requester)
+    except Exception:
+        is_owner = False
+
+    if not is_owner:
+        await edit_safe(
+            query,
+            "🔒 هذه المنطقة مخصصة لمالك النظام فقط.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        await edit_safe(
+            query,
+            "⚠️ معرّف غير صالح.",
+            InlineKeyboardMarkup([[btn("⬅️ المشرفون", "admin_subadmins")]]),
+        )
+        return
+
+    try:
+        permissions = await database.get_admin_permissions(user_id)
+    except Exception:
+        permissions = {}
+
+    rows = []
+
+    for key in database.PERMISSION_KEYS:
+        state = "✅" if permissions.get(key) else "⛔"
+        rows.append(
+            [
+                btn(
+                    f"{state} {database.PERMISSION_LABELS.get(key, key)}",
+                    f"admin_subadmin_toggle:{user_id}:{key}",
+                )
+            ]
+        )
+
+    rows.append([btn("🗑 إلغاء صلاحيات المشرف", f"admin_subadmin_revoke:{user_id}")])
+    rows.append([btn("⬅️ المشرفون", "admin_subadmins")])
+    rows.append([btn("🏠 الرئيسية", "home")])
+
+    await edit_safe(
+        query,
+        "⚙️ *صلاحيات المشرف*\n\n"
+        f"🆔 `{user_id}`\n\n"
+        "اضغط على أي صلاحية لتفعيلها أو تعطيلها:",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+async def toggle_subadmin_permission(query, user_id, permission):
+    requester = query.from_user.id
+
+    try:
+        is_owner = await database.is_owner(requester)
+    except Exception:
+        is_owner = False
+
+    if not is_owner:
+        await edit_safe(
+            query,
+            "🔒 هذه المنطقة مخصصة لمالك النظام فقط.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        await edit_safe(
+            query,
+            "⚠️ معرّف غير صالح.",
+            InlineKeyboardMarkup([[btn("⬅️ المشرفون", "admin_subadmins")]]),
+        )
+        return
+
+    if permission not in database.PERMISSION_KEYS:
+        await edit_safe(
+            query,
+            "⚠️ صلاحية غير معروفة.",
+            InlineKeyboardMarkup([[btn("⬅️ المشرفون", "admin_subadmins")]]),
+        )
+        return
+
+    try:
+        permissions = await database.get_admin_permissions(user_id)
+        permissions[permission] = not permissions.get(permission)
+        ok = await database.update_admin_permissions(user_id, permissions)
+    except Exception:
+        logger.exception("toggle_subadmin_permission failed")
+        ok = False
+
+    if not ok:
+        # No sub_admins row yet (legacy admin). Persist a full row now.
+        try:
+            existing = await database.get_sub_admin(user_id)
+            if not existing:
+                await database.add_sub_admin_record(
+                    user_id,
+                    permissions=permissions,
+                    added_by=requester,
+                )
+        except Exception:
+            logger.exception("Could not materialise sub_admin row")
+
+    await show_subadmin_detail(query, user_id)
+
+
+async def start_add_subadmin(query, context):
+    requester = query.from_user.id
+
+    try:
+        is_owner = await database.is_owner(requester)
+    except Exception:
+        is_owner = False
+
+    if not is_owner:
+        await edit_safe(
+            query,
+            "🔒 هذه المنطقة مخصصة لمالك النظام فقط.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    context.user_data["admin_subadmin_add"] = True
+
+    await edit_safe(
+        query,
+        "➕ *إضافة مشرف جديد*\n\n"
+        "أرسل الآن الـ Telegram ID الرقمي للمستخدم الجديد، "
+        "أو اسمه المسجل في البوت.\n\n"
+        "لإلغاء العملية أرسل /cancel",
+        InlineKeyboardMarkup([[btn("❌ إلغاء", "admin_subadmins")]]),
+    )
+
+
+async def handle_pending_subadmin_input(update, context):
+    """Consume the owner's identifier input and create the sub-admin."""
+    if not context.user_data.get("admin_subadmin_add"):
+        return False
+
+    message = update.effective_message
+    if message is None or getattr(message, "text", None) is None:
+        return False
+
+    requester = update.effective_user.id
+
+    try:
+        is_owner = await database.is_owner(requester)
+    except Exception:
+        is_owner = False
+
+    if not is_owner:
+        context.user_data.pop("admin_subadmin_add", None)
+        return False
+
+    identifier = message.text.strip()
+    context.user_data.pop("admin_subadmin_add", None)
+
+    if not identifier:
+        await message.reply_text("⚠️ المعرّف فارغ. أعد المحاولة أو /cancel.")
+        return True
+
+    try:
+        target_id = int(identifier) if identifier.isdigit() else None
+    except (TypeError, ValueError):
+        target_id = None
+
+    if target_id is None:
+        # Fall back to the existing username lookup helper.
+        try:
+            ok, note = await database.add_sub_admin_by_any(identifier)
+        except Exception:
+            ok, note = False, "تعذر إضافة المشرف."
+
+        if not ok:
+            await message.reply_text(
+                f"⚠️ {note}\n\nأرسل رقماً صحيحاً أو /cancel.",
+                reply_markup=home_keyboard(),
+            )
+            return True
+
+        try:
+            target_id = int(
+                (await database.get_all_admins())[-1][0]
+            )
+        except Exception:
+            target_id = None
+
+    if target_id is None:
+        await message.reply_text(
+            "⚠️ تعذر تحديد معرّف المستخدم.",
+            reply_markup=home_keyboard(),
+        )
+        return True
+
+    try:
+        await database.add_sub_admin(target_id)
+        await database.add_sub_admin_record(
+            target_id,
+            permissions={key: True for key in database.PERMISSION_KEYS},
+            added_by=requester,
+        )
+    except Exception:
+        logger.exception("add sub admin failed")
+
+    await message.reply_text(
+        f"✅ تمت إضافة المشرف `{target_id}`.\n\nاضبط صلاحياته الآن:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    btn(
+                        "⚙️ ضبط الصلاحيات",
+                        f"admin_subadmin_view:{target_id}",
+                    )
+                ],
+                [btn("⬅️ المشرفون", "admin_subadmins")],
+            ]
+        ),
+    )
+    return True
+
+
+async def revoke_subadmin(query, user_id):
+    requester = query.from_user.id
+
+    try:
+        is_owner = await database.is_owner(requester)
+    except Exception:
+        is_owner = False
+
+    if not is_owner:
+        await edit_safe(
+            query,
+            "🔒 هذه المنطقة مخصصة لمالك النظام فقط.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        await show_subadmins(query)
+        return
+
+    try:
+        await database.remove_sub_admin(user_id)
+    except Exception:
+        logger.exception("revoke_subadmin failed")
+
+    await show_subadmins(query)
 
 
 async def show_pending(query, context):
@@ -2677,7 +3449,10 @@ async def show_ai_registry(query):
         rows = []
 
     if not rows:
-        text = "🤖 *AI Registry*\n\nلا توجد نماذج مسجلة حالياً."
+        text = (
+            "🤖 *AI Registry*\n\n"
+            "لا توجد نماذج مسجلة حالياً في السجل."
+        )
     else:
         lines = ["🤖 *AI Registry*\n"]
 
@@ -2703,6 +3478,7 @@ async def show_ai_registry(query):
         text,
         InlineKeyboardMarkup(
             [
+                [btn("🔄 تحديث السجل", "admin_ai")],
                 [btn("⬅️ Admin", "admin")],
                 [btn("🏠 الرئيسية", "home")],
             ]
@@ -2755,6 +3531,118 @@ async def show_runtime(query):
 # ============================================================
 
 
+# ============================================================
+# CALLBACK ROUTER — authorization gate
+# ============================================================
+
+
+# Callback prefixes owned by the folder subsystem.
+_ADMIN_FOLDER_PREFIXES = (
+    "admin_folder",
+)
+
+# Callback prefixes owned by the content/resource subsystem.
+_ADMIN_CONTENT_PREFIXES = (
+    "admin_file",
+    "admin_upload",
+)
+
+# Callbacks that require the AI registry permission.
+_ADMIN_AI_CALLBACKS = ("admin_ai", "ai_registry")
+
+# Contribution-review surfaces.
+_ADMIN_CONTRIBUTION_CALLBACKS = ("review:", "approve:", "reject:")
+
+# Owner-only callbacks.
+_ADMIN_OWNER_CALLBACKS = (
+    "admin_subadmin",
+    "admin_db_backup",
+    "admin_broadcast",
+)
+
+
+async def _admin_route_allowed(query, data: str) -> bool:
+    """Central authorization gate for admin callbacks.
+
+    Returns True when the callback may proceed. When it must be denied, the
+    denial UI is drawn here so no admin route can be reached by a user (or a
+    sub-admin) lacking the relevant permission.
+    """
+    if not data:
+        return True
+
+    # Owner-only surfaces.
+    if data.startswith(_ADMIN_OWNER_CALLBACKS):
+        try:
+            is_owner = await database.is_owner(query.from_user.id)
+        except Exception:
+            is_owner = False
+
+        if not is_owner:
+            await edit_safe(
+                query,
+                "🔒 هذه المنطقة مخصصة لمالك النظام فقط.",
+                InlineKeyboardMarkup(
+                    [
+                        [btn("⬅️ Admin", "admin")],
+                        [btn("🏠 الرئيسية", "home")],
+                    ]
+                ),
+            )
+            return False
+        return True
+
+    required = None
+
+    if data.startswith(_ADMIN_FOLDER_PREFIXES):
+        required = "can_folders"
+    elif data.startswith(_ADMIN_CONTENT_PREFIXES):
+        required = "can_content"
+    elif data in _ADMIN_AI_CALLBACKS:
+        required = "can_ai"
+    elif data.startswith(_ADMIN_CONTRIBUTION_CALLBACKS):
+        required = "can_contributions"
+    elif data == "admin_pending":
+        required = "can_contributions"
+
+    if required is None:
+        return True
+
+    try:
+        is_admin = await database.is_user_admin(query.from_user.id)
+    except Exception:
+        is_admin = False
+
+    if not is_admin:
+        await edit_safe(
+            query,
+            "🔒 غير مصرح.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return False
+
+    try:
+        allowed = await database.user_has_permission(query.from_user.id, required)
+    except Exception:
+        logger.exception("Permission gate failed for %s", required)
+        allowed = False
+
+    if allowed:
+        return True
+
+    await edit_safe(
+        query,
+        "🔒 لا تملك الصلاحية لتنفيذ هذا الإجراء.",
+        InlineKeyboardMarkup(
+            [
+                [btn("⬅️ Admin", "admin")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+    return False
+
+
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
 
@@ -2764,6 +3652,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     data = query.data or ""
+
+    if not await _admin_route_allowed(query, data):
+        return
 
     if data == "home":
         context.user_data["search_mode"] = False
@@ -3553,12 +4444,75 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    if data == "admin_ai":
+    if data == "admin_ai" or data == "ai_registry":
         await show_ai_registry(query)
         return
 
     if data == "admin_runtime":
         await show_runtime(query)
+        return
+
+    if data == "admin_stats":
+        await show_admin_stats(query)
+        return
+
+    if data == "admin_db_backup":
+        await send_database_backup(query, context)
+        return
+
+    if data == "admin_broadcast":
+        await start_admin_broadcast(query, context)
+        return
+
+    if data == "admin_broadcast_confirm":
+        await confirm_admin_broadcast(query, context)
+        return
+
+    if data == "admin_broadcast_cancel":
+        _clear_admin_state(context)
+        await show_admin(query)
+        return
+
+    if data == "admin_subadmins":
+        await show_subadmins(query)
+        return
+
+    if data == "admin_subadmin_add":
+        await start_add_subadmin(query, context)
+        return
+
+    if data.startswith("admin_subadmin_view:"):
+        try:
+            target_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرّف غير صالح.",
+                InlineKeyboardMarkup([[btn("⬅️ المشرفون", "admin_subadmins")]]),
+            )
+            return
+        await show_subadmin_detail(query, target_id)
+        return
+
+    if data.startswith("admin_subadmin_revoke:"):
+        try:
+            target_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await show_subadmins(query)
+            return
+        await revoke_subadmin(query, target_id)
+        return
+
+    if data.startswith("admin_subadmin_toggle:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            await edit_safe(
+                query,
+                "⚠️ بيانات غير صالحة.",
+                InlineKeyboardMarkup([[btn("⬅️ المشرفون", "admin_subadmins")]]),
+            )
+            return
+        await toggle_subadmin_permission(query, parts[1], parts[2])
         return
 
 
@@ -3604,6 +4558,8 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "admin_upload_waiting_title",
             "admin_file_rename",
             "admin_file_move",
+            "admin_subadmin_add",
+            "admin_broadcast",
         )
     )
 
@@ -3642,6 +4598,18 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         and context.user_data.get("admin_file_rename_waiting")
     ):
         handled = await handle_pending_title_input(update, context)
+        if handled:
+            return
+
+    # Owner: broadcast text capture.
+    if context.user_data.get("admin_broadcast"):
+        handled = await handle_pending_broadcast_input(update, context)
+        if handled:
+            return
+
+    # Owner: new sub-admin identifier capture.
+    if context.user_data.get("admin_subadmin_add"):
+        handled = await handle_pending_subadmin_input(update, context)
         if handled:
             return
 

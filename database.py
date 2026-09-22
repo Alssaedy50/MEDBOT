@@ -1,5 +1,6 @@
 import aiosqlite
 import logging
+import os
 
 from datetime import datetime, date
 from typing import Tuple
@@ -98,6 +99,16 @@ async def init_db():
                 telegram_id INTEGER PRIMARY KEY,
                 username TEXT,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS sub_admins (
+                user_id INTEGER PRIMARY KEY,
+                role TEXT DEFAULT 'subadmin',
+                permissions TEXT DEFAULT '',
+                added_by INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -1005,6 +1016,12 @@ async def get_all_admins():
     return rows
 
 async def is_user_admin(telegram_id: int) -> bool:
+    try:
+        if await is_owner(telegram_id):
+            return True
+    except Exception:
+        pass
+
     db = await get_db()
     async with db.execute("SELECT 1 FROM admins WHERE telegram_id = ?", (telegram_id,)) as cur:
         row = await cur.fetchone()
@@ -1048,6 +1065,233 @@ async def get_all_user_ids() -> list:
         rows = await cur.fetchall()
     await db.close()
     return [r[0] for r in rows]
+
+
+# ============================================================
+# RBAC — sub-admin roles & granular permissions
+# ============================================================
+
+PERMISSION_KEYS = ("can_folders", "can_content", "can_contributions", "can_ai")
+
+PERMISSION_LABELS = {
+    "can_folders": "الأقسام والفروع",
+    "can_content": "الموردين (رفع/إدارة)",
+    "can_contributions": "مراجعة المساهمات",
+    "can_ai": "سجل الذكاء الاصطناعي",
+}
+
+
+def _default_permissions() -> dict:
+    return {key: True for key in PERMISSION_KEYS}
+
+
+def permissions_to_string(permissions: dict) -> str:
+    return ",".join(
+        key
+        for key in PERMISSION_KEYS
+        if permissions.get(key)
+    )
+
+
+def permissions_from_string(value: str) -> dict:
+    raw = set(
+        part.strip()
+        for part in str(value or "").split(",")
+        if part.strip()
+    )
+    return {key: (key in raw) for key in PERMISSION_KEYS}
+
+
+async def get_sub_admins() -> list:
+    """Return (user_id, role, permissions_string, added_by, created_at) rows."""
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT user_id, role, permissions, added_by, created_at "
+            "FROM sub_admins ORDER BY created_at ASC"
+        ) as cur:
+            return await cur.fetchall()
+    finally:
+        await db.close()
+
+
+async def get_sub_admin(user_id: int):
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT user_id, role, permissions, added_by, created_at "
+            "FROM sub_admins WHERE user_id = ?",
+            (user_id,),
+        ) as cur:
+            return await cur.fetchone()
+    finally:
+        await db.close()
+
+
+async def add_sub_admin_record(
+    user_id: int,
+    permissions: dict = None,
+    role: str = "subadmin",
+    added_by: int = None,
+) -> bool:
+    permissions = permissions or _default_permissions()
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT OR REPLACE INTO sub_admins "
+            "(user_id, role, permissions, added_by) VALUES (?, ?, ?, ?)",
+            (
+                int(user_id),
+                role,
+                permissions_to_string(permissions),
+                added_by,
+            ),
+        )
+        await db.commit()
+        return True
+    except Exception:
+        logger.exception("add_sub_admin_record failed for %s", user_id)
+        return False
+    finally:
+        await db.close()
+
+
+async def update_admin_permissions(user_id: int, permissions: dict) -> bool:
+    """Persist a permissions dict for a sub-admin. Returns True on success."""
+    if not isinstance(permissions, dict):
+        return False
+
+    normalized = {
+        key: bool(permissions.get(key))
+        for key in PERMISSION_KEYS
+    }
+
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "UPDATE sub_admins SET permissions = ? WHERE user_id = ?",
+            (permissions_to_string(normalized), int(user_id)),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def get_admin_permissions(user_id: int) -> dict:
+    """Resolve the effective permission set for any admin user.
+
+    The configured owner (OWNER_ID/ADMIN_ID) always has full permissions.
+    A sub-admin without a sub_admins row is treated as fully permitted so the
+    pre-existing `admins` table behaviour is preserved.
+    """
+    if await is_owner(user_id):
+        return _default_permissions()
+
+    row = await get_sub_admin(user_id)
+    if row:
+        return permissions_from_string(row[2])
+
+    return _default_permissions()
+
+
+async def user_has_permission(user_id: int, permission: str) -> bool:
+    if permission not in PERMISSION_KEYS:
+        return False
+
+    try:
+        if await is_owner(user_id):
+            return True
+    except Exception:
+        pass
+
+    try:
+        if not await is_user_admin(user_id):
+            return False
+    except Exception:
+        return False
+
+    permissions = await get_admin_permissions(user_id)
+    return bool(permissions.get(permission))
+
+
+async def is_owner(user_id: int) -> bool:
+    """True only for the owner configured via OWNER_ID/ADMIN_ID.
+
+    ADMIN_ID=0 must never promote anyone (legacy safety rule).
+    """
+    for name in ("OWNER_ID", "ADMIN_ID"):
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            continue
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value != 0 and value == int(user_id):
+            return True
+    return False
+
+
+# ============================================================
+# Analytics helpers
+# ============================================================
+
+async def get_system_stats() -> dict:
+    """Return real counts for the admin dashboard. Never fabricates values."""
+    stats = {
+        "total_users": 0,
+        "active_today": 0,
+        "total_folders": 0,
+        "total_resources": 0,
+        "pending_contributions": 0,
+        "total_admins": 0,
+    }
+
+    db = await get_db()
+    try:
+        queries = {
+            "total_users": "SELECT COUNT(*) FROM users",
+            "active_today": (
+                "SELECT COUNT(*) FROM users "
+                "WHERE date(joined_date) = date('now')"
+            ),
+            "total_folders": "SELECT COUNT(*) FROM folders",
+            "total_resources": "SELECT COUNT(*) FROM content",
+            "pending_contributions": (
+                "SELECT COUNT(*) FROM contributions WHERE status = 'pending'"
+            ),
+            "total_admins": "SELECT COUNT(*) FROM admins",
+        }
+
+        for key, sql in queries.items():
+            try:
+                async with db.execute(sql) as cur:
+                    row = await cur.fetchone()
+                stats[key] = int(row[0]) if row else 0
+            except Exception:
+                stats[key] = 0
+
+        return stats
+    finally:
+        await db.close()
+
+
+async def get_active_users_since(days: int = 1) -> int:
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT COUNT(*) FROM users "
+            "WHERE joined_date >= datetime('now', ?)",
+            (f"-{int(days)} day",),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        await db.close()
+
+
+
 
 async def get_pending_contributions_count() -> int:
     db = await get_db()
