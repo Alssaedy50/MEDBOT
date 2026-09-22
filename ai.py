@@ -8,6 +8,7 @@ import httpx
 from dotenv import load_dotenv
 
 import database
+from medical_sources import search_pubmed, build_source_context
 
 # Force IPv4 to avoid IPv6/network issues in Termux.
 _orig_getaddrinfo = socket.getaddrinfo
@@ -30,13 +31,27 @@ load_dotenv(dotenv_path="./.env")
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """أنت المساعد الطبي الذكي لمنصة MEDBOT.
-أجب بدقة علمية موثوقة لطلاب الطب والعلوم الصحية.
-القواعد:
-1. اذكر المصطلحات الطبية باللغة الإنجليزية واشرحها بالعربية بوضوح.
-2. نسق الإجابة بنقاط واضحة ومباشرة دون حشو.
-3. لا تخترع معلومات أو مراجع.
-4. إذا كان السؤال يحتاج تشخيصاً أو علاجاً شخصياً، وضّح أن الإجابة تعليمية وليست بديلاً عن الطبيب.
+SYSTEM_PROMPT = """أنت المساعد الطبي الذكي لمنصة MEDBOT لطلاب الطب والعلوم الصحية.
+
+الهدف: تقديم إجابة طبية قصيرة، مباشرة، علمياً موثوقة وسريعة.
+
+القواعد الإلزامية:
+1. أجب عن السؤال مباشرة دون مقدمات أو حشو.
+2. اجعل الإجابة مختصرة: أهم النقاط فقط، ويفضل 3-7 نقاط عند مناسبة ذلك.
+3. اذكر المصطلحات الطبية الأساسية باللغة الإنجليزية مع شرح عربي مختصر عند الحاجة.
+4. لا تخترع أي معلومة أو مرجع أو مصدر.
+5. عند ذكر مصدر، استخدم مصدراً طبياً موثوقاً فقط، مثل NCBI/NIH أو إرشادات الجمعيات الطبية أو المراجع الطبية الأكاديمية المعروفة.
+6. لا تنسب معلومة إلى مصدر لم تتحقق منها.
+7. إذا لم تكن متأكداً من معلومة، قل بوضوح إنك غير متأكد بدلاً من التخمين.
+8. لا تطيل الشرح إلا إذا طلب المستخدم التفصيل.
+9. إذا كان السؤال عن تشخيص أو علاج شخصي، اجعل الإجابة تعليمية ومختصرة واذكر أنها لا تغني عن تقييم الطبيب.
+10. لا تقدم تشخيصاً شخصياً أو وصفة علاجية شخصية بناءً على معلومات محدودة.
+
+11. استخدم المصادر التي يزوّدك بها النظام فقط عند ذكر مصدر تم التحقق منه.
+12. لا تخترع PMID أو رابطاً أو اسم مصدر.
+13. إذا وُجدت مصادر موثقة، اجعل الإجابة مبنية عليها قدر الإمكان.
+14. في نهاية الإجابة أضف سطراً قصيراً بعنوان "Source:" يتضمن عنوان المصدر وPMID فقط.
+15. إذا لم توجد مصادر موثقة، لا تقل إنك تحققت من مصدر؛ أجب بحذر ولا تنشئ مرجعاً من نفسك.
 """
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -1035,6 +1050,12 @@ async def _record_failure(item, exc):
 
 
 async def generate_medical_ai_response(prompt: str, user_id: int = None) -> str:
+    # REAL MEDICAL SOURCE RETRIEVAL
+    # NCBI PubMed is queried before generation so the model receives
+    # actual source records instead of inventing references.
+    sources = await search_pubmed(prompt, limit=3)
+    source_context = build_source_context(sources)
+
     prompt = (prompt or "").strip()
 
     if not prompt:
@@ -1052,11 +1073,62 @@ async def generate_medical_ai_response(prompt: str, user_id: int = None) -> str:
             try:
                 started = time.perf_counter()
 
+                grounded_prompt = (
+                    f"User question:\n{prompt}\n\n"
+                    f"Verified medical source context from NCBI PubMed:\n"
+                    f"{source_context}\n\n"
+                    "Answer the user's question briefly and accurately. "
+                    "Use only the supplied source context for source claims. "
+                    "Do not invent citations, PMID numbers, URLs, or sources."
+                )
+
                 answer = await _request(
                     client,
                     item,
-                    prompt,
+                    grounded_prompt,
                 )
+
+                # Add the verified PubMed source programmatically.
+                # The model must not be trusted to invent or format citations.
+                if sources:
+                    verified_source = sources[0]
+                    source_line = (
+                        f"\n\nSource: {verified_source['title']} "
+                        f"(PMID: {verified_source['pmid']})"
+                    )
+
+                    # Remove any model-generated Source line so the final
+                    # citation always comes from the verified PubMed record.
+                    # Remove every model-generated citation/source line.
+                    # The application, not the model, owns the final citation.
+                    source_patterns = (
+                        "source:",
+                        "source：",
+                        "المصدر:",
+                        "المصدر：",
+                        "sources:",
+                        "references:",
+                        "reference:",
+                    )
+
+                    lines = answer.splitlines()
+                    cleaned_lines = []
+
+                    for line in lines:
+                        normalized_line = line.strip().lower()
+
+                        if any(
+                            normalized_line.startswith(pattern)
+                            for pattern in source_patterns
+                        ):
+                            continue
+
+                        cleaned_lines.append(line)
+
+                    answer = "\n".join(cleaned_lines).strip()
+
+                    if answer:
+                        answer += source_line
 
                 latency_ms = round(
                     (time.perf_counter() - started) * 1000,

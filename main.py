@@ -818,6 +818,77 @@ async def _admin_check(query):
         return False
 
 
+async def show_admin_folder(query, folder_id: int):
+    """Show management actions for one existing folder."""
+    if not await _admin_check(query):
+        await edit_safe(
+            query,
+            "🔒 غير مصرح.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    try:
+        folder = await database.get_folder(folder_id)
+    except Exception:
+        folder = None
+
+    if not folder:
+        await edit_safe(
+            query,
+            "⚠️ القسم غير موجود.",
+            InlineKeyboardMarkup([
+                [btn("🗂 إدارة الأقسام", "admin_folders")],
+                [btn("🏠 الرئيسية", "home")],
+            ]),
+        )
+        return
+
+    _, parent_id, name, node_type, accepts = folder
+
+    try:
+        files = await database.get_files(folder_id)
+    except Exception:
+        files = []
+
+    try:
+        children = await database.get_folders(folder_id)
+    except Exception:
+        children = []
+
+    accepts_text = "مفعّلة ✅" if accepts else "متوقفة ⛔"
+
+    rows = [
+        [btn("➕ إضافة قسم فرعي", f"admin_folder_child:{folder_id}")],
+        [btn("✏️ إعادة تسمية", f"admin_folder_rename:{folder_id}")],
+        [btn("📦 تغيير النوع", f"admin_folder_retype_existing:{folder_id}")],
+        [btn("📤 تغيير قبول المساهمات", f"admin_folder_toggle:{folder_id}")],
+        [btn("🚚 نقل القسم", f"admin_folder_move:{folder_id}")],
+    ]
+
+    if not children and not files:
+        rows.append([btn("🗑 حذف القسم", f"admin_folder_delete:{folder_id}")])
+
+    if parent_id:
+        rows.append([btn("⬅️ القسم الأب", f"admin_folder:{parent_id}")])
+    else:
+        rows.append([btn("⬅️ إدارة الأقسام", "admin_folders")])
+
+    rows.append([btn("🏠 الرئيسية", "home")])
+
+    await edit_safe(
+        query,
+        "🗂 *إدارة القسم*\n\n"
+        f"📁 *الاسم:* {name}\n"
+        f"🏷 *النوع:* {node_type}\n"
+        f"📤 *المساهمات:* {accepts_text}\n"
+        f"📄 *الموارد:* {len(files)}\n"
+        f"📂 *الأقسام الفرعية:* {len(children)}\n\n"
+        "اختر الإجراء المطلوب:",
+        InlineKeyboardMarkup(rows),
+    )
+
+
 async def show_admin_folders(query):
     """Admin-only folder management menu."""
     if not await _admin_check(query):
@@ -876,7 +947,7 @@ async def show_admin_folder_parents(query, parent_id=0):
                 [
                     btn(
                         f"📁 {str(name)[:35]}",
-                        f"admin_folder_parent:{folder_id}",
+                        f"admin_folder:{folder_id}",
                     )
                 ]
             )
@@ -933,6 +1004,118 @@ async def start_admin_folder_create(query, context):
             ]
         ),
     )
+
+
+async def request_admin_folder_rename(update, context):
+    """Capture a new name for an existing folder."""
+    if not update.message or not update.message.text:
+        return False
+
+    if not context.user_data.get("admin_folder_rename"):
+        return False
+
+    try:
+        is_admin = await database.is_user_admin(update.effective_user.id)
+    except Exception:
+        is_admin = False
+
+    if not is_admin:
+        context.user_data.pop("admin_folder_rename", None)
+        context.user_data.pop("admin_folder_rename_id", None)
+        await update.message.reply_text(
+            "🔒 غير مصرح.",
+            reply_markup=home_keyboard(),
+        )
+        return True
+
+    name = update.message.text.strip()
+
+    if name == "/cancel":
+        folder_id = context.user_data.pop("admin_folder_rename_id", None)
+        context.user_data.pop("admin_folder_rename", None)
+
+        if folder_id:
+            await update.message.reply_text(
+                "❌ تم إلغاء إعادة تسمية القسم.",
+                reply_markup=InlineKeyboardMarkup([
+                    [btn("↩️ العودة إلى القسم", f"admin_folder:{folder_id}")],
+                    [btn("🏠 الرئيسية", "home")],
+                ]),
+            )
+        else:
+            await update.message.reply_text(
+                "❌ تم إلغاء إعادة تسمية القسم.",
+                reply_markup=home_keyboard(),
+            )
+        return True
+
+    if not name:
+        await update.message.reply_text(
+            "⚠️ اسم القسم لا يمكن أن يكون فارغاً. أرسل الاسم مرة أخرى."
+        )
+        return True
+
+    if len(name) > 100:
+        await update.message.reply_text(
+            "⚠️ اسم القسم طويل جداً. الحد الأقصى 100 حرف."
+        )
+        return True
+
+    folder_id = context.user_data.get("admin_folder_rename_id")
+
+    try:
+        folder_id = int(folder_id)
+    except (TypeError, ValueError):
+        context.user_data.pop("admin_folder_rename", None)
+        context.user_data.pop("admin_folder_rename_id", None)
+        await update.message.reply_text(
+            "⚠️ انتهت جلسة إعادة التسمية. ابدأ العملية من جديد.",
+            reply_markup=home_keyboard(),
+        )
+        return True
+
+    try:
+        folder = await database.get_folder(folder_id)
+    except Exception:
+        folder = None
+
+    if not folder:
+        context.user_data.pop("admin_folder_rename", None)
+        context.user_data.pop("admin_folder_rename_id", None)
+        await update.message.reply_text(
+            "⚠️ القسم غير موجود.",
+            reply_markup=home_keyboard(),
+        )
+        return True
+
+    try:
+        await database.update_folder_name(folder_id, name)
+    except Exception:
+        logger.exception("Admin folder rename failed")
+        await update.message.reply_text(
+            "⚠️ تعذر إعادة تسمية القسم حالياً.",
+            reply_markup=InlineKeyboardMarkup([
+                [btn("↩️ العودة إلى القسم", f"admin_folder:{folder_id}")],
+                [btn("🏠 الرئيسية", "home")],
+            ]),
+        )
+        return True
+
+    context.user_data.pop("admin_folder_rename", None)
+    context.user_data.pop("admin_folder_rename_id", None)
+
+    await update.message.reply_text(
+        "✅ تم تغيير اسم القسم بنجاح.\n\n"
+        f"📁 الاسم الجديد: <b>{escape(name)}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [btn("🗂 إدارة القسم", f"admin_folder:{folder_id}")],
+            [btn("🗂 إدارة الأقسام", "admin_folders")],
+            [btn("🏠 الرئيسية", "home")],
+        ]),
+    )
+    return True
+
 
 
 async def request_admin_folder_name(update, context):
@@ -1233,6 +1416,7 @@ async def show_admin(query):
         "اختر الإجراء:",
         InlineKeyboardMarkup(
             [
+                [btn("🗂 إدارة الأقسام والفروع", "admin_folders")],
                 [btn("📥 مراجعة المساهمات", "admin_pending")],
                 [btn("🤖 AI Registry", "admin_ai")],
                 [btn("📊 Runtime", "admin_runtime")],
@@ -1724,6 +1908,126 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_admin(query)
         return
 
+    if data.startswith("admin_folder:"):
+        try:
+            folder_id = int(data.split(":", 1)[1])
+            await show_admin_folder(query, folder_id)
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف القسم غير صالح.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+        return
+
+    if data.startswith("admin_folder_rename:"):
+        try:
+            folder_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف القسم غير صالح.",
+                InlineKeyboardMarkup([
+                    [btn("🗂 إدارة الأقسام", "admin_folders")]
+                ]),
+            )
+            return
+
+        if not await _admin_check(query):
+            await edit_safe(
+                query,
+                "🔒 غير مصرح.",
+                InlineKeyboardMarkup([
+                    [btn("🏠 الرئيسية", "home")]
+                ]),
+            )
+            return
+
+        folder = await database.get_folder(folder_id)
+
+        if not folder:
+            await edit_safe(
+                query,
+                "⚠️ القسم غير موجود.",
+                InlineKeyboardMarkup([
+                    [btn("🗂 إدارة الأقسام", "admin_folders")]
+                ]),
+            )
+            return
+
+        context.user_data["admin_folder_rename"] = True
+        context.user_data["admin_folder_rename_id"] = folder_id
+
+        await edit_safe(
+            query,
+            "✏️ *إعادة تسمية القسم*\n\n"
+            f"الاسم الحالي: <b>{escape(str(folder[2]))}</b>\n\n"
+            "أرسل الاسم الجديد.\n"
+            "يمكنك إرسال /cancel للإلغاء.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [btn("❌ إلغاء", f"admin_folder:{folder_id}")]
+            ]),
+        )
+        return
+
+    if data.startswith("admin_folder_toggle:"):
+        try:
+            folder_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف القسم غير صالح.",
+                InlineKeyboardMarkup([
+                    [btn("🗂 إدارة الأقسام", "admin_folders")]
+                ]),
+            )
+            return
+
+        if not await _admin_check(query):
+            await edit_safe(
+                query,
+                "🔒 غير مصرح.",
+                InlineKeyboardMarkup([
+                    [btn("🏠 الرئيسية", "home")]
+                ]),
+            )
+            return
+
+        folder = await database.get_folder(folder_id)
+
+        if not folder:
+            await edit_safe(
+                query,
+                "⚠️ القسم غير موجود.",
+                InlineKeyboardMarkup([
+                    [btn("🗂 إدارة الأقسام", "admin_folders")]
+                ]),
+            )
+            return
+
+        current = int(folder[4] or 0)
+        new_value = 0 if current else 1
+
+        try:
+            await database.update_folder_accepts_contributions(
+                folder_id,
+                new_value,
+            )
+        except Exception:
+            logger.exception("Admin folder contribution toggle failed")
+            await edit_safe(
+                query,
+                "⚠️ تعذر تغيير حالة استقبال المساهمات.",
+                InlineKeyboardMarkup([
+                    [btn("↩️ العودة إلى القسم", f"admin_folder:{folder_id}")]
+                ]),
+            )
+            return
+
+        await show_admin_folder(query, folder_id)
+        return
+
     if data == "admin_folders":
         await show_admin_folders(query)
         return
@@ -1891,6 +2195,12 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     query = update.message.text.strip()
+
+    # Admin folder rename state has priority over search/AI.
+    if context.user_data.get("admin_folder_rename"):
+        handled = await request_admin_folder_rename(update, context)
+        if handled:
+            return
 
     # Admin folder creation state has priority over search/AI.
     if context.user_data.get("admin_folder_create"):
