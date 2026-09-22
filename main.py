@@ -105,21 +105,20 @@ async def send_safe_message(update: Update, text: str, reply_markup=None):
                     await asyncio.sleep(1)
 
 
-async def edit_safe(query, text, reply_markup=None):
-    """Safely edit an inline message."""
-    try:
-        await query.edit_message_text(
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=reply_markup,
-        )
-    except Exception:
+async def edit_safe(query, text, reply_markup=None, parse_mode=ParseMode.MARKDOWN):
+    """Safely edit an inline message.
+
+    Falls back to plain text if the requested parse mode fails, so a
+    malformed entity can never leave the caller stuck on a stale screen.
+    """
+    for mode in (parse_mode, None):
         try:
             await query.edit_message_text(
                 text=text,
-                parse_mode=None,
+                parse_mode=mode,
                 reply_markup=reply_markup,
             )
+            return
         except Exception as exc:
             logger.warning("Failed to edit callback message: %s", exc)
 
@@ -384,10 +383,25 @@ async def show_folder(query, folder_id):
     )
 
 
+async def _send_registered_media(context, chat_id, file_id, file_type, title):
+    """Send a registered MEDBOT resource using its Telegram file_id."""
+    ft = str(file_type or "").lower()
+
+    if ft in ("photo", "image", "jpg", "jpeg", "png", "webp"):
+        await context.bot.send_photo(chat_id=chat_id, photo=file_id, caption=f"🖼 {title}")
+    elif ft in ("audio", "mp3", "m4a", "wav"):
+        await context.bot.send_audio(chat_id=chat_id, audio=file_id, caption=f"🎧 {title}")
+    elif ft in ("video", "mp4", "mkv", "mov"):
+        await context.bot.send_video(chat_id=chat_id, video=file_id, caption=f"🎥 {title}")
+    else:
+        await context.bot.send_document(chat_id=chat_id, document=file_id, caption=f"📄 {title}")
+
+
 async def open_file(query, context, content_id):
     try:
         record = await database.get_file_record(content_id)
     except Exception:
+        logger.exception("get_file_record failed")
         record = None
 
     if not record:
@@ -404,8 +418,18 @@ async def open_file(query, context, content_id):
         return
 
     try:
-        title, file_id, file_type, source_type, source_contribution_id = record
+        (
+            _record_id,
+            folder_id,
+            title,
+            file_id,
+            file_type,
+            _source_type,
+            _source_contribution_id,
+            _created_by,
+        ) = record
     except Exception:
+        logger.exception("Malformed content record id=%s", content_id)
         await edit_safe(
             query,
             "⚠️ تعذر قراءة سجل المورد.",
@@ -418,6 +442,8 @@ async def open_file(query, context, content_id):
         )
         return
 
+    back_target = int(folder_id) if folder_id else 0
+
     if not file_id:
         await edit_safe(
             query,
@@ -426,6 +452,7 @@ async def open_file(query, context, content_id):
             "لكن لا يوجد ملف قابل للإرسال حالياً.",
             InlineKeyboardMarkup(
                 [
+                    [btn("⬅️ رجوع", f"folder:{back_target}")],
                     [btn("📚 MEDBOT Resources", "library:0")],
                     [btn("🏠 الرئيسية", "home")],
                 ]
@@ -436,46 +463,22 @@ async def open_file(query, context, content_id):
     chat_id = query.message.chat_id
 
     try:
-        ft = str(file_type or "").lower()
-
-        if ft in ("photo", "image", "jpg", "jpeg", "png", "webp"):
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=file_id,
-                caption=f"🖼 {title}",
-            )
-        elif ft in ("audio", "mp3", "m4a", "wav"):
-            await context.bot.send_audio(
-                chat_id=chat_id,
-                audio=file_id,
-                caption=f"🎧 {title}",
-            )
-        elif ft in ("video", "mp4", "mkv", "mov"):
-            await context.bot.send_video(
-                chat_id=chat_id,
-                video=file_id,
-                caption=f"🎥 {title}",
-            )
-        else:
-            await context.bot.send_document(
-                chat_id=chat_id,
-                document=file_id,
-                caption=f"📄 {title}",
-            )
+        await _send_registered_media(context, chat_id, file_id, file_type, title)
 
         await context.bot.send_message(
             chat_id=chat_id,
             text="📚 يمكنك العودة إلى المكتبة من هنا:",
             reply_markup=InlineKeyboardMarkup(
                 [
+                    [btn("⬅️ رجوع", f"folder:{back_target}")],
                     [btn("📚 MEDBOT Resources", "library:0")],
                     [btn("🏠 الرئيسية", "home")],
                 ]
             ),
         )
 
-    except Exception as exc:
-        logger.exception("File send failed")
+    except Exception:
+        logger.exception("File send failed for content id=%s", content_id)
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
@@ -484,6 +487,7 @@ async def open_file(query, context, content_id):
             ),
             reply_markup=InlineKeyboardMarkup(
                 [
+                    [btn("⬅️ رجوع", f"folder:{back_target}")],
                     [btn("📚 MEDBOT Resources", "library:0")],
                     [btn("🏠 الرئيسية", "home")],
                 ]
@@ -546,14 +550,14 @@ async def run_search(update: Update, query_text):
 
     if not results:
         await update.message.reply_text(
-            "🔎 *نتيجة البحث*\\n\\n"
+            "🔎 *نتيجة البحث*\n\n"
             "المورد المطلوب غير مسجل حالياً في MEDBOT.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=home_keyboard(),
         )
         return
 
-    lines = ["🔎 *نتائج البحث داخل MEDBOT*\\n"]
+    lines = ["🔎 *نتائج البحث داخل MEDBOT*\n"]
     buttons = []
 
     for item in results:
@@ -567,8 +571,8 @@ async def run_search(update: Update, query_text):
         if result_type == "FOLDER":
             icon = "📁"
             lines.append(
-                f"{icon} *{title}*\\n"
-                f"   🧭 {path}\\n"
+                f"{icon} *{title}*\n"
+                f"   🧭 {path}\n"
                 f"   📄 الموارد: {content_count}"
             )
             buttons.append(
@@ -578,7 +582,7 @@ async def run_search(update: Update, query_text):
         elif result_type == "CONTENT":
             icon = content_icon(file_type)
             lines.append(
-                f"{icon} *{title}*\\n"
+                f"{icon} *{title}*\n"
                 f"   🧭 {path}"
             )
             buttons.append(
@@ -587,8 +591,8 @@ async def run_search(update: Update, query_text):
 
         elif result_type == "EMPTY_FOLDER":
             lines.append(
-                f"📁 *{title}*\\n"
-                f"   🧭 {path}\\n"
+                f"📁 *{title}*\n"
+                f"   🧭 {path}\n"
                 f"   لا توجد موارد مسجلة حالياً."
             )
             buttons.append(
@@ -599,7 +603,7 @@ async def run_search(update: Update, query_text):
     buttons.append([btn("🏠 الرئيسية", "home")])
 
     await update.message.reply_text(
-        "\\n".join(lines),
+        "\n".join(lines),
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(buttons),
     )
@@ -719,6 +723,25 @@ async def show_contribute(query):
 
 
 async def select_contribution_folder(query, context, folder_id):
+    try:
+        accepts = await database.folder_accepts_contributions(folder_id)
+    except Exception:
+        accepts = False
+
+    if not accepts:
+        _clear_contribution_state(context)
+        await edit_safe(
+            query,
+            "⚠️ هذا القسم غير متاح لاستقبال المساهمات حالياً.",
+            InlineKeyboardMarkup(
+                [
+                    [btn("📤 Student Contributions", "contribute")],
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
+        )
+        return
+
     context.user_data["contribution_folder"] = folder_id
 
     await edit_safe(
@@ -734,6 +757,10 @@ async def select_contribution_folder(query, context, folder_id):
             ]
         ),
     )
+
+
+def _clear_contribution_state(context):
+    context.user_data.pop("contribution_folder", None)
 
 
 async def contribution_media_handler(
@@ -860,14 +887,14 @@ async def show_admin_folder(query, folder_id: int):
 
     rows = [
         [btn("➕ إضافة قسم فرعي", f"admin_folder_child:{folder_id}")],
+        [btn("📤 رفع مورد (Resource)", f"admin_upload:{folder_id}")],
         [btn("✏️ إعادة تسمية", f"admin_folder_rename:{folder_id}")],
         [btn("📦 تغيير النوع", f"admin_folder_retype_existing:{folder_id}")],
         [btn("📤 تغيير قبول المساهمات", f"admin_folder_toggle:{folder_id}")],
         [btn("🚚 نقل القسم", f"admin_folder_move:{folder_id}")],
     ]
 
-    if not children and not files:
-        rows.append([btn("🗑 حذف القسم", f"admin_folder_delete:{folder_id}")])
+    rows.append([btn("🗑 حذف القسم", f"admin_folder_delete:{folder_id}")])
 
     if parent_id:
         rows.append([btn("⬅️ القسم الأب", f"admin_folder:{parent_id}")])
@@ -899,23 +926,42 @@ async def show_admin_folders(query):
         )
         return
 
-    folders = await database.get_folders(0)
+    try:
+        folders = await database.get_folders(0)
+    except Exception:
+        folders = []
 
     rows = [[btn("➕ إنشاء قسم جديد", "admin_folder_create")]]
 
-    if folders:
-        rows.append([btn("📂 اختيار قسم لإضافة قسم داخله", "admin_folder_parent:0")])
+    for folder in folders:
+        try:
+            folder_id, name, node_type, _accepts = folder[:4]
+        except Exception:
+            continue
+
+        rows.append(
+            [
+                btn(
+                    f"{resource_icon(node_type)} {str(name)[:35]}",
+                    f"admin_folder:{folder_id}",
+                )
+            ]
+        )
+
+    if not folders:
+        rows.append([btn("ℹ️ لا توجد أقسام بعد", "noop")])
 
     rows.extend(
         [
-            [btn("⬅️ Admin", "admin")],
             [btn("🏠 الرئيسية", "home")],
         ]
     )
 
     await edit_safe(
         query,
-        "🗂 *إدارة الأقسام*\n\n" "يمكنك إنشاء أقسام رئيسية أو أقسام فرعية متداخلة.",
+        "🗂 *إدارة الأقسام*\n\n"
+        "اختر قسماً لإدارته، أو أنشئ قسماً جديداً.\n"
+        "يمكنك أيضاً الدخول إلى قسم لإضافة قسم فرعي بداخله.",
         InlineKeyboardMarkup(rows),
     )
 
@@ -947,7 +993,7 @@ async def show_admin_folder_parents(query, parent_id=0):
                 [
                     btn(
                         f"📁 {str(name)[:35]}",
-                        f"admin_folder:{folder_id}",
+                        f"admin_folder_parent:{folder_id}",
                     )
                 ]
             )
@@ -1384,6 +1430,957 @@ async def finish_admin_folder_create(query, context, accepts):
     )
 
 
+# ============================================================
+# ADMIN RESOURCE UPLOAD / MANAGEMENT
+# ============================================================
+
+FOLDER_TYPE_OPTIONS = [
+    ("general", "📁 عام"),
+    ("books", "📚 كتب"),
+    ("audio", "🎧 صوتيات"),
+    ("video", "🎥 فيديو"),
+    ("mcq", "📝 MCQ"),
+    ("summaries", "📑 ملخصات"),
+]
+
+FOLDER_TYPE_KEYS = {key for key, _label in FOLDER_TYPE_OPTIONS}
+
+FILE_TYPE_OPTIONS = [
+    ("document", "📄 Document"),
+    ("photo", "🖼 Photo"),
+    ("audio", "🎧 Audio"),
+    ("video", "🎥 Video"),
+]
+
+FILE_TYPE_KEYS = {key for key, _label in FILE_TYPE_OPTIONS}
+
+
+def _folder_type_keyboard(folder_id, cancel_callback=None):
+    rows = [
+        [btn(label, f"admin_folder_settype:{folder_id}:{key}")]
+        for key, label in FOLDER_TYPE_OPTIONS
+    ]
+    rows.append(
+        [
+            btn(
+                "❌ إلغاء",
+                cancel_callback or f"admin_folder:{folder_id}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _file_type_keyboard(content_id, cancel_callback=None):
+    rows = [
+        [btn(label, f"admin_file_settype:{content_id}:{key}")]
+        for key, label in FILE_TYPE_OPTIONS
+    ]
+    rows.append(
+        [
+            btn(
+                "❌ إلغاء",
+                cancel_callback or f"admin_file:{content_id}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _extract_media_info(message):
+    """Return (file_id, file_type, suggested_title) for a Telegram media message."""
+    if message.document:
+        return (
+            message.document.file_id,
+            "document",
+            message.document.file_name or "Document",
+        )
+
+    if message.photo:
+        return (message.photo[-1].file_id, "photo", "Photo")
+
+    if message.audio:
+        return (
+            message.audio.file_id,
+            "audio",
+            message.audio.file_name
+            or message.audio.title
+            or "Audio",
+        )
+
+    if message.video:
+        return (
+            message.video.file_id,
+            "video",
+            message.video.file_name or "Video",
+        )
+
+    if message.voice:
+        return (message.voice.file_id, "audio", "Voice Note")
+
+    return (None, None, None)
+
+
+async def start_admin_upload(query, context, folder_id):
+    """Enter admin resource upload state for a folder."""
+    if not await _admin_check(query):
+        await edit_safe(
+            query,
+            "🔒 غير مصرح.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    try:
+        folder = await database.get_folder(folder_id)
+    except Exception:
+        folder = None
+
+    if not folder:
+        await edit_safe(
+            query,
+            "⚠️ القسم غير موجود.",
+            InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+        )
+        return
+
+    # Clear any other admin workflow state so upload cannot be corrupted.
+    _clear_admin_state(context)
+
+    context.user_data["admin_upload"] = True
+    context.user_data["admin_upload_folder"] = int(folder_id)
+
+    await edit_safe(
+        query,
+        "📤 *رفع مورد إلى MEDBOT*\n\n"
+        f"📁 القسم: <b>{escape(str(folder[2]))}</b>\n\n"
+        "أرسل الآن المورد كـ Document أو Photo أو Audio أو Video.\n"
+        "سيتم تسجيله مباشرة في المكتبة (ليس مساهمة طالب).\n\n"
+        "لإلغاء العملية اضغط ❌ إلغاء أو أرسل /cancel.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [btn("❌ إلغاء", f"admin_folder:{folder_id}")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
+def _clear_admin_state(context, keep=None):
+    """Remove all transient admin workflow keys from user_data."""
+    keys = [
+        "admin_folder_create",
+        "admin_folder_parent",
+        "admin_folder_name",
+        "admin_folder_type",
+        "admin_folder_rename",
+        "admin_folder_rename_id",
+        "admin_folder_retype_id",
+        "admin_folder_move",
+        "admin_folder_move_id",
+        "admin_upload",
+        "admin_upload_folder",
+        "admin_upload_preview",
+        "admin_upload_waiting_title",
+        "admin_upload_title",
+        "admin_file_rename",
+        "admin_file_rename_id",
+        "admin_file_rename_waiting",
+        "admin_file_move",
+        "admin_file_move_id",
+    ]
+
+    for key in keys:
+        if keep and key in keep:
+            continue
+        context.user_data.pop(key, None)
+
+
+async def admin_upload_media_handler(update, context):
+    """Handle media sent while the admin is in upload state."""
+    if not context.user_data.get("admin_upload"):
+        return False
+
+    folder_id = context.user_data.get("admin_upload_folder")
+
+    try:
+        folder_id = int(folder_id)
+    except (TypeError, ValueError):
+        _clear_admin_state(context)
+        await update.message.reply_text(
+            "⚠️ انتهت جلسة الرفع. ابدأ العملية من جديد.",
+            reply_markup=home_keyboard(),
+        )
+        return True
+
+    try:
+        is_admin = await database.is_user_admin(update.effective_user.id)
+    except Exception:
+        is_admin = False
+
+    if not is_admin:
+        _clear_admin_state(context)
+        await update.message.reply_text(
+            "🔒 غير مصرح.",
+            reply_markup=home_keyboard(),
+        )
+        return True
+
+    try:
+        folder = await database.get_folder(folder_id)
+    except Exception:
+        folder = None
+
+    if not folder:
+        _clear_admin_state(context)
+        await update.message.reply_text(
+            "⚠️ القسم لم يعد موجوداً. تم إلغاء الرفع.",
+            reply_markup=home_keyboard(),
+        )
+        return True
+
+    file_id, file_type, suggested_title = _extract_media_info(update.message)
+
+    if not file_id:
+        await update.message.reply_text(
+            "⚠️ أرسل مورداً من الأنواع المدعومة: Document / Photo / Audio / Video.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [btn("❌ إلغاء الرفع", f"admin_folder:{folder_id}")],
+                ]
+            ),
+        )
+        return True
+
+    context.user_data["admin_upload_preview"] = {
+        "file_id": file_id,
+        "file_type": file_type,
+        "folder_id": folder_id,
+        "title": suggested_title,
+    }
+
+    await update.message.reply_text(
+        "📥 *تم استلام المورد*\n\n"
+        f"📄 العنوان المقترح: <b>{escape(str(suggested_title))}</b>\n"
+        f"📎 النوع: <code>{escape(str(file_type))}</code>\n\n"
+        "اختر طريقة تسجيل العنوان:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    btn(
+                        "✅ تسجيل بالعنوان المقترح",
+                        "admin_upload_confirm",
+                    )
+                ],
+                [btn("✏️ إدخال عنوان مخصص", "admin_upload_custom_title")],
+                [btn("❌ إلغاء", f"admin_folder:{folder_id}")],
+            ]
+        ),
+    )
+    return True
+
+
+async def admin_upload_confirm(query, context):
+    if not await _admin_check(query):
+        await edit_safe(
+            query,
+            "🔒 غير مصرح.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    preview = context.user_data.get("admin_upload_preview")
+
+    if not isinstance(preview, dict):
+        _clear_admin_state(context)
+        await edit_safe(
+            query,
+            "⚠️ انتهت جلسة الرفع. ابدأ العملية من جديد.",
+            InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+        )
+        return
+
+    await _register_admin_upload(query, context, preview)
+
+
+async def admin_upload_custom_title(query, context, custom_title=None):
+    if not await _admin_check(query):
+        await edit_safe(
+            query,
+            "🔒 غير مصرح.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    preview = context.user_data.get("admin_upload_preview")
+
+    if not isinstance(preview, dict):
+        await edit_safe(
+            query,
+            "⚠️ انتهت جلسة الرفع. ابدأ العملية من جديد.",
+            InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+        )
+        return
+
+    if custom_title is None:
+        context.user_data["admin_upload_waiting_title"] = True
+        await edit_safe(
+            query,
+            "✏️ *العنوان المخصص*\n\n"
+            "أرسل الآن عنوان المورد في رسالة نصية.\n\n"
+            "للإلغاء أرسل /cancel.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        btn(
+                            "❌ إلغاء",
+                            f"admin_folder:{preview.get('folder_id')}",
+                        )
+                    ],
+                ]
+            ),
+        )
+        return
+
+    title = str(custom_title).strip()
+
+    if not title:
+        return
+
+    if len(title) > 150:
+        return
+
+    preview["title"] = title
+
+    await _register_admin_upload(query, context, preview)
+
+
+async def _register_admin_upload(query, context, preview):
+    folder_id = preview.get("folder_id")
+    title = str(preview.get("title") or "Resource").strip() or "Resource"
+    file_id = preview.get("file_id")
+    file_type = preview.get("file_type") or "document"
+
+    try:
+        folder_id = int(folder_id)
+    except (TypeError, ValueError):
+        _clear_admin_state(context)
+        await edit_safe(
+            query,
+            "⚠️ القسم الهدف غير صالح.",
+            InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+        )
+        return
+
+    try:
+        folder = await database.get_folder(folder_id)
+    except Exception:
+        folder = None
+
+    if not folder:
+        _clear_admin_state(context)
+        await edit_safe(
+            query,
+            "⚠️ القسم لم يعد موجوداً. لم يتم تسجيل المورد.",
+            InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+        )
+        return
+
+    if not file_id:
+        _clear_admin_state(context)
+        await edit_safe(
+            query,
+            "⚠️ لا يوجد ملف Telegram صالح للتسجيل.",
+            InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+        )
+        return
+
+    try:
+        content_id = await database.add_content(
+            folder_id=folder_id,
+            title=title,
+            file_id=file_id,
+            file_type=file_type,
+            source_type="direct",
+            source_contribution_id=None,
+            created_by=query.from_user.id,
+        )
+    except Exception:
+        logger.exception("Admin resource registration failed")
+        content_id = None
+
+    _clear_admin_state(context)
+
+    if not content_id:
+        await edit_safe(
+            query,
+            "⚠️ تعذر تسجيل المورد. لم يتم تأكيد الإضافة.",
+            InlineKeyboardMarkup(
+                [
+                    [btn("🗂 إدارة الأقسام", "admin_folders")],
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
+        )
+        return
+
+    await edit_safe(
+        query,
+        "✅ <b>تم تسجيل المورد بنجاح.</b>\n\n"
+        f"📄 العنوان: <b>{escape(title)}</b>\n"
+        f"📎 النوع: <code>{escape(str(file_type))}</code>\n"
+        f"📁 القسم: <b>{escape(str(folder[2]))}</b>\n"
+        f"🆔 المورد: <code>{content_id}</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [btn("🗂 إدارة المورد", f"admin_file:{content_id}")],
+                [btn("📤 رفع مورد آخر", f"admin_upload:{folder_id}")],
+                [btn("🗂 إدارة القسم", f"admin_folder:{folder_id}")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
+async def show_admin_file(query, content_id):
+    """Show management actions for one registered resource."""
+    if not await _admin_check(query):
+        await edit_safe(
+            query,
+            "🔒 غير مصرح.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    try:
+        record = await database.get_file_record(content_id)
+    except Exception:
+        record = None
+
+    if not record:
+        await edit_safe(
+            query,
+            "⚠️ المورد غير موجود.",
+            InlineKeyboardMarkup(
+                [
+                    [btn("🗂 إدارة الأقسام", "admin_folders")],
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
+        )
+        return
+
+    _, folder_id, title, file_id, file_type, source_type, _scid, _cby = record
+    folder_id = int(folder_id) if folder_id else 0
+
+    try:
+        folder = await database.get_folder(folder_id)
+    except Exception:
+        folder = None
+
+    folder_name = folder[2] if folder else "غير معروف"
+
+    await edit_safe(
+        query,
+        "🗂 *إدارة المورد*\n\n"
+        f"📄 العنوان: <b>{escape(str(title))}</b>\n"
+        f"📎 النوع: <code>{escape(str(file_type))}</code>\n"
+        f"📁 القسم: <b>{escape(str(folder_name))}</b>\n"
+        f"🔗 المصدر: <code>{escape(str(source_type or 'direct'))}</code>\n"
+        f"🆔 file_id: {'موجود ✅' if file_id else 'مفقود ⚠️'}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [btn("✏️ إعادة تسمية", f"admin_file_rename:{content_id}")],
+                [btn("📦 تغيير النوع", f"admin_file_retype:{content_id}")],
+                [btn("🚚 نقل المورد", f"admin_file_move:{content_id}")],
+                [btn("🗑 حذف المورد", f"admin_file_delete:{content_id}")],
+                [btn("👁 فتح المورد", f"file:{content_id}")],
+                [btn("⬅️ القسم", f"admin_folder:{folder_id}")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
+async def admin_file_delete(query, context, content_id):
+    if not await _admin_check(query):
+        await edit_safe(
+            query,
+            "🔒 غير مصرح.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    try:
+        record = await database.get_file_record(content_id)
+    except Exception:
+        record = None
+
+    if not record:
+        await edit_safe(
+            query,
+            "⚠️ المورد غير موجود أو تم حذفه مسبقاً.",
+            InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+        )
+        return
+
+    folder_id = int(record[1]) if record[1] else 0
+
+    try:
+        ok = await database.delete_file(content_id)
+    except Exception:
+        logger.exception("Admin resource delete failed")
+        ok = False
+
+    if not ok:
+        await edit_safe(
+            query,
+            "⚠️ تعذر حذف المورد.",
+            InlineKeyboardMarkup([[btn("🗂 إدارة المورد", f"admin_file:{content_id}")]]),
+        )
+        return
+
+    await edit_safe(
+        query,
+        "🗑 تم حذف تسجيل المورد بنجاح.",
+        InlineKeyboardMarkup(
+            [
+                [btn("⬅️ القسم", f"admin_folder:{folder_id}")],
+                [btn("🗂 إدارة الأقسام", "admin_folders")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
+async def admin_folder_move_menu(query, context):
+    """Show target folders for moving a folder."""
+    if not await _admin_check(query):
+        await edit_safe(
+            query,
+            "🔒 غير مصرح.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    try:
+        folder_id = int(context.user_data.get("admin_folder_move_id"))
+    except (TypeError, ValueError):
+        folder_id = None
+
+    if not folder_id:
+        await edit_safe(
+            query,
+            "⚠️ انتهت جلسة النقل. ابدأ العملية من جديد.",
+            InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+        )
+        return
+
+    try:
+        folder = await database.get_folder(folder_id)
+    except Exception:
+        folder = None
+
+    if not folder:
+        _clear_admin_state(context)
+        await edit_safe(
+            query,
+            "⚠️ القسم غير موجود.",
+            InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+        )
+        return
+
+    context.user_data["admin_folder_move"] = True
+
+    rows = [[btn("🏠 نقل إلى الجذر", f"admin_folder_move_to:{folder_id}:0")]]
+
+    try:
+        roots = await database.get_folders(0)
+    except Exception:
+        roots = []
+
+    for item in roots:
+        try:
+            target_id, name, _node_type, _acc = item[:4]
+        except Exception:
+            continue
+
+        if int(target_id) == folder_id:
+            continue
+
+        rows.append(
+            [
+                btn(
+                    f"📁 {str(name)[:35]}",
+                    f"admin_folder_move_to:{folder_id}:{target_id}",
+                )
+            ]
+        )
+
+    rows.append([btn("❌ إلغاء", f"admin_folder:{folder_id}")])
+
+    await edit_safe(
+        query,
+        "🚚 *نقل القسم*\n\n"
+        f"📁 القسم: <b>{escape(str(folder[2]))}</b>\n\n"
+        "اختر القسم الهدف (الجذر أو قسم رئيسي):",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def admin_folder_move_to(query, context, folder_id, target_id):
+    if not await _admin_check(query):
+        await edit_safe(
+            query,
+            "🔒 غير مصرح.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    try:
+        ok, message = await database.move_folder(
+            int(folder_id),
+            int(target_id),
+        )
+    except Exception:
+        logger.exception("Admin folder move failed")
+        ok, message = False, "تعذر تنفيذ النقل."
+
+    _clear_admin_state(context)
+
+    if not ok:
+        await edit_safe(
+            query,
+            f"⚠️ {escape(str(message))}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [btn("↩️ إدارة القسم", f"admin_folder:{folder_id}")],
+                    [btn("🗂 إدارة الأقسام", "admin_folders")],
+                ]
+            ),
+        )
+        return
+
+    await edit_safe(
+        query,
+        f"✅ تم نقل القسم بنجاح.\n\n{message}",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [btn("🗂 إدارة القسم", f"admin_folder:{folder_id}")],
+                [btn("🗂 إدارة الأقسام", "admin_folders")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
+async def admin_folder_delete(query, context, folder_id):
+    if not await _admin_check(query):
+        await edit_safe(
+            query,
+            "🔒 غير مصرح.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    try:
+        folder = await database.get_folder(folder_id)
+    except Exception:
+        folder = None
+
+    if not folder:
+        await edit_safe(
+            query,
+            "ℹ️ القسم غير موجود أو تم حذفه مسبقاً.",
+            InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+        )
+        return
+
+    parent_id = folder[1] or 0
+
+    try:
+        ok = await database.delete_folder(folder_id)
+    except Exception:
+        logger.exception("Admin folder delete failed")
+        ok = False
+
+    if not ok:
+        await edit_safe(
+            query,
+            "⚠️ لا يمكن حذف هذا القسم.\n\n"
+            "الحذف مسموح فقط للأقسام الفارغة تماماً "
+            "(بدون أقسام فرعية أو موارد).",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [btn("↩️ إدارة القسم", f"admin_folder:{folder_id}")],
+                    [btn("🗂 إدارة الأقسام", "admin_folders")],
+                ]
+            ),
+        )
+        return
+
+    back_rows = []
+    if parent_id:
+        back_rows.append([btn("⬅️ القسم الأب", f"admin_folder:{parent_id}")])
+    else:
+        back_rows.append([btn("🗂 إدارة الأقسام", "admin_folders")])
+    back_rows.append([btn("🏠 الرئيسية", "home")])
+
+    await edit_safe(
+        query,
+        "🗑 تم حذف القسم بنجاح.",
+        reply_markup=InlineKeyboardMarkup(back_rows),
+    )
+
+
+async def admin_file_move_menu(query, context):
+    if not await _admin_check(query):
+        await edit_safe(
+            query,
+            "🔒 غير مصرح.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    try:
+        content_id = int(context.user_data.get("admin_file_move_id"))
+    except (TypeError, ValueError):
+        content_id = None
+
+    if not content_id:
+        await edit_safe(
+            query,
+            "⚠️ انتهت جلسة نقل المورد.",
+            InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+        )
+        return
+
+    try:
+        record = await database.get_file_record(content_id)
+    except Exception:
+        record = None
+
+    if not record:
+        _clear_admin_state(context)
+        await edit_safe(
+            query,
+            "⚠️ المورد غير موجود.",
+            InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+        )
+        return
+
+    try:
+        roots = await database.get_folders(0)
+    except Exception:
+        roots = []
+
+    rows = []
+
+    for item in roots:
+        try:
+            target_id, name, _node_type, _acc = item[:4]
+        except Exception:
+            continue
+
+        rows.append(
+            [
+                btn(
+                    f"📁 {str(name)[:35]}",
+                    f"admin_file_move_to:{content_id}:{target_id}",
+                )
+            ]
+        )
+
+    rows.append([btn("❌ إلغاء", f"admin_file:{content_id}")])
+
+    await edit_safe(
+        query,
+        "🚚 *نقل المورد*\n\n"
+        f"📄 المورد: <b>{escape(str(record[2]))}</b>\n\n"
+        "اختر القسم الهدف:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def admin_file_move_to(query, context, content_id, target_id):
+    if not await _admin_check(query):
+        await edit_safe(
+            query,
+            "🔒 غير مصرح.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    try:
+        ok, message = await database.move_content(
+            int(content_id),
+            int(target_id),
+        )
+    except Exception:
+        logger.exception("Admin resource move failed")
+        ok, message = False, "تعذر تنفيذ النقل."
+
+    _clear_admin_state(context)
+
+    if not ok:
+        await edit_safe(
+            query,
+            f"⚠️ {escape(str(message))}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [[btn("↩️ إدارة المورد", f"admin_file:{content_id}")]]
+            ),
+        )
+        return
+
+    await edit_safe(
+        query,
+        f"✅ {escape(str(message))}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [btn("🗂 إدارة المورد", f"admin_file:{content_id}")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
+async def handle_pending_title_input(update, context):
+    """Consume custom title input for upload or rename workflows."""
+    if not update.message or not update.message.text:
+        return False
+
+    custom = context.user_data.get("admin_upload_waiting_title")
+    rename_mode = context.user_data.get("admin_file_rename")
+    rename_waiting = context.user_data.get("admin_file_rename_waiting")
+
+    if not custom and not (rename_mode and rename_waiting):
+        return False
+
+    try:
+        is_admin = await database.is_user_admin(update.effective_user.id)
+    except Exception:
+        is_admin = False
+
+    if not is_admin:
+        _clear_admin_state(context)
+        await update.message.reply_text(
+            "🔒 غير مصرح.",
+            reply_markup=home_keyboard(),
+        )
+        return True
+
+    text = update.message.text.strip()
+
+    if text == "/cancel":
+        _clear_admin_state(context)
+        await update.message.reply_text(
+            "❌ تم إلغاء العملية.",
+            reply_markup=home_keyboard(),
+        )
+        return True
+
+    if not text:
+        await update.message.reply_text("⚠️ النص فارغ. أرسل عنواناً صالحاً.")
+        return True
+
+    if len(text) > 150:
+        await update.message.reply_text("⚠️ العنوان طويل جداً (الحد 150 حرفاً).")
+        return True
+
+    if custom:
+        preview = context.user_data.get("admin_upload_preview")
+
+        if not isinstance(preview, dict):
+            _clear_admin_state(context)
+            await update.message.reply_text(
+                "⚠️ انتهت جلسة الرفع. ابدأ من جديد.",
+                reply_markup=home_keyboard(),
+            )
+            return True
+
+        preview["title"] = text
+        context.user_data.pop("admin_upload_waiting_title", None)
+        context.user_data.pop("admin_upload_title", None)
+
+        folder_id = preview.get("folder_id")
+
+        await update.message.reply_text(
+            "✏️ *تأكيد العنوان*\n\n"
+            f"📄 العنوان: <b>{escape(text)}</b>\n\n"
+            "هل تريد تسجيل المورد بهذا العنوان؟",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [btn("✅ تسجيل", "admin_upload_confirm")],
+                    [btn("❌ إلغاء", f"admin_folder:{folder_id}")],
+                ]
+            ),
+        )
+        return True
+
+    # Resource rename state.
+    try:
+        content_id = int(context.user_data.get("admin_file_rename_id"))
+    except (TypeError, ValueError):
+        _clear_admin_state(context)
+        await update.message.reply_text(
+            "⚠️ انتهت جلسة إعادة التسمية.",
+            reply_markup=home_keyboard(),
+        )
+        return True
+
+    try:
+        record = await database.get_file_record(content_id)
+    except Exception:
+        record = None
+
+    if not record:
+        _clear_admin_state(context)
+        await update.message.reply_text(
+            "⚠️ المورد غير موجود.",
+            reply_markup=home_keyboard(),
+        )
+        return True
+
+    try:
+        ok = await database.update_file_title(content_id, text)
+    except Exception:
+        logger.exception("Admin resource rename failed")
+        ok = False
+
+    _clear_admin_state(context)
+
+    if not ok:
+        await update.message.reply_text(
+            "⚠️ تعذر إعادة تسمية المورد.",
+            reply_markup=home_keyboard(),
+        )
+        return True
+
+    await update.message.reply_text(
+        "✅ تم تغيير عنوان المورد بنجاح.\n\n"
+        f"📄 العنوان الجديد: <b>{escape(text)}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [btn("🗂 إدارة المورد", f"admin_file:{content_id}")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+    return True
+
+
+
 async def show_admin(query):
     user_id = query.from_user.id
 
@@ -1586,6 +2583,15 @@ async def process_approval(query, contribution_id, approve):
         is_admin = False
 
     if not is_admin:
+        await edit_safe(
+            query,
+            "🔒 غير مصرح لك بمراجعة المساهمات.",
+            InlineKeyboardMarkup(
+                [
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
+        )
         return
 
     try:
@@ -1658,6 +2664,11 @@ async def show_ai_registry(query):
         is_admin = False
 
     if not is_admin:
+        await edit_safe(
+            query,
+            "🔒 غير مصرح.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
         return
 
     try:
@@ -1757,6 +2768,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "home":
         context.user_data["search_mode"] = False
         context.user_data["assistant_mode"] = None
+        _clear_admin_state(context)
         await show_home(update)
         return
 
@@ -1889,6 +2901,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "contribute":
+        _clear_contribution_state(context)
         await show_contribute(query)
         return
 
@@ -1906,6 +2919,422 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "admin":
         await show_admin(query)
+        return
+
+    # ---- Admin resource upload / management ------------------
+    if data.startswith("admin_upload:"):
+        try:
+            folder_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف القسم غير صالح.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+        await start_admin_upload(query, context, folder_id)
+        return
+
+    if data == "admin_upload_confirm":
+        await admin_upload_confirm(query, context)
+        return
+
+    if data == "admin_upload_custom_title":
+        await admin_upload_custom_title(query, context)
+        return
+
+    if data.startswith("admin_file_rename:"):
+        try:
+            content_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف المورد غير صالح.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        if not await _admin_check(query):
+            await edit_safe(
+                query,
+                "🔒 غير مصرح.",
+                InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+            )
+            return
+
+        record = await database.get_file_record(content_id)
+
+        if not record:
+            await edit_safe(
+                query,
+                "⚠️ المورد غير موجود.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        context.user_data["admin_file_rename"] = True
+        context.user_data["admin_file_rename_id"] = content_id
+        context.user_data["admin_file_rename_waiting"] = True
+
+        await edit_safe(
+            query,
+            "✏️ *إعادة تسمية المورد*\n\n"
+            f"العنوان الحالي: <b>{escape(str(record[2]))}</b>\n\n"
+            "أرسل العنوان الجديد في رسالة نصية.\n"
+            "يمكنك إرسال /cancel للإلغاء.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [[btn("❌ إلغاء", f"admin_file:{content_id}")]]
+            ),
+        )
+        return
+
+    if data.startswith("admin_file_retype:"):
+        try:
+            content_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف المورد غير صالح.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        if not await _admin_check(query):
+            await edit_safe(
+                query,
+                "🔒 غير مصرح.",
+                InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+            )
+            return
+
+        record = await database.get_file_record(content_id)
+
+        if not record:
+            await edit_safe(
+                query,
+                "⚠️ المورد غير موجود.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        await edit_safe(
+            query,
+            "📦 *تغيير نوع المورد*\n\n"
+            f"📄 العنوان: <b>{escape(str(record[2]))}</b>\n"
+            f"📎 النوع الحالي: <code>{escape(str(record[4]))}</code>\n\n"
+            "اختر النوع الجديد:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_file_type_keyboard(content_id),
+        )
+        return
+
+    if data.startswith("admin_file_settype:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            await edit_safe(
+                query,
+                "⚠️ بيانات غير صالحة.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        try:
+            content_id = int(parts[1])
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف المورد غير صالح.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        node_type = parts[2]
+
+        if node_type not in FILE_TYPE_KEYS:
+            await edit_safe(
+                query,
+                "⚠️ نوع غير مدعوم.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        if not await _admin_check(query):
+            await edit_safe(
+                query,
+                "🔒 غير مصرح.",
+                InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+            )
+            return
+
+        record = await database.get_file_record(content_id)
+
+        if not record:
+            await edit_safe(
+                query,
+                "⚠️ المورد غير موجود.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        try:
+            ok = await database.update_content_type(content_id, node_type)
+        except Exception:
+            logger.exception("Admin resource type change failed")
+            ok = False
+
+        if not ok:
+            await edit_safe(
+                query,
+                "⚠️ تعذر تغيير نوع المورد.",
+                InlineKeyboardMarkup(
+                    [[btn("🗂 إدارة المورد", f"admin_file:{content_id}")]]
+                ),
+            )
+            return
+
+        await show_admin_file(query, content_id)
+        return
+
+    if data.startswith("admin_file_move_to:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            await edit_safe(
+                query,
+                "⚠️ بيانات غير صالحة.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        try:
+            await admin_file_move_to(
+                query,
+                context,
+                int(parts[1]),
+                int(parts[2]),
+            )
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف غير صالح.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+        return
+
+    if data.startswith("admin_file_move:"):
+        try:
+            content_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف المورد غير صالح.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        context.user_data["admin_file_move"] = True
+        context.user_data["admin_file_move_id"] = content_id
+        await admin_file_move_menu(query, context)
+        return
+
+    if data.startswith("admin_file_delete:"):
+        try:
+            content_id = int(data.split(":", 1)[1])
+            await admin_file_delete(query, context, content_id)
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف المورد غير صالح.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+        return
+
+    if data.startswith("admin_file:"):
+        try:
+            content_id = int(data.split(":", 1)[1])
+            await show_admin_file(query, content_id)
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف المورد غير صالح.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+        return
+
+    # ---- Folder move / delete / child / type -----------------
+    if data.startswith("admin_folder_move_to:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            await edit_safe(
+                query,
+                "⚠️ بيانات غير صالحة.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        try:
+            await admin_folder_move_to(
+                query,
+                context,
+                int(parts[1]),
+                int(parts[2]),
+            )
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف غير صالح.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+        return
+
+    if data.startswith("admin_folder_move:"):
+        try:
+            folder_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف القسم غير صالح.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        context.user_data["admin_folder_move"] = True
+        context.user_data["admin_folder_move_id"] = folder_id
+        await admin_folder_move_menu(query, context)
+        return
+
+    if data.startswith("admin_folder_delete:"):
+        try:
+            folder_id = int(data.split(":", 1)[1])
+            await admin_folder_delete(query, context, folder_id)
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف القسم غير صالح.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+        return
+
+    if data.startswith("admin_folder_child:"):
+        try:
+            parent_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف القسم غير صالح.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+        await select_admin_folder_parent(query, context, parent_id)
+        return
+
+    if data.startswith("admin_folder_retype_existing:"):
+        try:
+            folder_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف القسم غير صالح.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        if not await _admin_check(query):
+            await edit_safe(
+                query,
+                "🔒 غير مصرح.",
+                InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+            )
+            return
+
+        folder = await database.get_folder(folder_id)
+
+        if not folder:
+            await edit_safe(
+                query,
+                "⚠️ القسم غير موجود.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        context.user_data["admin_folder_retype_id"] = folder_id
+
+        await edit_safe(
+            query,
+            "📦 *تغيير نوع القسم*\n\n"
+            f"📁 الاسم: <b>{escape(str(folder[2]))}</b>\n"
+            f"🏷 النوع الحالي: <code>{escape(str(folder[3]))}</code>\n\n"
+            "اختر النوع الجديد:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_folder_type_keyboard(folder_id),
+        )
+        return
+
+    if data.startswith("admin_folder_settype:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            await edit_safe(
+                query,
+                "⚠️ بيانات غير صالحة.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        try:
+            folder_id = int(parts[1])
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف القسم غير صالح.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        node_type = parts[2]
+
+        if node_type not in FOLDER_TYPE_KEYS:
+            await edit_safe(
+                query,
+                "⚠️ نوع غير مدعوم.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        if not await _admin_check(query):
+            await edit_safe(
+                query,
+                "🔒 غير مصرح.",
+                InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+            )
+            return
+
+        folder = await database.get_folder(folder_id)
+
+        if not folder:
+            await edit_safe(
+                query,
+                "⚠️ القسم غير موجود.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+
+        try:
+            ok = await database.update_folder_type(folder_id, node_type)
+        except Exception:
+            logger.exception("Admin folder type change failed")
+            ok = False
+
+        if not ok:
+            await edit_safe(
+                query,
+                "⚠️ تعذر تغيير نوع القسم.",
+                InlineKeyboardMarkup(
+                    [[btn("↩️ إدارة القسم", f"admin_folder:{folder_id}")]]
+                ),
+            )
+            return
+
+        await show_admin_folder(query, folder_id)
         return
 
     if data.startswith("admin_folder:"):
@@ -2160,18 +3589,29 @@ async def quota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel any active admin folder creation flow."""
+    """Cancel any active admin workflow."""
     if not update.message:
         return
 
-    if context.user_data.get("admin_folder_create"):
-        context.user_data.pop("admin_folder_create", None)
-        context.user_data.pop("admin_folder_parent", None)
-        context.user_data.pop("admin_folder_name", None)
-        context.user_data.pop("admin_folder_type", None)
+    active = any(
+        context.user_data.get(key)
+        for key in (
+            "admin_folder_create",
+            "admin_folder_rename",
+            "admin_folder_retype_id",
+            "admin_folder_move",
+            "admin_upload",
+            "admin_upload_waiting_title",
+            "admin_file_rename",
+            "admin_file_move",
+        )
+    )
 
+    _clear_admin_state(context)
+
+    if active:
         await update.message.reply_text(
-            "❌ تم إلغاء إنشاء القسم.",
+            "❌ تم إلغاء العملية الجارية.",
             reply_markup=home_keyboard(),
         )
         return
@@ -2195,6 +3635,31 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     query = update.message.text.strip()
+
+    # Custom title input (upload / resource rename) has the highest priority.
+    if context.user_data.get("admin_upload_waiting_title") or (
+        context.user_data.get("admin_file_rename")
+        and context.user_data.get("admin_file_rename_waiting")
+    ):
+        handled = await handle_pending_title_input(update, context)
+        if handled:
+            return
+
+    # Admin upload awaiting media: text input should not fall through to AI.
+    if context.user_data.get("admin_upload"):
+        folder_id = context.user_data.get("admin_upload_folder")
+        await update.message.reply_text(
+            "📤 أنت في وضع رفع مورد.\n\n"
+            "أرسل المورد الآن كـ Document / Photo / Audio / Video، "
+            "أو اضغط ❌ إلغاء / أرسل /cancel للخروج.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [btn("❌ إلغاء", f"admin_folder:{folder_id}")],
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
+        )
+        return
 
     # Admin folder rename state has priority over search/AI.
     if context.user_data.get("admin_folder_rename"):
@@ -2305,11 +3770,18 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Admin resource upload has priority over student contributions.
+    handled = await admin_upload_media_handler(update, context)
+
+    if handled:
+        return
+
     handled = await contribution_media_handler(update, context)
 
     if handled:
         return
 
+    # Unrecognized media with no active state: never crash, never corrupt.
     await update.message.reply_text(
         "📚 إذا كنت تريد إرسال مساهمة، افتح:\n"
         "📤 Student Contributions\n\n"
