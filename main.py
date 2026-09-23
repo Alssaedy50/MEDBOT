@@ -50,13 +50,35 @@ from telegram.ext import (
 )
 
 import database
-from ai import generate_medical_ai_response
+from ai import (
+    generate_medical_ai_response,
+    generate_medbot_assistant_response,
+    NOT_REGISTERED_MESSAGE,
+)
 from search_engine import search_library_summary
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DAILY_LIMIT = 20
+
+
+def configured_admin_id() -> int:
+    """Return the configured owner/admin Telegram ID, or 0 if unset.
+
+    Security: admin identity must come from explicit configuration. A
+    missing/blank/zero ADMIN_ID returns 0 and never promotes any user,
+    especially not the first user who happens to send /start.
+    """
+    raw = os.getenv("ADMIN_ID", "").strip()
+
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+    return value if value > 0 else 0
+
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -3588,6 +3610,43 @@ async def quota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the caller's Telegram ID and current authorization status.
+
+    This does not grant any privilege. It exists so the configured owner can
+    discover their numeric ID to place in ADMIN_ID.
+    """
+    user = update.effective_user
+
+    await database.register_user(user.id, user.username, user.full_name)
+
+    try:
+        is_admin = await database.is_user_admin(user.id)
+    except Exception:
+        is_admin = False
+
+    configured = configured_admin_id()
+
+    if configured == 0:
+        status = (
+            "ADMIN_ID غير مُهيّأ في البيئة.\n"
+            "لن يُرقّى أي مستخدم تلقائياً، حتى أول مستخدم."
+        )
+    elif configured == user.id:
+        status = f"أنت المالك المُهيّأ (ADMIN_ID={configured})."
+    else:
+        status = f"ADMIN_ID مُهيّأ لمُعرّف آخر ({configured})."
+
+    await send_safe_message(
+        update,
+        f"🆔 *مُعرّف Telegram الخاص بك:* `{user.id}`\n\n"
+        f"🔐 صلاحية مشرف في MEDBOT: "
+        f"{'نعم' if is_admin else 'لا'}\n\n"
+        f"{status}",
+        home_keyboard(),
+    )
+
+
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel any active admin workflow."""
     if not update.message:
@@ -3688,6 +3747,26 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # If the user is inside the Assistant gateway, route according
     # to the selected assistant mode instead of guessing the intent.
     assistant_mode = context.user_data.get("assistant_mode")
+
+    # MEDBOT resource assistant: deterministic search first, then grounded AI.
+    if assistant_mode == "resource":
+        context.user_data["assistant_mode"] = None
+
+        try:
+            answer = await generate_medbot_assistant_response(
+                query,
+                user_id=user.id,
+            )
+        except Exception:
+            logger.exception("MEDBOT grounded assistant failed")
+            answer = NOT_REGISTERED_MESSAGE
+
+        await send_safe_message(
+            update,
+            answer,
+            home_keyboard(),
+        )
+        return
 
     if assistant_mode is None:
         await update.message.reply_text(
@@ -3802,6 +3881,21 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application: Application):
     await database.init_db()
 
+    admin_id = configured_admin_id()
+
+    if admin_id:
+        granted = await database.ensure_configured_admin(admin_id)
+
+        if granted:
+            logger.info(
+                "Configured ADMIN_ID=%s ensured as MEDBOT admin", admin_id
+            )
+    else:
+        logger.warning(
+            "ADMIN_ID is not configured. "
+            "No admin was promoted; set ADMIN_ID in the environment."
+        )
+
 
 def main():
     if not BOT_TOKEN:
@@ -3826,6 +3920,7 @@ def main():
     # Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("quota", quota_command))
+    app.add_handler(CommandHandler("whoami", whoami_command))
     app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("ask", ai_handler))
@@ -3836,7 +3931,11 @@ def main():
     # Uploaded media / student contributions
     app.add_handler(
         MessageHandler(
-            filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VIDEO,
+            filters.Document.ALL
+            | filters.PHOTO
+            | filters.AUDIO
+            | filters.VIDEO
+            | filters.VOICE,
             media_router,
         )
     )
