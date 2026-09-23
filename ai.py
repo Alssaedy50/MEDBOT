@@ -1,5 +1,6 @@
 import os
 import socket
+import asyncio
 import logging
 import time
 from random import SystemRandom
@@ -102,6 +103,15 @@ KNOWN_GOOD_MODELS = {
 _DISCOVERY_CACHE = {}
 _DISCOVERY_LAST_RUN = {}
 DISCOVERY_TTL_SECONDS = 900
+
+# The verified active pool is expensive to build: provider discovery plus up
+# to six health probes, all network round-trips. Rebuilding it on every user
+# message is what made /start-adjacent AI replies slow. Cache the resulting
+# pool for a short TTL (and on failure keep serving the previous pool).
+_CANDIDATE_CACHE = {"pool": None}
+_CANDIDATE_CACHE_AT = 0.0
+CANDIDATE_TTL_SECONDS = 300
+_CANDIDATE_LOCK = asyncio.Lock()
 
 
 FALLBACKS = ()
@@ -689,7 +699,41 @@ async def _get_candidates():
         DISCOVERED -> probe -> VERIFIED -> active pool
 
     AVAILABLE/UNKNOWN/DISCOVERED models are never used directly.
+
+    The resulting pool is cached for ``CANDIDATE_TTL_SECONDS`` so a burst of
+    user messages does not re-run discovery and health probes on every call.
+    Callers never mutate the returned pool.
     """
+    global _CANDIDATE_CACHE_AT
+
+    now = time.time()
+    cached_pool = _CANDIDATE_CACHE.get("pool")
+
+    if cached_pool and now - _CANDIDATE_CACHE_AT < CANDIDATE_TTL_SECONDS:
+        return list(cached_pool)
+
+    async with _CANDIDATE_LOCK:
+        # Re-check inside the lock: another coroutine may have refreshed it.
+        now = time.time()
+        cached_pool = _CANDIDATE_CACHE.get("pool")
+
+        if cached_pool and now - _CANDIDATE_CACHE_AT < CANDIDATE_TTL_SECONDS:
+            return list(cached_pool)
+
+        pool = await _build_candidates_uncached()
+
+        if pool:
+            _CANDIDATE_CACHE["pool"] = pool
+            _CANDIDATE_CACHE_AT = time.time()
+        elif not cached_pool:
+            # Nothing verified yet: do not cache an empty pool, so the next
+            # request can retry instead of being stuck with no providers.
+            _CANDIDATE_CACHE_AT = 0.0
+
+        return list(pool if pool else (cached_pool or []))
+
+
+async def _build_candidates_uncached():
     candidates = []
 
     # --------------------------------------------------------

@@ -9,6 +9,16 @@ DB_NAME = "medbot_v2.sqlite3"
 async def get_db():
     db = await aiosqlite.connect(DB_NAME)
     await db.execute("PRAGMA foreign_keys = ON;")
+    # WAL keeps readers from blocking the writer, and the busy timeout lets
+    # concurrent handler coroutines wait briefly instead of failing with
+    # "database is locked". row_factory=None is intentional: callers index
+    # rows positionally, so we must not switch to sqlite3.Row.
+    try:
+        await db.execute("PRAGMA journal_mode = WAL;")
+        await db.execute("PRAGMA synchronous = NORMAL;")
+        await db.execute("PRAGMA busy_timeout = 5000;")
+    except Exception:
+        logger.debug("PRAGMA tuning unavailable", exc_info=True)
     return db
 
 async def init_db():
@@ -158,6 +168,7 @@ async def init_db():
         await _migrate_v2(db)
         await _migrate_v3(db)
         await _migrate_v4(db)
+        await _migrate_v5(db)
 
         # ------------------------------------------------------------
         # Performance / integrity indexes
@@ -185,6 +196,11 @@ async def init_db():
         await db.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS ux_ai_registry_provider_model_endpoint
             ON ai_registry(provider, model, endpoint)
+        """)
+
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_content_created
+            ON content(created_at)
         """)
 
         await db.commit()
@@ -317,6 +333,44 @@ async def _migrate_v4(db):
         """)
     except Exception:
         pass
+
+
+async def _migrate_v5(db):
+    """AI resource search: add optional searchable metadata.
+
+    Extends the searchable surface beyond folder/title so the
+    intent-aware search can match resource descriptions and keywords
+    that the operator registers. Both columns are nullable, so existing
+    rows remain valid and are treated as empty during search.
+    Safe to re-run; never rewrites or deletes data.
+    """
+    for table, column, ddl in (
+        (
+            "folders",
+            "description",
+            "ALTER TABLE folders ADD COLUMN description TEXT DEFAULT NULL",
+        ),
+        (
+            "folders",
+            "keywords",
+            "ALTER TABLE folders ADD COLUMN keywords TEXT DEFAULT NULL",
+        ),
+        (
+            "content",
+            "description",
+            "ALTER TABLE content ADD COLUMN description TEXT DEFAULT NULL",
+        ),
+        (
+            "content",
+            "keywords",
+            "ALTER TABLE content ADD COLUMN keywords TEXT DEFAULT NULL",
+        ),
+    ):
+        try:
+            await db.execute(ddl)
+            logger.info("Migration v5: added %s.%s", table, column)
+        except Exception:
+            pass
 
 
 # Message categories and lifecycle states.
@@ -576,82 +630,179 @@ async def get_files(folder_id: int):
     await db.close()
     return res
 
+
+async def get_folder_view(folder_id: int):
+    """Load everything the library folder screen needs in one connection.
+
+    Replaces the previous sequence of separate get_folder + get_folders +
+    get_files + get_parent_id + get_breadcrumbs calls, each of which opened
+    and closed its own SQLite connection. Returns
+    (folder, child_folders, files, parent_id, breadcrumb).
+    """
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT id, parent_id, name, node_type, accepts_contributions "
+            "FROM folders WHERE id = ?",
+            (folder_id,),
+        ) as cur:
+            folder = await cur.fetchone()
+
+        async with db.execute(
+            "SELECT id, name, node_type, accepts_contributions "
+            "FROM folders WHERE parent_id = ? ORDER BY id ASC",
+            (folder_id,),
+        ) as cur:
+            children = await cur.fetchall()
+
+        async with db.execute(
+            "SELECT id, title, file_id, file_type, source_type, "
+            "source_contribution_id, created_by "
+            "FROM content WHERE folder_id = ? ORDER BY id DESC",
+            (folder_id,),
+        ) as cur:
+            files = await cur.fetchall()
+
+        parent_id = folder[1] if folder and folder[1] is not None else 0
+        paths = await build_breadcrumb_paths(db, [folder_id])
+        breadcrumb = paths.get(folder_id, "الرئيسية 🏠")
+
+        return folder, children, files, parent_id, breadcrumb
+    finally:
+        await db.close()
+
+
+async def get_searchable_records():
+    """Return (folders, contents) for intent-aware search, one connection.
+
+    Folder rows:   (id, parent_id, name, node_type, description, keywords)
+    Content rows:  (id, folder_id, title, file_type, description, keywords)
+    """
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT id, parent_id, name, node_type, description, keywords "
+            "FROM folders ORDER BY id ASC"
+        ) as cur:
+            folders = await cur.fetchall()
+
+        async with db.execute(
+            "SELECT id, folder_id, title, file_type, description, keywords "
+            "FROM content ORDER BY id DESC"
+        ) as cur:
+            contents = await cur.fetchall()
+
+        paths = await build_breadcrumb_paths(
+            db,
+            {row[0] for row in folders} | {row[1] for row in contents},
+        )
+
+        return folders, contents, paths
+    finally:
+        await db.close()
+
 async def get_breadcrumbs(folder_id: int):
     if folder_id == 0: return "الرئيسية 🏠"
     db = await get_db()
-    path = []
-    curr = folder_id
-    while curr:
-        async with db.execute("SELECT parent_id, name FROM folders WHERE id = ?", (curr,)) as cur:
-            row = await cur.fetchone()
+    try:
+        path = []
+        curr = folder_id
+        visited = set()
+        while curr:
+            if curr in visited:
+                break
+            visited.add(curr)
+            async with db.execute("SELECT parent_id, name FROM folders WHERE id = ?", (curr,)) as cur:
+                row = await cur.fetchone()
             if not row: break
             path.append(row[1])
             curr = row[0]
-    await db.close()
-    path.append("الرئيسية 🏠")
-    path.reverse()
-    return " ⬅️ ".join(path)
+        path.append("الرئيسية 🏠")
+        path.reverse()
+        return " ⬅️ ".join(path)
+    finally:
+        await db.close()
+
+
+async def build_breadcrumb_paths(db_conn, folder_ids) -> dict:
+    """Resolve many folder paths with one connection and no N+1 queries.
+
+    Returns {folder_id: "الرئيسية 🏠 ⬅️ A ⬅️ B"}. Root is "الرئيسية 🏠".
+    Cycle-safe: corrupted parent chains stop repeating a node.
+    """
+    parents = {}
+    names = {}
+
+    async with db_conn.execute("SELECT id, parent_id, name FROM folders") as cur:
+        async for row in cur:
+            parents[row[0]] = row[1]
+            names[row[0]] = row[2]
+
+    paths = {0: "الرئيسية 🏠"}
+
+    for folder_id in folder_ids:
+        if folder_id in paths:
+            continue
+
+        chain = []
+        visited = set()
+        current = folder_id
+
+        while current and current not in visited:
+            visited.add(current)
+            chain.append(names.get(current, str(current)))
+            current = parents.get(current)
+
+        chain.append("الرئيسية 🏠")
+        chain.reverse()
+        paths[folder_id] = " ⬅️ ".join(chain)
+
+    return paths
+
 
 async def get_breadcrumbs_inline(db_conn, folder_id: int):
     if folder_id == 0: return "الرئيسية 🏠"
-    path = []
-    curr = folder_id
-    while curr:
-        async with db_conn.execute("SELECT parent_id, name FROM folders WHERE id = ?", (curr,)) as cur:
-            row = await cur.fetchone()
-            if not row: break
-            path.append(row[1])
-            curr = row[0]
-    path.append("الرئيسية 🏠")
-    path.reverse()
-    return " ⬅️ ".join(path)
+    paths = await build_breadcrumb_paths(db_conn, [folder_id])
+    return paths.get(folder_id, "الرئيسية 🏠")
 
 async def add_folder(parent_id: int, name: str, node_type: str, accepts_contributions: int = 0):
     db = await get_db()
-    pid = None if parent_id == 0 else parent_id
-    await db.execute("INSERT INTO folders (parent_id, name, node_type, accepts_contributions) VALUES (?, ?, ?, ?)", (pid, name, node_type, accepts_contributions))
-    await db.commit()
-    await db.close()
-    return True
+    try:
+        pid = None if parent_id in (None, 0) else parent_id
+        cursor = await db.execute(
+            "INSERT INTO folders (parent_id, name, node_type, accepts_contributions) VALUES (?, ?, ?, ?)",
+            (pid, name, node_type, accepts_contributions),
+        )
+        await db.commit()
+        # The new row id is truthy; every legacy caller that treated the
+        # return value as a boolean continues to work unchanged.
+        return cursor.lastrowid
+    finally:
+        await db.close()
 
 async def delete_folder(folder_id: int) -> bool:
     """Delete an empty folder only. Non-existent or non-empty folders are refused."""
     db = await get_db()
     try:
+        # One round-trip replaces the former four sequential existence/count
+        # queries. Any child folder, content or contribution blocks deletion
+        # (contributions are ON DELETE CASCADE and must never be discarded).
         async with db.execute(
-            "SELECT 1 FROM folders WHERE id = ?",
-            (folder_id,),
+            """
+            SELECT
+                (SELECT COUNT(*) FROM folders WHERE parent_id = ?) AS children,
+                (SELECT COUNT(*) FROM content WHERE folder_id = ?) AS content,
+                (SELECT COUNT(*) FROM contributions WHERE folder_id = ?) AS contribs,
+                (SELECT COUNT(*) FROM folders WHERE id = ?) AS exists_flag
+            """,
+            (folder_id, folder_id, folder_id, folder_id),
         ) as cur:
-            if not await cur.fetchone():
-                return False
+            row = await cur.fetchone()
 
-        async with db.execute(
-            "SELECT COUNT(*) FROM folders WHERE parent_id = ?",
-            (folder_id,),
-        ) as cur:
-            child_row = await cur.fetchone()
-
-        if child_row and int(child_row[0]) > 0:
+        if not row or int(row[3]) == 0:
             return False
 
-        async with db.execute(
-            "SELECT COUNT(*) FROM content WHERE folder_id = ?",
-            (folder_id,),
-        ) as cur:
-            content_row = await cur.fetchone()
-
-        if content_row and int(content_row[0]) > 0:
-            return False
-
-        # Contributions reference the folder with ON DELETE CASCADE; deleting
-        # the folder would silently discard student submissions.
-        async with db.execute(
-            "SELECT COUNT(*) FROM contributions WHERE folder_id = ?",
-            (folder_id,),
-        ) as cur:
-            contribution_row = await cur.fetchone()
-
-        if contribution_row and int(contribution_row[0]) > 0:
+        if int(row[0]) > 0 or int(row[1]) > 0 or int(row[2]) > 0:
             return False
 
         await db.execute("DELETE FROM folders WHERE id = ?", (folder_id,))

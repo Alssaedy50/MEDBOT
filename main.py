@@ -263,7 +263,7 @@ def content_icon(file_type):
     return "📄"
 
 
-def folder_keyboard(folders, parent_id=0):
+def folder_keyboard(folders, parent_id=0, back_target=None):
     rows = []
 
     for folder in folders:
@@ -284,7 +284,8 @@ def folder_keyboard(folders, parent_id=0):
         )
 
     if parent_id != 0:
-        rows.append([btn("⬅️ رجوع", f"library:{parent_id}")])
+        target = parent_id if back_target is None else back_target
+        rows.append([btn("⬅️ رجوع", f"library:{target}")])
 
     rows.append([btn("🏠 الرئيسية", "home")])
 
@@ -302,6 +303,17 @@ async def show_library(query, parent_id=0):
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
         return
+
+    # The back button must target the real parent of the folder being viewed,
+    # not the folder itself.
+    back_target = 0
+
+    if parent_id:
+        try:
+            parent = await database.get_parent_id(parent_id)
+            back_target = int(parent) if parent else 0
+        except Exception:
+            back_target = 0
 
     if parent_id == 0:
         title = (
@@ -326,23 +338,34 @@ async def show_library(query, parent_id=0):
     await edit_safe(
         query,
         title,
-        folder_keyboard(folders, parent_id),
+        folder_keyboard(folders, parent_id, back_target),
     )
 
 
 async def show_folder(query, folder_id):
     try:
-        folders = await database.get_folders(folder_id)
-        files = await database.get_files(folder_id)
-        parent_id = await database.get_parent_id(folder_id)
-        breadcrumb = await database.get_breadcrumbs(folder_id)
-        folder = await database.get_folder(folder_id)
-    except Exception as exc:
+        folder, folders, files, parent_id, breadcrumb = (
+            await database.get_folder_view(folder_id)
+        )
+    except Exception:
         logger.exception("Folder loading failed")
         await edit_safe(
             query,
             "⚠️ تعذر تحميل محتوى القسم حالياً.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    if not folder:
+        await edit_safe(
+            query,
+            "⚠️ القسم غير موجود.",
+            InlineKeyboardMarkup(
+                [
+                    [btn("📚 MEDBOT Resources", "library:0")],
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
         )
         return
 
@@ -1164,6 +1187,23 @@ async def show_admin_folder(query, folder_id: int):
         [btn("🚚 نقل القسم", f"admin_folder_move:{folder_id}")],
     ]
 
+    # Direct navigation into this branch's real sub-sections, so the admin
+    # never has to leave the panel to walk the tree.
+    for child in children:
+        try:
+            child_id, child_name, child_type, _child_accepts = child[:4]
+        except Exception:
+            continue
+
+        rows.append(
+            [
+                btn(
+                    f"{resource_icon(child_type)} {str(child_name)[:35]}",
+                    f"admin_folder:{child_id}",
+                )
+            ]
+        )
+
     rows.append([btn("🗑 حذف القسم", f"admin_folder_delete:{folder_id}")])
 
     if parent_id:
@@ -1181,7 +1221,7 @@ async def show_admin_folder(query, folder_id: int):
         f"📤 *المساهمات:* {accepts_text}\n"
         f"📄 *الموارد:* {len(files)}\n"
         f"📂 *الأقسام الفرعية:* {len(children)}\n\n"
-        "اختر الإجراء المطلوب:",
+        "اختر الإجراء المطلوب أو ادخل إلى قسم فرعي:",
         InlineKeyboardMarkup(rows),
     )
 
@@ -1209,10 +1249,17 @@ async def show_admin_folders(query):
         except Exception:
             continue
 
+        try:
+            children = await database.get_folder_children_count(folder_id)
+            files = await database.get_files(folder_id)
+        except Exception:
+            children, files = 0, []
+
         rows.append(
             [
                 btn(
-                    f"{resource_icon(node_type)} {str(name)[:35]}",
+                    f"{resource_icon(node_type)} {str(name)[:30]} "
+                    f"({len(files)} مورد · {children} قسم فرعي)",
                     f"admin_folder:{folder_id}",
                 )
             ]
@@ -1230,8 +1277,9 @@ async def show_admin_folders(query):
     await edit_safe(
         query,
         "🗂 *إدارة الأقسام*\n\n"
-        "اختر قسماً لإدارته، أو أنشئ قسماً جديداً.\n"
-        "يمكنك أيضاً الدخول إلى قسم لإضافة قسم فرعي بداخله.",
+        "هذه الأقسام الرئيسية. اضغط على قسم للدخول إلى فرعه وإدارة "
+        "الأقسام الفرعية أو رفع الموارد داخله.\n\n"
+        "أو أنشئ قسماً جديداً:",
         InlineKeyboardMarkup(rows),
     )
 
@@ -1683,16 +1731,28 @@ async def finish_admin_folder_create(query, context, accepts):
         )
         return
 
+    new_folder_id = int(ok)
+
+    try:
+        new_folder = await database.get_folder(new_folder_id)
+    except Exception:
+        new_folder = None
+
+    new_name = new_folder[2] if new_folder else name
+
     await edit_safe(
         query,
         "✅ <b>تم إنشاء القسم بنجاح.</b>\n\n"
-        f"📁 الاسم: <b>{escape(name)}</b>\n"
+        f"📁 الاسم: <b>{escape(str(new_name))}</b>\n"
         f"🧩 النوع: <code>{escape(str(node_type))}</code>\n"
-        f"📤 استقبال المساهمات: {'نعم' if int(accepts) else 'لا'}",
+        f"📤 استقبال المساهمات: {'نعم' if int(accepts) else 'لا'}\n\n"
+        "يمكنك الآن رفع الموارد داخله أو إنشاء قسم فرعي.",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(
             [
-                [btn("➕ إنشاء قسم آخر", "admin_folder_create")],
+                [btn("📤 رفع مورد", f"admin_upload:{new_folder_id}")],
+                [btn("➕ إضافة قسم فرعي", f"admin_folder_child:{new_folder_id}")],
+                [btn("🗂 إدارة هذا القسم", f"admin_folder:{new_folder_id}")],
                 [btn("🗂 إدارة الأقسام", "admin_folders")],
                 [btn("🏠 الرئيسية", "home")],
             ]

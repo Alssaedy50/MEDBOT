@@ -1,11 +1,31 @@
+"""MEDBOT deterministic, intent-aware resource search.
+
+The database is the single source of truth: this module only ever ranks
+rows that are actually registered (folders, subjects/blocks, resource
+titles). It never fabricates a resource, folder, or link.
+
+Matching is semantic-ish rather than exact-string:
+
+    query -> normalize -> tokenize -> expand abbreviations/synonyms into
+    canonical concepts -> score each registered record by (a) direct text
+    match, (b) metadata match and (c) concept overlap.
+
+So "CBC" reaches "Complete Blood Count", "Blood Count", "Hematology" and
+"Blood Tests" without any of those titles containing the literal token,
+while an unrelated query still returns nothing.
+"""
+
 import re
 import unicodedata
-from typing import Any
 
 import aiosqlite
 
 DB_NAME = "medbot_v2.sqlite3"
 
+
+# ---------------------------------------------------------------------------
+# Normalization
+# ---------------------------------------------------------------------------
 
 def normalize_text(value: str) -> str:
     """
@@ -46,86 +66,293 @@ def normalize_text(value: str) -> str:
     return text
 
 
-def _like_pattern(value: str) -> str:
+# ---------------------------------------------------------------------------
+# Intent model: canonical concepts and their surface forms
+# ---------------------------------------------------------------------------
+#
+# Each entry maps a canonical concept to the surface forms (English and
+# Arabic) that should be treated as the same intent. Surface forms are
+# normalized at import time and indexed both as whole phrases and as
+# individual tokens, so "complete blood count", "CBC", "blood count" and
+# "تحليل الدم" all resolve to the same concept.
+
+_CONCEPT_SURFACES = {
+    "cbc": [
+        "cbc", "complete blood count", "blood count", "full blood count",
+        "hemogram", "hematology", "haematology", "hematology blood test",
+        "blood test", "blood tests", "blood work",
+        "تحليل الدم", "تحاليل الدم", "صورة الدم", "فحص الدم", "امراض الدم",
+    ],
+    "hemoglobin": [
+        "hb", "hgb", "hemoglobin", "haemoglobin", "هيموغلوبين", "خضاب",
+    ],
+    "esr": [
+        "esr", "erythrocyte sedimentation rate", "sedimentation rate",
+        "سرعة ترسيب الدم", "ترسيب الدم",
+    ],
+    "crp": [
+        "crp", "c-reactive protein", "c reactive protein",
+        "بروتين سي التفاعلي",
+    ],
+    "electrolytes": [
+        "electrolytes", "electrolyte", "sodium", "potassium",
+        "املاح الدم", "الكهارل", "شوارد الدم",
+    ],
+    "renal": [
+        "renal", "kidney", "kidneys", "renal function", "creatinine",
+        "urea", "bun", "gfr", "الكلى", "كلى", "وظائف الكلى", "كرياتينين",
+    ],
+    "liver": [
+        "liver", "hepatic", "liver function", "lft", "lfts", "alt", "ast",
+        "bilirubin", "الكبد", "وظائف الكبد", "بيليروبين",
+    ],
+    "lipid": [
+        "lipid", "lipids", "lipid profile", "cholesterol", "ldl", "hdl",
+        "triglycerides", "دهون", "الكوليسترول", "دهنيات الدم",
+    ],
+    "glucose": [
+        "glucose", "blood sugar", "fbg", "hba1c", "سكر", "سكري",
+        "سكر الدم", "الجلوكوز",
+    ],
+    "thyroid": [
+        "thyroid", "tsh", "t3", "t4", "thyroid function", "الغده الدرقيه",
+        "درقيه",
+    ],
+    "urinalysis": [
+        "urinalysis", "urine analysis", "urine test", "تحليل البول", "بول",
+    ],
+    "anatomy": [
+        "anatomy", "تشريح", "علم التشريح",
+    ],
+    "physiology": [
+        "physiology", "فسيولوجيا", "علم وظائف الاعضاء", "وظائف الاعضاء",
+    ],
+    "pathology": [
+        "pathology", "علم الامراض", "باثولوجي",
+    ],
+    "pharmacology": [
+        "pharmacology", "pharma", "drugs", "drug", "فارماكولوجي",
+        "علم الادويه", "الادويه",
+    ],
+    "microbiology": [
+        "microbiology", "micro", "بكتيريا", "ميكروبيولوجي",
+        "علم الاحياء الدقيقه",
+    ],
+    "biochemistry": [
+        "biochemistry", "biochem", "الكيمياء الحيويه", "كيمياء حيويه",
+    ],
+    "immunology": [
+        "immunology", "immune", "immuno", "مناعه", "علم المناعه",
+    ],
+    "mcq": [
+        "mcq", "mcqs", "multiple choice", "questions", "question",
+        "اسئله", "امتحان", "امتحانات", "كويز",
+    ],
+    "summary": [
+        "summary", "summaries", "note", "notes", "ملخص", "ملخصات",
+    ],
+    "lecture": [
+        "lecture", "lectures", "محاضره", "محاضرات", "شرح",
+    ],
+    "book": [
+        "book", "books", "textbook", "كتاب", "كتب", "مرجع",
+    ],
+    "video": [
+        "video", "videos", "فيديو", "مقاطع",
+    ],
+    "audio": [
+        "audio", "record", "recording", "صوتيات", "تسجيل",
+    ],
+    "block": [
+        "block", "blocks", "بلوك", "بلوكات", "موديول", "module",
+    ],
+    "subject": [
+        "subject", "course", "ماده", "مواد", "مقرر",
+    ],
+}
+
+# Query words that carry no topical intent.
+_STOPWORDS = {
+    "where", "what", "which", "find", "show", "give", "get", "need",
+    "want", "the", "a", "an", "of", "to", "in", "on", "for", "and",
+    "or", "is", "are", "do", "does", "can", "i", "me", "my", "please",
+    "about", "content", "contents", "material", "materials",
+    "اين", "وين", "ما", "ماذا", "هل", "عن", "في", "على", "من", "الى",
+    "اريد", "ابحث", "اعطني", "هات", "محتوى", "محتوي", "مواد",
+    "عندي", "عند", "كيف", "اماكن", "مكان",
+}
+
+# phrase/token -> ordered canonical concepts
+_SURFACE_INDEX: dict[str, tuple] = {}
+_TOKEN_INDEX: dict[str, tuple] = {}
+
+
+def _build_indexes() -> None:
+    phrase_map: dict[str, list] = {}
+    token_map: dict[str, list] = {}
+
+    for concept, surfaces in _CONCEPT_SURFACES.items():
+        for surface in surfaces:
+            norm = normalize_text(surface)
+            if not norm:
+                continue
+
+            phrase_map.setdefault(norm, []).append(concept)
+
+            for token in re.findall(r"[a-z0-9\u0600-\u06FF]+", norm):
+                if token in _STOPWORDS or len(token) < 2:
+                    continue
+                token_map.setdefault(token, []).append(concept)
+
+    for mapping, store in (
+        (phrase_map, _SURFACE_INDEX),
+        (token_map, _TOKEN_INDEX),
+    ):
+        for key, values in mapping.items():
+            # Preserve a deterministic order, drop duplicates.
+            store[key] = tuple(dict.fromkeys(values))
+
+
+_build_indexes()
+
+
+def _lookup_concepts(text: str) -> set:
+    """Return canonical concepts implied by a piece of text."""
+    norm = normalize_text(text)
+
+    if not norm:
+        return set()
+
+    concepts = set()
+
+    direct = _SURFACE_INDEX.get(norm)
+    if direct:
+        concepts.update(direct)
+
+    for token in re.findall(r"[a-z0-9\u0600-\u06FF]+", norm):
+        if token in _STOPWORDS or len(token) < 2:
+            continue
+
+        # Only whole-token matches are indexed, which avoids substring
+        # false positives (e.g. "k" inside "kidney").
+        token_concepts = _TOKEN_INDEX.get(token)
+        if token_concepts:
+            concepts.update(token_concepts)
+
+    return concepts
+
+
+def _query_terms(query_norm: str) -> list:
+    return [
+        token
+        for token in re.findall(r"[a-z0-9\u0600-\u06FF]+", query_norm)
+        if len(token) >= 2 and token not in _STOPWORDS
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Record scoring
+# ---------------------------------------------------------------------------
+
+# Rank buckets, lower is better.
+_RANK_EXACT = 0
+_RANK_PREFIX = 1
+_RANK_TEXT = 2
+_RANK_METADATA = 3
+_RANK_CONCEPT = 4
+
+_WORD_RE = re.compile(r"[a-z0-9\u0600-\u06FF]+")
+
+
+def _score_record(
+    query_norm: str,
+    query_terms: list,
+    query_concepts: set,
+    primary_text: str,
+    secondary_text: str,
+    kind_tokens: set,
+):
+    """Return a rank for one record, or None when it is unrelated.
+
+    ``primary_text`` is the searchable name/title; ``secondary_text`` holds
+    description/keywords/ancestor-path text; ``kind_tokens`` are the record's
+    own type/node keywords (e.g. summaries, mcq, video).
     """
-    Escape LIKE wildcards so user input is treated as text.
-    """
-    value = value.replace("\\", "\\\\")
-    value = value.replace("%", "\\%")
-    value = value.replace("_", "\\_")
-    return value
+    primary_norm = normalize_text(primary_text)
+    secondary_norm = normalize_text(secondary_text)
+
+    # 1. Direct textual match on the primary name/title.
+    if primary_norm and primary_norm == query_norm:
+        return _RANK_EXACT
+
+    if primary_norm and query_norm and primary_norm.startswith(query_norm):
+        return _RANK_PREFIX
+
+    if primary_norm and query_norm and query_norm in primary_norm:
+        return _RANK_TEXT
+
+    # 2. All meaningful query tokens present in the primary title.
+    if query_terms and all(term in primary_norm for term in query_terms):
+        return _RANK_PREFIX
+
+    # 3. Metadata: description/keywords/path.
+    if query_norm and query_norm in secondary_norm:
+        return _RANK_METADATA
+
+    if query_terms and any(term in secondary_norm for term in query_terms):
+        return _RANK_METADATA
+
+    # 4. Intent/concept overlap (abbreviations & synonyms).
+    record_text = f"{primary_norm} {secondary_norm}"
+
+    if query_concepts and query_concepts & _lookup_concepts(record_text):
+        return _RANK_CONCEPT
+
+    if query_concepts and query_concepts & kind_tokens:
+        return _RANK_CONCEPT
+
+    # 5. Partial-token overlap: at least one reasonably specific token
+    #    appears as a whole word in the record text. Keeps recall sane
+    #    without matching unrelated rows.
+    if query_terms:
+        record_words = set(_WORD_RE.findall(record_text))
+        if any(term in record_words for term in query_terms):
+            return _RANK_CONCEPT
+
+    return None
 
 
-async def _build_folder_path(db: aiosqlite.Connection, folder_id: int) -> str:
-    """
-    Build a human-readable folder path.
-
-    Root is represented internally by NULL parent_id.
-    Cycle protection is included so corrupted data cannot loop forever.
-    """
-    parts = []
-    current = folder_id
-    visited = set()
-
-    while current is not None:
-        if current in visited:
-            parts.append("[CYCLE]")
-            break
-
-        visited.add(current)
-
-        async with db.execute(
-            "SELECT parent_id, name FROM folders WHERE id = ?",
-            (current,),
-        ) as cur:
-            row = await cur.fetchone()
-
-        if not row:
-            break
-
-        parent_id, name = row
-        parts.append(name)
-        current = parent_id
-
-    parts.reverse()
-    return "الرئيسية 🏠" + ((" ⬅️ " + " ⬅️ ".join(parts)) if parts else "")
-
-
-async def _folder_content_count(
-    db: aiosqlite.Connection,
-    folder_id: int,
-) -> int:
+async def _fetch_records(db: aiosqlite.Connection):
     async with db.execute(
-        "SELECT COUNT(*) FROM content WHERE folder_id = ?",
-        (folder_id,),
+        "SELECT id, parent_id, name, node_type, description, keywords "
+        "FROM folders ORDER BY id ASC"
     ) as cur:
-        row = await cur.fetchone()
+        folders = await cur.fetchall()
 
-    return int(row[0] if row else 0)
+    async with db.execute(
+        "SELECT id, folder_id, title, file_type, description, keywords "
+        "FROM content ORDER BY id DESC"
+    ) as cur:
+        contents = await cur.fetchall()
+
+    return folders, contents
 
 
 async def search_library(
     keyword: str,
     limit: int = 15,
-) -> list[dict[str, Any]]:
-    """
-    Search Engine v1.
+) -> list:
+    """Intent-aware search over registered folders and resources.
 
     Search scope:
-      1. Folder names
-      2. Content titles
+      1. Folder/subject/block names
+      2. Resource titles
+      3. Registered descriptions/keywords
+      4. Abbreviation/synonym concepts (CBC -> Complete Blood Count)
 
-    Ranking:
-      0 = exact
-      1 = prefix
-      2 = partial
+    Ranking: exact -> prefix -> text -> metadata -> concept.
 
-    Result types:
-      FOLDER
-      CONTENT
-      EMPTY_FOLDER
-
-    The database remains the source of truth.
+    Result types: FOLDER, EMPTY_FOLDER, CONTENT.
     """
 
     query = normalize_text(keyword)
@@ -133,98 +360,115 @@ async def search_library(
     if not query:
         return []
 
+    query_terms = _query_terms(query)
+    query_concepts = _lookup_concepts(keyword)
+
+    if not query_terms and not query_concepts:
+        return []
+
     limit = max(1, min(int(limit), 50))
-    escaped = _like_pattern(query)
 
     db = await aiosqlite.connect(DB_NAME)
 
     try:
-        # Fetch all candidate folders/content records. The dataset is
-        # intentionally small at this stage, and normalization is performed
-        # in Python so Arabic matching is reliable without changing stored data.
-        async with db.execute(
-            """
-            SELECT
-                f.id,
-                f.parent_id,
-                f.name,
-                f.node_type,
-                COUNT(c.id) AS content_count
-            FROM folders f
-            LEFT JOIN content c ON c.folder_id = f.id
-            GROUP BY f.id
-            ORDER BY f.id ASC
-            """
-        ) as cur:
-            folders = await cur.fetchall()
+        folders, contents = await _fetch_records(db)
 
-        async with db.execute(
-            """
-            SELECT
-                c.id,
-                c.folder_id,
-                c.title,
-                c.file_type,
-                (
-                    SELECT COUNT(*)
-                    FROM content fc
-                    WHERE fc.folder_id = c.folder_id
-                ) AS folder_content_count
-            FROM content c
-            ORDER BY c.id DESC
-            """
-        ) as cur:
-            contents = await cur.fetchall()
+        # Folder content counts, computed once.
+        content_counts = {}
+        for row in contents:
+            content_counts[row[1]] = content_counts.get(row[1], 0) + 1
 
-        results: list[dict[str, Any]] = []
+        # Ancestor path text per folder, resolved once (no N+1 queries).
+        folder_by_id = {row[0]: row for row in folders}
+        path_cache = {}
 
-        # Folder results.
-        for folder_id, parent_id, name, node_type, content_count in folders:
-            normalized_name = normalize_text(name)
+        def folder_path(folder_id: int) -> str:
+            if folder_id in path_cache:
+                return path_cache[folder_id]
 
-            if normalized_name == query:
-                rank = 0
-            elif normalized_name.startswith(query):
-                rank = 1
-            elif query in normalized_name:
-                rank = 2
-            else:
+            chain = []
+            visited = set()
+            current = folder_id
+
+            while current and current not in visited:
+                visited.add(current)
+                row = folder_by_id.get(current)
+                if not row:
+                    break
+                chain.append(row[2])
+                current = row[1]
+
+            chain.append("الرئيسية 🏠")
+            chain.reverse()
+            path_cache[folder_id] = " ⬅️ ".join(chain)
+            return path_cache[folder_id]
+
+        results = []
+
+        # ---- Folders -----------------------------------------------------
+        for folder_id, parent_id, name, node_type, description, keywords in folders:
+            ancestor_text = folder_path(folder_id)
+            secondary = " ".join(
+                part for part in (description, keywords, ancestor_text) if part
+            )
+            kind_tokens = {node_type} if node_type else set()
+
+            rank = _score_record(
+                query,
+                query_terms,
+                query_concepts,
+                name,
+                secondary,
+                kind_tokens,
+            )
+
+            if rank is None:
                 continue
 
-            path = await _build_folder_path(db, folder_id)
-
-            result_type = "FOLDER"
-            if int(content_count) == 0:
-                result_type = "EMPTY_FOLDER"
+            content_count = content_counts.get(folder_id, 0)
 
             results.append({
-                "type": result_type,
-                "result_type": result_type,
+                "type": "FOLDER",
+                "result_type": "FOLDER" if content_count else "EMPTY_FOLDER",
                 "id": folder_id,
                 "folder_id": folder_id,
                 "title": name,
                 "name": name,
-                "path": path,
-                "content_count": int(content_count),
+                "path": ancestor_text,
+                "content_count": content_count,
                 "node_type": node_type,
                 "rank": rank,
                 "match_field": "folder_name",
             })
 
-        # Content results.
-        for content_id, folder_id, title, file_type, folder_content_count in contents:
-            normalized_title = normalize_text(title)
+        # ---- Content -----------------------------------------------------
+        for content_id, folder_id, title, file_type, description, keywords in contents:
+            folder_row = folder_by_id.get(folder_id)
+            folder_name = folder_row[2] if folder_row else ""
 
-            if normalized_title == query:
-                rank = 0
-            elif normalized_title.startswith(query):
-                rank = 1
-            elif query in normalized_title:
-                rank = 2
-            else:
+            secondary = " ".join(
+                part
+                for part in (
+                    description,
+                    keywords,
+                    folder_name,
+                    folder_path(folder_id),
+                )
+                if part
+            )
+            kind_tokens = {file_type} if file_type else set()
+
+            rank = _score_record(
+                query,
+                query_terms,
+                query_concepts,
+                title,
+                secondary,
+                kind_tokens,
+            )
+
+            if rank is None:
                 continue
-
-            path = await _build_folder_path(db, folder_id)
 
             results.append({
                 "type": "CONTENT",
@@ -234,15 +478,14 @@ async def search_library(
                 "folder_id": folder_id,
                 "title": title,
                 "name": title,
-                "path": path,
-                "content_count": int(folder_content_count),
+                "path": folder_path(folder_id),
+                "content_count": content_counts.get(folder_id, 0),
                 "file_type": file_type,
                 "rank": rank,
                 "match_field": "content_title",
             })
 
-        # Deterministic ordering:
-        # exact → prefix → partial → folders before content → title → id.
+        # Deterministic ordering: rank -> folders before content -> title -> id.
         results.sort(
             key=lambda item: (
                 item["rank"],
@@ -258,7 +501,7 @@ async def search_library(
         await db.close()
 
 
-async def search_library_summary(keyword: str, limit: int = 15) -> dict[str, Any]:
+async def search_library_summary(keyword: str, limit: int = 15) -> dict:
     """
     Stable API for Telegram/AI layers.
     """
