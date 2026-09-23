@@ -158,6 +158,8 @@ async def init_db():
         await _migrate_v2(db)
         await _migrate_v3(db)
         await _migrate_v4(db)
+        await _migrate_v5(db)
+        await _migrate_v6(db)
 
         # ------------------------------------------------------------
         # Performance / integrity indexes
@@ -317,6 +319,129 @@ async def _migrate_v4(db):
         """)
     except Exception:
         pass
+
+
+async def _migrate_v5(db):
+    """RBAC: extend the existing `admins` identity with role + permissions.
+
+    Additive columns only; existing rows default to role='admin' with an empty
+    permissions string, which resolves to full access (no behaviour change).
+    """
+    try:
+        await db.execute("ALTER TABLE admins ADD COLUMN role TEXT DEFAULT 'admin'")
+        logger.info("Migration v5: added role to admins")
+    except Exception:
+        pass
+
+    try:
+        await db.execute("ALTER TABLE admins ADD COLUMN permissions TEXT DEFAULT ''")
+        logger.info("Migration v5: added permissions to admins")
+    except Exception:
+        pass
+
+
+async def _migrate_v6(db):
+    """Audit log: isolated from every other subsystem.
+
+    Creates the `audit_log` table and its indexes if missing. Safe to re-run.
+    """
+    try:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_id INTEGER,
+                actor_role TEXT,
+                action TEXT NOT NULL,
+                target_type TEXT,
+                target_id TEXT,
+                details TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        logger.info("Migration v6: ensured audit_log table")
+    except Exception:
+        pass
+
+    for index_name, column in (
+        ("idx_audit_actor", "actor_id"),
+        ("idx_audit_action", "action"),
+        ("idx_audit_created", "created_at"),
+    ):
+        try:
+            await db.execute(
+                f"CREATE INDEX IF NOT EXISTS {index_name} ON audit_log({column})"
+            )
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------
+# RBAC: roles and per-capability permissions
+# ------------------------------------------------------------
+ROLES = ("owner", "admin", "reviewer")
+
+PERMISSION_KEYS = (
+    "can_folders",
+    "can_content",
+    "can_contributions",
+    "can_messages",
+    "can_ai",
+    "can_admins",
+)
+
+PERMISSION_LABELS = {
+    "can_folders": "📁 إدارة المجلدات",
+    "can_content": "📄 إدارة المحتوى",
+    "can_contributions": "📥 مراجعة المساهمات",
+    "can_messages": "📬 رسائل الطلاب",
+    "can_ai": "🤖 الذكاء الاصطناعي",
+    "can_admins": "👥 إدارة المشرفين",
+}
+
+ROLE_LABELS = {
+    "owner": "👑 المالك",
+    "admin": "🛡 مشرف",
+    "reviewer": "🔎 مراجع",
+}
+
+# Stored in `admins.permissions` to mean "explicitly granted nothing". An empty
+# column instead means "legacy row, keep full access".
+PERMISSIONS_NONE = "none"
+
+
+def _default_permissions() -> dict:
+    return {key: True for key in PERMISSION_KEYS}
+
+
+def permissions_to_string(permissions) -> str:
+    """Serialise a permission mapping to the stored comma-separated form.
+
+    A revoked-everything admin serialises to the explicit `PERMISSIONS_NONE`
+    sentinel rather than an empty string, so it cannot be confused with a
+    pre-migration row (empty = full access).
+    """
+    if not permissions:
+        return ""
+    if isinstance(permissions, str):
+        return permissions
+    granted = [k for k in PERMISSION_KEYS if permissions.get(k)]
+    if not granted:
+        return PERMISSIONS_NONE
+    return ",".join(granted)
+
+
+def permissions_from_string(raw: str) -> dict:
+    """Parse stored permissions.
+
+    Empty/None means 'all granted' (pre-migration admins keep full access).
+    The `PERMISSIONS_NONE` sentinel means 'explicitly granted nothing'.
+    """
+    if raw is None or not str(raw).strip():
+        return _default_permissions()
+    if str(raw).strip() == PERMISSIONS_NONE:
+        return {key: False for key in PERMISSION_KEYS}
+    granted = {part.strip() for part in str(raw).split(",") if part.strip()}
+    return {key: (key in granted) for key in PERMISSION_KEYS}
 
 
 # Message categories and lifecycle states.
@@ -1574,7 +1699,208 @@ async def ensure_configured_admin(telegram_id: int, username: str = None) -> boo
     if not telegram_id or int(telegram_id) <= 0:
         return False
 
-    return await add_sub_admin(int(telegram_id), username)
+    granted = await add_sub_admin(int(telegram_id), username)
+    if not granted:
+        return False
+
+    # The configured ID is the single owner identity: pin role + full perms.
+    # Any other row left holding 'owner' from a previous ADMIN_ID is demoted
+    # so exactly one owner can exist at a time.
+    try:
+        await db_demote_stale_owners(int(telegram_id))
+        await set_admin_role(int(telegram_id), "owner")
+        await update_admin_permissions(int(telegram_id), _default_permissions())
+    except Exception:
+        pass
+    return True
+
+
+async def db_demote_stale_owners(owner_id: int) -> None:
+    """Demote every admin holding 'owner' except `owner_id` to 'admin'."""
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE admins SET role = 'admin' "
+            "WHERE role = 'owner' AND telegram_id != ?",
+            (owner_id,),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+# ------------------------------------------------------------
+# RBAC helpers (extend the existing `admins` identity)
+# ------------------------------------------------------------
+async def get_admin_record(user_id):
+    """Return the admin row as a dict, or None when the user is not an admin."""
+    try:
+        db = await get_db()
+        try:
+            async with db.execute(
+                "SELECT telegram_id, username, added_at, role, permissions "
+                "FROM admins WHERE telegram_id = ?",
+                (user_id,),
+            ) as cur:
+                row = await cur.fetchone()
+        finally:
+            await db.close()
+    except Exception:
+        return None
+
+    if not row:
+        return None
+    return {
+        "telegram_id": row[0],
+        "username": row[1],
+        "added_at": row[2],
+        "role": row[3] or "admin",
+        "permissions_raw": row[4],
+        "permissions": permissions_from_string(row[4]),
+    }
+
+
+async def get_admin_permissions(user_id) -> dict:
+    """Resolved permission map for a user; all-False when not an admin."""
+    record = await get_admin_record(user_id)
+    if not record:
+        return {key: False for key in PERMISSION_KEYS}
+    if record["role"] == "owner":
+        return _default_permissions()
+    return record["permissions"]
+
+
+async def set_admin_role(user_id, role: str) -> bool:
+    """Set an admin's role. Unknown roles are rejected (no write)."""
+    if role not in ROLES:
+        return False
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "UPDATE admins SET role = ? WHERE telegram_id = ?", (role, user_id)
+        )
+        await db.commit()
+        return cur.rowcount > 0
+    except Exception:
+        return False
+    finally:
+        await db.close()
+
+
+async def update_admin_permissions(user_id, permissions: dict) -> bool:
+    """Persist a permission map. Keys outside PERMISSION_KEYS are ignored."""
+    if not isinstance(permissions, dict):
+        return False
+    cleaned = {key: bool(permissions.get(key)) for key in PERMISSION_KEYS}
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "UPDATE admins SET permissions = ? WHERE telegram_id = ?",
+            (permissions_to_string(cleaned), user_id),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+    except Exception:
+        return False
+    finally:
+        await db.close()
+
+
+async def is_owner(user_id) -> bool:
+    """True only for the configured owner ID that holds the owner role.
+
+    Falls back to the stored role so an owner set by another path is honoured;
+    a missing ADMIN_ID (id 0) can never be an owner.
+    """
+    if not user_id or int(user_id) <= 0:
+        return False
+    record = await get_admin_record(user_id)
+    if not record:
+        return False
+    return record["role"] == "owner"
+
+
+async def user_has_permission(user_id, permission: str) -> bool:
+    """Capability check. Owner: always. Non-admin: never.
+
+    An admin whose stored permissions are empty (pre-migration rows) keeps
+    full access, so enabling RBAC does not revoke anything that already worked.
+    """
+    if permission not in PERMISSION_KEYS:
+        return False
+    record = await get_admin_record(user_id)
+    if not record:
+        return False
+    if record["role"] == "owner":
+        return True
+    return bool(record["permissions"].get(permission))
+
+
+# ------------------------------------------------------------
+# Audit log access (isolated: touches only `audit_log`)
+# ------------------------------------------------------------
+async def add_audit_entry(actor_id, actor_role, action, target_type=None,
+                          target_id=None, details=None) -> bool:
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO audit_log "
+            "(actor_id, actor_role, action, target_type, target_id, details) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (actor_id, actor_role, action, target_type,
+             None if target_id is None else str(target_id), details),
+        )
+        await db.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        await db.close()
+
+
+async def get_audit_entries(limit: int = 50, action: str = None, actor_id=None):
+    """Most recent audit rows first, optionally filtered."""
+    try:
+        limit = max(1, min(int(limit), 500))
+    except (TypeError, ValueError):
+        limit = 50
+
+    clauses, params = [], []
+    if action:
+        clauses.append("action = ?")
+        params.append(action)
+    if actor_id is not None:
+        clauses.append("actor_id = ?")
+        params.append(actor_id)
+
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    sql = (
+        "SELECT id, actor_id, actor_role, action, target_type, target_id, "
+        f"details, created_at FROM audit_log{where} "
+        "ORDER BY id DESC LIMIT ?"
+    )
+    params.append(limit)
+
+    db = await get_db()
+    try:
+        async with db.execute(sql, tuple(params)) as cur:
+            return await cur.fetchall()
+    except Exception:
+        return []
+    finally:
+        await db.close()
+
+
+async def get_audit_count() -> int:
+    db = await get_db()
+    try:
+        async with db.execute("SELECT COUNT(*) FROM audit_log") as cur:
+            row = await cur.fetchone()
+        return row[0] if row else 0
+    except Exception:
+        return 0
+    finally:
+        await db.close()
 
 
 async def add_sub_admin_by_any(identifier: str) -> tuple[bool, str]:

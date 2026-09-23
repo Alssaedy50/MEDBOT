@@ -51,6 +51,8 @@ from telegram.ext import (
 
 import database
 import messaging
+import audit
+import admin_management
 from ai import (
     generate_medical_ai_response,
     generate_medbot_assistant_response,
@@ -180,6 +182,43 @@ def home_keyboard():
     )
 
 
+async def home_keyboard_for(user_id):
+    """Home keyboard, adding an owner-only audit shortcut.
+
+    The audit viewer is reachable from the Admin Panel too; this surfaces it
+    directly for the configured owner without changing the base keyboard.
+    """
+    try:
+        is_owner = await database.is_owner(user_id)
+    except Exception:
+        is_owner = False
+
+    if not is_owner:
+        return home_keyboard()
+
+    return InlineKeyboardMarkup(
+        [
+            [btn("📚 MEDBOT Resources", "library:0")],
+            [
+                btn("🤖 MEDBOT Assistant", "assistant"),
+                btn("📤 Student Contributions", "contribute"),
+            ],
+            [
+                btn("📄 مساهماتي", "my_contributions"),
+                btn("📊 My Account", "account"),
+            ],
+            [
+                btn("📬 Contact Admin", "contact"),
+                btn("ℹ️ About MEDBOT", "about"),
+            ],
+            [
+                btn("🛠 Admin Panel", "admin"),
+                btn("📜 سجل التدقيق", "audit_log"),
+            ],
+        ]
+    )
+
+
 async def show_home(update: Update):
     user = update.effective_user
 
@@ -207,13 +246,13 @@ async def show_home(update: Update):
         await edit_safe(
             update.callback_query,
             text,
-            home_keyboard(),
+            await home_keyboard_for(user.id),
         )
     else:
         await send_safe_message(
             update,
             text,
-            home_keyboard(),
+            await home_keyboard_for(user.id),
         )
 
 
@@ -1115,6 +1154,43 @@ async def _admin_check(query):
         return False
 
 
+async def _require_permission(query, permission) -> bool:
+    """Capability gate for a specific admin surface.
+
+    Sends the standard denial screen and returns False when the caller lacks
+    `permission`. Existing admins default to full permissions, so this is a
+    no-op for pre-RBAC admins.
+    """
+    try:
+        allowed = await database.user_has_permission(query.from_user.id, permission)
+    except Exception:
+        allowed = False
+
+    if allowed:
+        return True
+
+    await edit_safe(
+        query,
+        "🔒 غير مصرح.",
+        InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+    )
+    return False
+
+
+async def _audit(query, action, target_type=None, target_id=None, details=None):
+    """Best-effort audit write. Never raises into the calling handler."""
+    try:
+        await audit.log_action(
+            query.from_user.id,
+            action,
+            target_type=target_type,
+            target_id=target_id,
+            details=details,
+        )
+    except Exception:
+        pass
+
+
 async def show_admin_folder(query, folder_id: int):
     """Show management actions for one existing folder."""
     if not await _admin_check(query):
@@ -1123,6 +1199,10 @@ async def show_admin_folder(query, folder_id: int):
             "🔒 غير مصرح.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
+        return
+
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_folders"):
         return
 
     try:
@@ -1196,6 +1276,10 @@ async def show_admin_folders(query):
         )
         return
 
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_folders"):
+        return
+
     try:
         folders = await database.get_folders(0)
     except Exception:
@@ -1244,6 +1328,10 @@ async def show_admin_folder_parents(query, parent_id=0):
             "🔒 غير مصرح.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
+        return
+
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_folders"):
         return
 
     try:
@@ -1300,6 +1388,10 @@ async def start_admin_folder_create(query, context):
             "🔒 غير مصرح.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
+        return
+
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_folders"):
         return
 
     context.user_data["admin_folder_create"] = True
@@ -1420,6 +1512,11 @@ async def request_admin_folder_rename(update, context):
     context.user_data.pop("admin_folder_rename", None)
     context.user_data.pop("admin_folder_rename_id", None)
 
+    await audit.log_action(
+        update.effective_user.id, "folder_rename", target_type="folder",
+        target_id=folder_id, details=f"name={name}",
+    )
+
     await update.message.reply_text(
         "✅ تم تغيير اسم القسم بنجاح.\n\n"
         f"📁 الاسم الجديد: <b>{escape(name)}</b>",
@@ -1506,6 +1603,10 @@ async def select_admin_folder_parent(query, context, parent_id):
         )
         return
 
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_folders"):
+        return
+
     context.user_data["admin_folder_create"] = True
     context.user_data["admin_folder_parent"] = int(parent_id)
     context.user_data.pop("admin_folder_name", None)
@@ -1532,6 +1633,10 @@ async def show_admin_folder_types(query, context):
             "🔒 غير مصرح.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
+        return
+
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_folders"):
         return
 
     name = context.user_data.get("admin_folder_name")
@@ -1583,6 +1688,10 @@ async def admin_folder_type(query, context, node_type):
         )
         return
 
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_folders"):
+        return
+
     name = context.user_data.get("admin_folder_name")
     parent_id = context.user_data.get("admin_folder_parent")
 
@@ -1630,6 +1739,10 @@ async def finish_admin_folder_create(query, context, accepts):
             "🔒 غير مصرح.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
+        return
+
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_folders"):
         return
 
     name = context.user_data.get("admin_folder_name")
@@ -1682,6 +1795,9 @@ async def finish_admin_folder_create(query, context, accepts):
             ),
         )
         return
+
+    await _audit(query, "folder_create", "folder",
+                 details=f"name={name}, type={node_type}, parent={parent_id}")
 
     await edit_safe(
         query,
@@ -1799,6 +1915,10 @@ async def start_admin_upload(query, context, folder_id):
             "🔒 غير مصرح.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
+        return
+
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_content"):
         return
 
     try:
@@ -1961,6 +2081,10 @@ async def admin_upload_confirm(query, context):
         )
         return
 
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_content"):
+        return
+
     preview = context.user_data.get("admin_upload_preview")
 
     if not isinstance(preview, dict):
@@ -1982,6 +2106,10 @@ async def admin_upload_custom_title(query, context, custom_title=None):
             "🔒 غير مصرح.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
+        return
+
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_content"):
         return
 
     preview = context.user_data.get("admin_upload_preview")
@@ -2096,6 +2224,9 @@ async def _register_admin_upload(query, context, preview):
         )
         return
 
+    await _audit(query, "content_upload", "content", content_id,
+                 details=f"title={title}, folder={folder_id}")
+
     await edit_safe(
         query,
         "✅ <b>تم تسجيل المورد بنجاح.</b>\n\n"
@@ -2123,6 +2254,10 @@ async def show_admin_file(query, content_id):
             "🔒 غير مصرح.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
+        return
+
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_content"):
         return
 
     try:
@@ -2185,6 +2320,10 @@ async def admin_file_delete(query, context, content_id):
         )
         return
 
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_content"):
+        return
+
     try:
         record = await database.get_file_record(content_id)
     except Exception:
@@ -2214,6 +2353,8 @@ async def admin_file_delete(query, context, content_id):
         )
         return
 
+    await _audit(query, "content_delete", "content", content_id)
+
     await edit_safe(
         query,
         "🗑 تم حذف تسجيل المورد بنجاح.",
@@ -2235,6 +2376,10 @@ async def admin_folder_move_menu(query, context):
             "🔒 غير مصرح.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
+        return
+
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_folders"):
         return
 
     try:
@@ -2312,6 +2457,10 @@ async def admin_folder_move_to(query, context, folder_id, target_id):
         )
         return
 
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_folders"):
+        return
+
     try:
         ok, message = await database.move_folder(
             int(folder_id),
@@ -2337,6 +2486,9 @@ async def admin_folder_move_to(query, context, folder_id, target_id):
         )
         return
 
+    await _audit(query, "folder_move", "folder", folder_id,
+                 details=f"target={target_id}")
+
     await edit_safe(
         query,
         f"✅ تم نقل القسم بنجاح.\n\n{message}",
@@ -2357,6 +2509,10 @@ async def admin_folder_delete(query, context, folder_id):
             "🔒 غير مصرح.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
+        return
+
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_folders"):
         return
 
     try:
@@ -2402,6 +2558,8 @@ async def admin_folder_delete(query, context, folder_id):
         back_rows.append([btn("🗂 إدارة الأقسام", "admin_folders")])
     back_rows.append([btn("🏠 الرئيسية", "home")])
 
+    await _audit(query, "folder_delete", "folder", folder_id)
+
     await edit_safe(
         query,
         "🗑 تم حذف القسم بنجاح.",
@@ -2416,6 +2574,10 @@ async def admin_file_move_menu(query, context):
             "🔒 غير مصرح.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
+        return
+
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_content"):
         return
 
     try:
@@ -2488,6 +2650,10 @@ async def admin_file_move_to(query, context, content_id, target_id):
         )
         return
 
+    # Capability gate (RBAC).
+    if not await _require_permission(query, "can_content"):
+        return
+
     try:
         ok, message = await database.move_content(
             int(content_id),
@@ -2509,6 +2675,9 @@ async def admin_file_move_to(query, context, content_id, target_id):
             ),
         )
         return
+
+    await _audit(query, "content_move", "content", content_id,
+                 details=f"target={target_id}")
 
     await edit_safe(
         query,
@@ -2636,6 +2805,11 @@ async def handle_pending_title_input(update, context):
         )
         return True
 
+    await audit.log_action(
+        update.effective_user.id, "content_rename", target_type="content",
+        target_id=content_id, details=f"title={text}",
+    )
+
     await update.message.reply_text(
         "✅ تم تغيير عنوان المورد بنجاح.\n\n"
         f"📄 العنوان الجديد: <b>{escape(text)}</b>",
@@ -2681,22 +2855,43 @@ async def show_admin(query):
     except Exception:
         open_messages = 0
 
+    rows = [
+        [btn("🗂 إدارة الأقسام والفروع", "admin_folders")],
+        [btn("📥 مراجعة المساهمات", "admin_pending")],
+        [btn("📬 رسائل الطلاب", "admin_messages")],
+        [btn("🤖 AI Registry", "admin_ai")],
+        [btn("📊 Runtime", "admin_runtime")],
+    ]
+
+    try:
+        can_view_audit = await database.is_owner(user_id) or await database.user_has_permission(
+            user_id, "can_admins"
+        )
+    except Exception:
+        can_view_audit = False
+
+    if can_view_audit:
+        rows.append([btn("📜 سجل التدقيق", "audit_log")])
+
+    try:
+        can_manage_admins = await database.is_owner(user_id) or await database.user_has_permission(
+            user_id, "can_admins"
+        )
+    except Exception:
+        can_manage_admins = False
+
+    if can_manage_admins:
+        rows.append([btn("👥 إدارة المشرفين", "amg_list")])
+
+    rows.append([btn("🏠 الرئيسية", "home")])
+
     await edit_safe(
         query,
         "🛠 *MEDBOT Admin Panel*\n\n"
         f"📤 المساهمات المعلقة: {pending_count}\n"
         f"📬 رسائل الطلاب غير المغلقة: {open_messages}\n\n"
         "اختر الإجراء:",
-        InlineKeyboardMarkup(
-            [
-                [btn("🗂 إدارة الأقسام والفروع", "admin_folders")],
-                [btn("📥 مراجعة المساهمات", "admin_pending")],
-                [btn("📬 رسائل الطلاب", "admin_messages")],
-                [btn("🤖 AI Registry", "admin_ai")],
-                [btn("📊 Runtime", "admin_runtime")],
-                [btn("🏠 الرئيسية", "home")],
-            ]
-        ),
+        InlineKeyboardMarkup(rows),
     )
 
 
@@ -2712,6 +2907,9 @@ async def show_pending(query, context):
             "🔒 غير مصرح.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
+        return
+
+    if not await _require_permission(query, "can_contributions"):
         return
 
     try:
@@ -2973,6 +3171,11 @@ async def process_review_text(update, context):
                 f"السبب:\n{text}"
             ),
         )
+
+        await audit.log_action(
+            reviewer_id, "contribution_reject", target_type="contribution",
+            target_id=contribution_id, details=f"reason={text}",
+        )
         return True
 
     # kind == "revise"
@@ -3012,6 +3215,11 @@ async def process_review_text(update, context):
             "يمكنك إعادة إرسال المساهمة بعد التعديل من "
             "«📄 مساهماتي»."
         ),
+    )
+
+    await audit.log_action(
+        reviewer_id, "contribution_revise", target_type="contribution",
+        target_id=contribution_id, details=f"note={text}",
     )
     return True
 
@@ -3079,7 +3287,14 @@ async def process_approval(query, contribution_id, approve):
     except Exception:
         is_admin = False
 
-    if not is_admin:
+    try:
+        can_review = await database.user_has_permission(
+            query.from_user.id, "can_contributions"
+        )
+    except Exception:
+        can_review = False
+
+    if not is_admin or not can_review:
         await edit_safe(
             query,
             "🔒 غير مصرح لك بمراجعة المساهمات.",
@@ -3134,6 +3349,13 @@ async def process_approval(query, contribution_id, approve):
             ),
         )
 
+        await _audit(
+            query,
+            "contribution_approve" if approve else "contribution_reject",
+            "contribution",
+            contribution_id,
+        )
+
         # Only approval carries the contributor id at index 4.
         if approve and len(result) >= 5:
             await _notify_contributor(
@@ -3172,6 +3394,9 @@ async def show_ai_registry(query):
             "🔒 غير مصرح.",
             InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
         )
+        return
+
+    if not await _require_permission(query, "can_ai"):
         return
 
     try:
@@ -3481,6 +3706,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # Capability gate (RBAC).
+        if not await _require_permission(query, "can_content"):
+            return
+
         record = await database.get_file_record(content_id)
 
         if not record:
@@ -3525,6 +3754,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🔒 غير مصرح.",
                 InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
             )
+            return
+
+        # Capability gate (RBAC).
+        if not await _require_permission(query, "can_content"):
             return
 
         record = await database.get_file_record(content_id)
@@ -3586,6 +3819,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # Capability gate (RBAC).
+        if not await _require_permission(query, "can_content"):
+            return
+
         record = await database.get_file_record(content_id)
 
         if not record:
@@ -3611,6 +3848,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ),
             )
             return
+
+        await _audit(query, "content_retype", "content", content_id,
+                     details=f"type={node_type}")
 
         await show_admin_file(query, content_id)
         return
@@ -3766,6 +4006,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # Capability gate (RBAC).
+        if not await _require_permission(query, "can_folders"):
+            return
+
         folder = await database.get_folder(folder_id)
 
         if not folder:
@@ -3827,6 +4071,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # Capability gate (RBAC).
+        if not await _require_permission(query, "can_folders"):
+            return
+
         folder = await database.get_folder(folder_id)
 
         if not folder:
@@ -3852,6 +4100,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ),
             )
             return
+
+        await _audit(query, "folder_retype", "folder", folder_id,
+                     details=f"type={node_type}")
 
         await show_admin_folder(query, folder_id)
         return
@@ -3889,6 +4140,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [btn("🏠 الرئيسية", "home")]
                 ]),
             )
+            return
+
+        # Capability gate (RBAC).
+        if not await _require_permission(query, "can_folders"):
             return
 
         folder = await database.get_folder(folder_id)
@@ -3942,6 +4197,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # Capability gate (RBAC).
+        if not await _require_permission(query, "can_folders"):
+            return
+
         folder = await database.get_folder(folder_id)
 
         if not folder:
@@ -3972,6 +4231,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]),
             )
             return
+
+        await _audit(query, "folder_toggle", "folder", folder_id,
+                     details=f"accepts={new_value}")
 
         await show_admin_folder(query, folder_id)
         return
@@ -4225,6 +4487,10 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await messaging.handle_admin_reply_text(update, context):
         return
 
+    # Owner adding a sub-admin by ID/@username.
+    if await admin_management.handle_add_admin_text(update, context):
+        return
+
     # Custom title input (upload / resource rename) has the highest priority.
     if context.user_data.get("admin_upload_waiting_title") or (
         context.user_data.get("admin_file_rename")
@@ -4414,12 +4680,26 @@ async def post_init(application: Application):
     admin_id = configured_admin_id()
 
     if admin_id:
+        try:
+            existed = await database.is_user_admin(admin_id)
+        except Exception:
+            existed = True
+
         granted = await database.ensure_configured_admin(admin_id)
 
         if granted:
             logger.info(
                 "Configured ADMIN_ID=%s ensured as MEDBOT admin", admin_id
             )
+            if not existed:
+                # Audit only the first promotion, not every restart.
+                await audit.log_action(
+                    admin_id,
+                    "owner_bootstrap",
+                    target_type="admin",
+                    target_id=admin_id,
+                    details="configured ADMIN_ID",
+                )
     else:
         logger.warning(
             "ADMIN_ID is not configured. "
@@ -4458,6 +4738,8 @@ def main():
     # Contact Admin messaging (isolated module). Must register before the
     # catch-all inline UI handler so its `msg_*`/`contact` callbacks win.
     messaging.register_messaging_handlers(app)
+    audit.register_audit_handlers(app)
+    admin_management.register_admin_management_handlers(app)
 
     # Inline UI
     app.add_handler(CallbackQueryHandler(callback_router))

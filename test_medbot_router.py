@@ -10,6 +10,9 @@ import unittest
 
 import database
 import main
+import messaging
+import audit
+import admin_management
 from test_medbot_system import _FakeDoc, _FakePhoto, _FakeAudio
 
 
@@ -133,11 +136,53 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             "approve:abc",
             "reject:abc",
             "contrib_folder:abc",
+            # Contact Admin messaging (handled by the messaging module).
+            "msg_open:abc",
+            "msg_reply:abc",
+            "msg_status:abc",
+            "msg_status:",
+            "msg_status:5",
+            "msg_status:5:BOGUS",
+            "msg_status:5:CLOSED:extra",
+            "msg_cat:",
+            "msg_cat:bogus",
+            "msg_open:",
+            "msg_reply:",
+            # RBAC admin management + audit viewer (isolated modules).
+            "amg_view:abc",
+            "amg_perm:1",
+            "amg_perm:abc:can_ai",
+            "amg_role:abc:admin",
+            "amg_remove:abc",
+            "audit_act:",
+            "audit_act:bogus_action",
             "unknown_namespace:1",
         ]
 
         for data in bad:
-            query, _ = await self._route(999, data)
+            # Messaging / audit / admin-management callbacks are dispatched to
+            # their own modules in production (registered before the catch-all
+            # router), so route them through their real handler; everything
+            # else goes through the router.
+            ns = data.split(":", 1)[0]
+            if ns in ("msg_open", "msg_reply", "msg_status", "msg_cat"):
+                query = _FakeQuery(999, data)
+                await messaging.messaging_callback_handler(
+                    _FakeUpdate(query), _FakeContext()
+                )
+            elif ns in ("audit_log", "audit_act"):
+                query = _FakeQuery(999, data)
+                await audit.audit_callback_handler(
+                    _FakeUpdate(query), _FakeContext()
+                )
+            elif ns in ("amg_list", "amg_add", "amg_view", "amg_perm",
+                        "amg_role", "amg_remove"):
+                query = _FakeQuery(999, data)
+                await admin_management.admin_management_callback_handler(
+                    _FakeUpdate(query), _FakeContext()
+                )
+            else:
+                query, _ = await self._route(999, data)
             self.assertTrue(query.answered, data)
 
     # ---------------- Authorization ----------------
@@ -177,6 +222,18 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 ("غير مصرح" in text) or ("مخصصة للمشرفين" in text),
                 f"{data}: {text}",
             )
+
+    async def test_unauthorized_new_surfaces_blocked(self):
+        # The isolated modules must reject a non-admin on every entry point.
+        for handler, data in (
+            (admin_management.admin_management_callback_handler, "amg_list"),
+            (admin_management.admin_management_callback_handler, "amg_add"),
+            (audit.audit_callback_handler, "audit_log"),
+            (audit.audit_callback_handler, "audit_act:folder_create"),
+        ):
+            query = _FakeQuery(999, data)
+            await handler(_FakeUpdate(query), _FakeContext())
+            self.assertIn("غير مصرح", query.last_text or "", data)
 
     async def test_unauthorized_cannot_delete_resource(self):
         query, _ = await self._route(999, f"admin_file_delete:{self.content_id}")
