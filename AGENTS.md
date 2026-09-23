@@ -42,12 +42,33 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
   for IDs `<= 0`; the first user is never auto-promoted. `/whoami` grants
   nothing and only reports the caller's ID and admin status.
 
+## RBAC (owner + sub-admin) and Audit Log
+- Roles live in `database.ROLES` (`owner`, `admin`, `reviewer`); capabilities
+  in `database.PERMISSION_KEYS` (`can_folders`, `can_content`,
+  `can_contributions`, `can_messages`, `can_ai`, `can_admins`).
+- Migrations are additive: `_migrate_v5` adds `admins.role`/`admins.permissions`;
+  `_migrate_v6` creates the isolated `audit_log` table. Never rewrite v1..v4.
+- Permission storage: an EMPTY `admins.permissions` column means "legacy row,
+  full access". An explicitly revoked admin is stored as the `PERMISSIONS_NONE`
+  (`none`) sentinel. Never persist an all-False map as an empty string.
+- `user_has_permission()` is the only capability check: owner always passes,
+  non-admin always fails, unknown key fails, legacy/empty grants everything.
+- `audit.log_action()` is best-effort and must never raise into the audited
+  operation. The audit table is independent of messages/contributions/content.
+- Isolated modules: `audit.py` (viewer) and `admin_management.py` (role/permission
+  UI). Register their handlers BEFORE the catch-all `callback_router`, and route
+  their callbacks through their own handlers in tests.
+- `admin_management` uses `database.add_sub_admin_by_any`, which does
+  `INSERT OR REPLACE`; never let it touch the owner (it would reset role/perms).
+
 ## Testing
 - `python -m py_compile` all modules.
 - `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding`
+- `python -m unittest test_medbot_phase2 test_messaging test_rbac_audit`
 - `test_db_patch.py` needs a real `medbot_v2.sqlite3`; it is skipped locally
   when absent.
 - Tests must exercise real code paths against temporary SQLite; no mocks.
+- Root folders are stored with `parent_id IS NULL` (not `0`).
 
 ## Backups
 - Timestamped source backups go under `backups/` (gitignored).
