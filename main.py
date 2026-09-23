@@ -158,6 +158,11 @@ def btn(text, callback):
 
 
 def home_keyboard():
+    """Start keyboard for a regular (non-privileged) user.
+
+    Shows only the student-facing options; the admin entry point is added by
+    `home_for` for admins, so a normal user never sees privileged buttons.
+    """
     return InlineKeyboardMarkup(
         [
             [
@@ -175,48 +180,37 @@ def home_keyboard():
                 btn("📬 Contact Admin", "contact"),
                 btn("ℹ️ About MEDBOT", "about"),
             ],
-            [
-                btn("🛠 Admin Panel", "admin"),
-            ],
         ]
     )
 
 
-async def home_keyboard_for(user_id):
-    """Home keyboard, adding an owner-only audit shortcut.
+def admin_home_keyboard():
+    """Start keyboard with the admin entry point appended for admins."""
+    rows = list(home_keyboard().inline_keyboard)
+    rows.append([btn("🛠 Admin Panel", "admin")])
+    return InlineKeyboardMarkup(rows)
 
-    The audit viewer is reachable from the Admin Panel too; this surfaces it
-    directly for the configured owner without changing the base keyboard.
+
+async def home_for(update):
+    """Role-aware start keyboard for the caller of `update`.
+
+    Regular users get the public keyboard; admins additionally get the Admin
+    Panel, which itself enumerates only the surfaces they are permitted to use.
     """
-    try:
-        is_owner = await database.is_owner(user_id)
-    except Exception:
-        is_owner = False
+    user = getattr(update, "effective_user", None)
+    user_id = getattr(user, "id", None)
 
-    if not is_owner:
+    is_admin = False
+    if user_id is not None:
+        try:
+            is_admin = await database.is_user_admin(user_id)
+        except Exception:
+            is_admin = False
+
+    if not is_admin:
         return home_keyboard()
 
-    return InlineKeyboardMarkup(
-        [
-            [btn("📚 MEDBOT Resources", "library:0")],
-            [
-                btn("🤖 MEDBOT Assistant", "assistant"),
-                btn("📤 Student Contributions", "contribute"),
-            ],
-            [
-                btn("📄 مساهماتي", "my_contributions"),
-                btn("📊 My Account", "account"),
-            ],
-            [
-                btn("📬 Contact Admin", "contact"),
-                btn("ℹ️ About MEDBOT", "about"),
-            ],
-            [
-                btn("🛠 Admin Panel", "admin"),
-                btn("📜 سجل التدقيق", "audit_log"),
-            ],
-        ]
-    )
+    return admin_home_keyboard()
 
 
 async def show_home(update: Update):
@@ -246,13 +240,13 @@ async def show_home(update: Update):
         await edit_safe(
             update.callback_query,
             text,
-            await home_keyboard_for(user.id),
+            await home_for(update),
         )
     else:
         await send_safe_message(
             update,
             text,
-            await home_keyboard_for(user.id),
+            await home_for(update),
         )
 
 
@@ -610,7 +604,7 @@ async def run_search(update: Update, query_text):
         logger.exception("Search failed")
         await update.message.reply_text(
             "⚠️ حدث خطأ أثناء البحث.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return
 
@@ -619,7 +613,7 @@ async def run_search(update: Update, query_text):
             "🔎 *نتيجة البحث*\n\n"
             "المورد المطلوب غير مسجل حالياً في MEDBOT.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return
 
@@ -1073,7 +1067,7 @@ async def contribution_media_handler(
         if not ok:
             await update.message.reply_text(
                 result,
-                reply_markup=home_keyboard(),
+                reply_markup=await home_for(update),
             )
             return True
 
@@ -1085,7 +1079,7 @@ async def contribution_media_handler(
             "الحالة الحالية: `pending`\n\n"
             "ستتم مراجعتها من جديد.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
 
         await notify_admins_new_contribution(
@@ -1109,14 +1103,14 @@ async def contribution_media_handler(
     except database.ContributionValidationError as exc:
         await update.message.reply_text(
             str(exc),
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
     except Exception:
         logger.exception("Contribution failed")
         await update.message.reply_text(
             "⚠️ تعذر تسجيل المساهمة حالياً. لم يتم تأكيد نجاح الإضافة.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
 
@@ -1128,7 +1122,7 @@ async def contribution_media_handler(
         "الحالة الحالية: `pending`\n\n"
         "سيتمكن المشرفون من مراجعتها قبل نشرها في المكتبة.",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=home_keyboard(),
+        reply_markup=await home_for(update),
     )
 
     await notify_admins_new_contribution(
@@ -1432,7 +1426,7 @@ async def request_admin_folder_rename(update, context):
         context.user_data.pop("admin_folder_rename_id", None)
         await update.message.reply_text(
             "🔒 غير مصرح.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
 
@@ -1453,7 +1447,7 @@ async def request_admin_folder_rename(update, context):
         else:
             await update.message.reply_text(
                 "❌ تم إلغاء إعادة تسمية القسم.",
-                reply_markup=home_keyboard(),
+                reply_markup=await home_for(update),
             )
         return True
 
@@ -1478,7 +1472,7 @@ async def request_admin_folder_rename(update, context):
         context.user_data.pop("admin_folder_rename_id", None)
         await update.message.reply_text(
             "⚠️ انتهت جلسة إعادة التسمية. ابدأ العملية من جديد.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
 
@@ -1492,7 +1486,7 @@ async def request_admin_folder_rename(update, context):
         context.user_data.pop("admin_folder_rename_id", None)
         await update.message.reply_text(
             "⚠️ القسم غير موجود.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
 
@@ -1548,7 +1542,7 @@ async def request_admin_folder_name(update, context):
         context.user_data.pop("admin_folder_create", None)
         await update.message.reply_text(
             "🔒 غير مصرح.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
 
@@ -1558,7 +1552,7 @@ async def request_admin_folder_name(update, context):
         context.user_data.pop("admin_folder_create", None)
         await update.message.reply_text(
             "❌ تم إلغاء إنشاء القسم.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
 
@@ -2000,7 +1994,7 @@ async def admin_upload_media_handler(update, context):
         _clear_admin_state(context)
         await update.message.reply_text(
             "⚠️ انتهت جلسة الرفع. ابدأ العملية من جديد.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
 
@@ -2013,7 +2007,7 @@ async def admin_upload_media_handler(update, context):
         _clear_admin_state(context)
         await update.message.reply_text(
             "🔒 غير مصرح.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
 
@@ -2026,7 +2020,7 @@ async def admin_upload_media_handler(update, context):
         _clear_admin_state(context)
         await update.message.reply_text(
             "⚠️ القسم لم يعد موجوداً. تم إلغاء الرفع.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
 
@@ -2713,7 +2707,7 @@ async def handle_pending_title_input(update, context):
         _clear_admin_state(context)
         await update.message.reply_text(
             "🔒 غير مصرح.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
 
@@ -2723,7 +2717,7 @@ async def handle_pending_title_input(update, context):
         _clear_admin_state(context)
         await update.message.reply_text(
             "❌ تم إلغاء العملية.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
 
@@ -2742,7 +2736,7 @@ async def handle_pending_title_input(update, context):
             _clear_admin_state(context)
             await update.message.reply_text(
                 "⚠️ انتهت جلسة الرفع. ابدأ من جديد.",
-                reply_markup=home_keyboard(),
+                reply_markup=await home_for(update),
             )
             return True
 
@@ -2773,7 +2767,7 @@ async def handle_pending_title_input(update, context):
         _clear_admin_state(context)
         await update.message.reply_text(
             "⚠️ انتهت جلسة إعادة التسمية.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
 
@@ -2786,7 +2780,7 @@ async def handle_pending_title_input(update, context):
         _clear_admin_state(context)
         await update.message.reply_text(
             "⚠️ المورد غير موجود.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
 
@@ -2801,7 +2795,7 @@ async def handle_pending_title_input(update, context):
     if not ok:
         await update.message.reply_text(
             "⚠️ تعذر إعادة تسمية المورد.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
 
@@ -2855,33 +2849,30 @@ async def show_admin(query):
     except Exception:
         open_messages = 0
 
-    rows = [
-        [btn("🗂 إدارة الأقسام والفروع", "admin_folders")],
-        [btn("📥 مراجعة المساهمات", "admin_pending")],
-        [btn("📬 رسائل الطلاب", "admin_messages")],
-        [btn("🤖 AI Registry", "admin_ai")],
-        [btn("📊 Runtime", "admin_runtime")],
-    ]
+    rows = []
 
-    try:
-        can_view_audit = await database.is_owner(user_id) or await database.user_has_permission(
-            user_id, "can_admins"
-        )
-    except Exception:
-        can_view_audit = False
+    async def _allowed(permission):
+        try:
+            return await database.user_has_permission(user_id, permission)
+        except Exception:
+            return False
 
-    if can_view_audit:
-        rows.append([btn("📜 سجل التدقيق", "audit_log")])
+    # Each admin surface appears once and only when the caller may use it.
+    if await _allowed("can_folders"):
+        rows.append([btn("🗂 إدارة الأقسام والفروع", "admin_folders")])
+    if await _allowed("can_contributions"):
+        rows.append([btn("📥 مراجعة المساهمات", "admin_pending")])
+    if await _allowed("can_messages"):
+        rows.append([btn("📬 رسائل الطلاب", "admin_messages")])
+    if await _allowed("can_ai"):
+        rows.append([btn("🤖 AI Registry", "admin_ai")])
 
-    try:
-        can_manage_admins = await database.is_owner(user_id) or await database.user_has_permission(
-            user_id, "can_admins"
-        )
-    except Exception:
-        can_manage_admins = False
+    rows.append([btn("📊 Runtime", "admin_runtime")])
 
-    if can_manage_admins:
+    # Admin management + audit trail are for owners / admins granted can_admins.
+    if await _allowed("can_admins"):
         rows.append([btn("👥 إدارة المشرفين", "amg_list")])
+        rows.append([btn("📜 سجل التدقيق", "audit_log")])
 
     rows.append([btn("🏠 الرئيسية", "home")])
 
@@ -3105,7 +3096,7 @@ async def process_review_text(update, context):
         _clear_review_state(context)
         await update.message.reply_text(
             "🔒 غير مصرح.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
 
@@ -3115,7 +3106,7 @@ async def process_review_text(update, context):
         _clear_review_state(context)
         await update.message.reply_text(
             "❌ تم إلغاء المراجعة.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
 
@@ -3149,7 +3140,7 @@ async def process_review_text(update, context):
         if not result:
             await update.message.reply_text(
                 "ℹ️ المساهمة غير موجودة أو تمت معالجتها مسبقاً.",
-                reply_markup=home_keyboard(),
+                reply_markup=await home_for(update),
             )
             return True
 
@@ -3159,7 +3150,7 @@ async def process_review_text(update, context):
             f"✅ تم رفض المساهمة رقم `{contribution_id}`.\n"
             "تم إرسال سبب الرفض إلى صاحب المساهمة.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
 
         await _notify_contributor(
@@ -3192,7 +3183,7 @@ async def process_review_text(update, context):
     if not result:
         await update.message.reply_text(
             "ℹ️ المساهمة غير موجودة أو تمت معالجتها مسبقاً.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return True
 
@@ -3202,7 +3193,7 @@ async def process_review_text(update, context):
         f"✅ تم طلب تعديل المساهمة رقم `{contribution_id}`.\n"
         "تم إرسال الملاحظات إلى صاحب المساهمة.",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=home_keyboard(),
+        reply_markup=await home_for(update),
     )
 
     await _notify_contributor(
@@ -4373,7 +4364,7 @@ async def quota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_safe_message(
         update,
         f"📊 *رصيدك المتبقي لليوم:* {remaining} من {DAILY_LIMIT} طلباً.",
-        home_keyboard(),
+        await home_for(update),
     )
 
 
@@ -4410,7 +4401,7 @@ async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔐 صلاحية مشرف في MEDBOT: "
         f"{'نعم' if is_admin else 'لا'}\n\n"
         f"{status}",
-        home_keyboard(),
+        await home_for(update),
     )
 
 
@@ -4452,13 +4443,13 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if active or review_active or contact_active:
         await update.message.reply_text(
             "❌ تم إلغاء العملية الجارية.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return
 
     await update.message.reply_text(
         "ℹ️ لا توجد عملية قيد التنفيذ.",
-        reply_markup=home_keyboard(),
+        reply_markup=await home_for(update),
     )
 
 
@@ -4560,7 +4551,7 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_safe_message(
             update,
             answer,
-            home_keyboard(),
+            await home_for(update),
         )
         return
 
@@ -4591,7 +4582,7 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⚠️ لم يتم تحديد وضع المساعد بشكل صحيح.\n\n"
             "يرجى اختيار أحد المسارين من 🤖 MEDBOT Assistant.",
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return
 
@@ -4605,7 +4596,7 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ استنفدت رصيدك اليومي المتاح (20 طلباً). "
             "يتجدد الرصيد تلقائياً كل 24 ساعة.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=home_keyboard(),
+            reply_markup=await home_for(update),
         )
         return
 
@@ -4635,7 +4626,7 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_safe_message(
         update,
         final_text,
-        home_keyboard(),
+        await home_for(update),
     )
 
 
@@ -4661,7 +4652,7 @@ async def media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📚 إذا كنت تريد إرسال مساهمة، افتح:\n"
         "📤 Student Contributions\n\n"
         "أو استخدم /start للعودة إلى الرئيسية.",
-        reply_markup=home_keyboard(),
+        reply_markup=await home_for(update),
     )
 
 

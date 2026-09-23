@@ -43,16 +43,23 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
   nothing and only reports the caller's ID and admin status.
 
 ## RBAC (owner + sub-admin) and Audit Log
-- Roles live in `database.ROLES` (`owner`, `admin`, `reviewer`); capabilities
-  in `database.PERMISSION_KEYS` (`can_folders`, `can_content`,
+- Roles live in `database.ROLES` (`owner`, `admin`, `reviewer`, `none`);
+  active admin roles are `database.ADMIN_ROLES` (excludes `none`).
+  Capabilities live in `database.PERMISSION_KEYS` (`can_folders`, `can_content`,
   `can_contributions`, `can_messages`, `can_ai`, `can_admins`).
 - Migrations are additive: `_migrate_v5` adds `admins.role`/`admins.permissions`;
-  `_migrate_v6` creates the isolated `audit_log` table. Never rewrite v1..v4.
+  `_migrate_v6` creates the isolated `audit_log` table; `_migrate_v7` backfills
+  NULL/empty roles to `admin`. Never rewrite v1..v4.
 - Permission storage: an EMPTY `admins.permissions` column means "legacy row,
   full access". An explicitly revoked admin is stored as the `PERMISSIONS_NONE`
   (`none`) sentinel. Never persist an all-False map as an empty string.
 - `user_has_permission()` is the only capability check: owner always passes,
   non-admin always fails, unknown key fails, legacy/empty grants everything.
+- Owner protection: the single `owner` must never be demoted or revoked while
+  it is the only owner. `set_admin_role`/`remove_sub_admin` enforce this and
+  `admin_management.change_role` reports it. A new owner must be minted first.
+- Removing an admin sets `role='none'` (row + username kept) instead of
+  deleting the row; `is_user_admin()` rejects `none`, and re-adding restores it.
 - `audit.log_action()` is best-effort and must never raise into the audited
   operation. The audit table is independent of messages/contributions/content.
 - Isolated modules: `audit.py` (viewer) and `admin_management.py` (role/permission
@@ -60,6 +67,10 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
   their callbacks through their own handlers in tests.
 - `admin_management` uses `database.add_sub_admin_by_any`, which does
   `INSERT OR REPLACE`; never let it touch the owner (it would reset role/perms).
+- UI visibility rule: `main.home_keyboard()` is the public student keyboard and
+  never contains the admin entry. Use `await main.home_for(update)` everywhere a
+  home keyboard is attached; it appends the Admin Panel only for admins. The
+  panel itself lists each permitted surface exactly once.
 
 ## Testing
 - `python -m py_compile` all modules.

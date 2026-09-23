@@ -81,20 +81,9 @@ def _admins_menu(admins) -> InlineKeyboardMarkup:
 async def _load_admins():
     """All admin records, resolved through the RBAC helpers."""
     try:
-        raw = await database.get_all_admins()
+        return await database.get_admins_full_records()
     except Exception:
         return []
-
-    records = []
-    for row in raw:
-        try:
-            telegram_id = row[0]
-        except Exception:
-            continue
-        record = await database.get_admin_record(telegram_id)
-        if record:
-            records.append(record)
-    return records
 
 
 async def show_admin_management(query, context=None):
@@ -215,6 +204,19 @@ async def change_role(query, target_id, role):
         )
         return
 
+    # The active owner must not be demoted; a new owner has to exist first.
+    if (
+        role != "owner"
+        and await database.is_owner(target_id)
+    ):
+        await _edit(
+            query,
+            "🔒 لا يمكن تغيير دور المالك الحالي إلى مشرف.\n"
+            "عيّن حساباً آخر كمالك أولاً، ثم غيّر هذا الحساب.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة المشرفين", "amg_list")]]),
+        )
+        return
+
     ok = await database.set_admin_role(target_id, role)
 
     if ok:
@@ -225,6 +227,13 @@ async def change_role(query, target_id, role):
             target_id=target_id,
             details=f"role={role}",
         )
+    else:
+        await _edit(
+            query,
+            "⚠️ تعذّر تغيير الدور.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة المشرفين", "amg_list")]]),
+        )
+        return
 
     await show_admin_detail(query, target_id)
 
@@ -252,6 +261,13 @@ async def remove_admin(query, target_id):
             target_type="admin",
             target_id=target_id,
         )
+    else:
+        await _edit(
+            query,
+            "⚠️ تعذّر إلغاء وصول هذا المشرف.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة المشرفين", "amg_list")]]),
+        )
+        return
 
     await show_admin_management(query)
 

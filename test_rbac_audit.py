@@ -182,6 +182,23 @@ class MigrationTests(RBACBase):
         # Pre-existing admins default to 'admin', not owner.
         self.assertNotEqual(row[1], "owner")
 
+    async def test_migration_v7_backfills_null_role(self):
+        # A legacy row written before RBAC (role NULL) becomes an active admin.
+        db = await database.get_db()
+        await db.execute(
+            "INSERT INTO admins (telegram_id, username, role) "
+            "VALUES (?, ?, NULL)",
+            (self.student_id + 1, "legacy-null"),
+        )
+        await db.commit()
+        await db.close()
+
+        await database.init_db()
+
+        record = await database.get_admin_record(self.student_id + 1)
+        self.assertEqual(record["role"], "admin")
+        self.assertTrue(await database.is_user_admin(self.student_id + 1))
+
 
 # ---------------------------------------------------------------
 # Permission resolution / backward compatibility
@@ -577,6 +594,145 @@ class AdminOperationAuditTests(RBACBase):
 
         query, _ = await self._route(self.sub_id, "admin_folders")
         self.assertNotIn("غير مصرح", query.last_text)
+
+
+# ---------------------------------------------------------------
+# Owner protection (the reported defect: owner demoted to sub-admin)
+# ---------------------------------------------------------------
+
+
+class OwnerProtectionTests(RBACBase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        await database.ensure_configured_admin(self.owner_id)
+
+    async def _manage(self, user_id, data):
+        """Route an admin-management callback through its real handler."""
+        query = _FakeQuery(user_id, data)
+        await admin_management.admin_management_callback_handler(
+            _FakeUpdate(query), _FakeContext()
+        )
+        return query
+
+    async def test_owner_cannot_be_demoted_by_role_change(self):
+        # Owner tries to set their own role to a plain admin.
+        query = await self._manage(self.owner_id, f"amg_role:{self.owner_id}:admin")
+        self.assertTrue(await database.is_owner(self.owner_id))
+        self.assertIn("لا يمكن تغيير دور المالك", query.last_text)
+
+        # The demotion must not be written either.
+        self.assertFalse(await database.set_admin_role(self.owner_id, "admin"))
+        self.assertTrue(await database.is_owner(self.owner_id))
+
+    async def test_owner_can_be_demoted_only_when_another_owner_exists(self):
+        # The owner promotes the sub-admin to owner (only owner can mint owner).
+        await self._manage(self.owner_id, f"amg_role:{self.sub_id}:owner")
+        self.assertTrue(await database.is_owner(self.sub_id))
+
+        # Now demoting the original owner is allowed (a new owner exists).
+        self.assertTrue(await database.set_admin_role(self.owner_id, "admin"))
+        self.assertFalse(await database.is_owner(self.owner_id))
+        self.assertTrue(await database.is_owner(self.sub_id))
+
+    async def test_owner_cannot_remove_themselves(self):
+        query = await self._manage(self.owner_id, f"amg_remove:{self.owner_id}")
+        self.assertTrue(await database.is_user_admin(self.owner_id))
+        self.assertTrue(await database.is_owner(self.owner_id))
+        self.assertIn("لا يمكن إزالة المالك", query.last_text)
+        self.assertFalse(await database.remove_sub_admin(self.owner_id))
+
+    async def test_owner_still_has_permission_toggles(self):
+        # Owner keeps the permission surface (it is separate from the role).
+        await self._manage(self.owner_id, f"amg_perm:{self.owner_id}:can_ai")
+        # Owner permissions always resolve to full, regardless of the toggle.
+        self.assertTrue(
+            await database.user_has_permission(self.owner_id, "can_ai")
+        )
+
+
+class RevokedAdminTests(RBACBase):
+    """Remove keeps the row but revokes access, and can be re-added."""
+
+    async def test_removed_admin_is_not_admin_but_row_kept(self):
+        await database.ensure_configured_admin(self.owner_id)
+        await database.remove_sub_admin(self.sub_id)
+
+        self.assertFalse(await database.is_user_admin(self.sub_id))
+        self.assertFalse(await database.is_owner(self.sub_id))
+        for key in database.PERMISSION_KEYS:
+            self.assertFalse(await database.user_has_permission(self.sub_id, key))
+
+        record = await database.get_admin_record(self.sub_id)
+        self.assertEqual(record["role"], "none")
+        self.assertTrue(await database.admin_access_denied(self.sub_id))
+
+    async def test_revoked_admin_can_be_added_again(self):
+        await database.remove_sub_admin(self.sub_id)
+        self.assertTrue(await database.add_sub_admin(self.sub_id, "sub"))
+        # A fresh add restores the legacy full-access role.
+        self.assertTrue(await database.is_user_admin(self.sub_id))
+
+    async def test_revoked_admin_is_excluded_from_notification_recipients(self):
+        # `get_all_admins` feeds admin notifications; a revoked row must not
+        # receive them even though it is still present in the table.
+        await database.remove_sub_admin(self.sub_id)
+        ids = [row[0] for row in await database.get_all_admins()]
+        self.assertNotIn(self.sub_id, ids)
+
+
+class HomeKeyboardTests(RBACBase):
+    """Design rule: regular users see only their options; admins see the panel."""
+
+    @staticmethod
+    def _callbacks(markup):
+        return [
+            b.callback_data for row in markup.inline_keyboard for b in row
+        ]
+
+    async def test_regular_user_has_no_admin_button(self):
+        callbacks = self._callbacks(main.home_keyboard())
+        self.assertNotIn("admin", callbacks)
+        self.assertIn("contact", callbacks)
+
+    async def test_home_for_regular_user_hides_admin(self):
+        query = _FakeQuery(self.student_id, "home")
+        update = _FakeUpdate(query)
+        markup = await main.home_for(update)
+        self.assertNotIn("admin", self._callbacks(markup))
+
+    async def test_home_for_admin_shows_admin_panel_once(self):
+        await database.add_sub_admin(self.sub_id, "sub")
+        query = _FakeQuery(self.sub_id, "home")
+        update = _FakeUpdate(query)
+        callbacks = self._callbacks(await main.home_for(update))
+        self.assertEqual(callbacks.count("admin"), 1)
+
+    async def test_admin_panel_rows_have_no_duplicates(self):
+        await database.ensure_configured_admin(self.owner_id)
+        query, _ = await self._route(self.owner_id, "admin")
+        callbacks = self._callbacks(query.last_markup)
+        self.assertEqual(len(callbacks), len(set(callbacks)), callbacks)
+        self.assertIn("amg_list", callbacks)
+        self.assertIn("audit_log", callbacks)
+
+    async def test_admin_panel_hides_surfaces_without_permission(self):
+        await database.ensure_configured_admin(self.owner_id)
+        perms = await database.get_admin_permissions(self.sub_id)
+        perms = dict(perms)
+        perms["can_folders"] = False
+        perms["can_ai"] = False
+        perms["can_admins"] = False
+        await database.update_admin_permissions(self.sub_id, perms)
+
+        query, _ = await self._route(self.sub_id, "admin")
+        callbacks = self._callbacks(query.last_markup)
+        self.assertNotIn("admin_folders", callbacks)
+        self.assertNotIn("admin_ai", callbacks)
+        self.assertNotIn("amg_list", callbacks)
+        self.assertNotIn("audit_log", callbacks)
+        # Retained surfaces still show, exactly once each.
+        self.assertEqual(callbacks.count("admin_pending"), 1)
+        self.assertEqual(callbacks.count("admin_runtime"), 1)
 
 
 if __name__ == "__main__":
