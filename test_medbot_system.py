@@ -366,5 +366,81 @@ class MedbotSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(summary["result_count"], 1)
 
 
+# ============================================================
+# Schema migration safety — existing data must survive
+# ============================================================
+
+
+class MigrationSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="medbot-migrate-")
+        self.db_path = os.path.join(self.tmp_dir, "test.sqlite3")
+        self._old = database.DB_NAME
+        database.DB_NAME = self.db_path
+
+    async def asyncTearDown(self):
+        database.DB_NAME = self._old
+        for name in os.listdir(self.tmp_dir):
+            try:
+                os.remove(os.path.join(self.tmp_dir, name))
+            except OSError:
+                pass
+        os.rmdir(self.tmp_dir)
+
+    async def test_migration_is_idempotent_and_preserves_data(self):
+        await database.init_db()
+
+        await database.add_folder(0, "Cardio", "general")
+        folder_id = (await database.get_folders(0))[0][0]
+        await database.add_content(folder_id, "Existing Doc", "fid-keep", "document")
+
+        # Re-running migrations (e.g. on a later boot) must not fail or drop data.
+        await database.init_db()
+        await database.init_db()
+
+        folders = await database.get_folders(0)
+        self.assertEqual(len(folders), 1)
+        self.assertEqual(folders[0][1], "Cardio")
+
+        files = await database.get_files(folder_id)
+        self.assertEqual(len(files), 1)
+        self.assertEqual(files[0][1], "Existing Doc")
+
+    async def test_new_tables_exist_after_migration(self):
+        await database.init_db()
+
+        db = await database.get_db()
+        try:
+            async with db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ) as cur:
+                tables = {row[0] for row in await cur.fetchall()}
+        finally:
+            await db.close()
+
+        self.assertIn("mcq_questions", tables)
+        self.assertIn("users", tables)
+        self.assertIn("content", tables)
+
+    async def test_notifications_enabled_defaults_to_true(self):
+        await database.init_db()
+        await database.register_user(4242, "u", "User")
+
+        # A freshly registered user is opted in by default.
+        self.assertTrue(await database.notifications_enabled(4242))
+
+    async def test_unknown_mcq_folder_still_stored_as_null(self):
+        await database.init_db()
+
+        # No folder chosen: the question belongs to the general bank.
+        qid = await database.add_mcq_question(
+            None, "Loose question?", ["a", "b"], 0, None
+        )
+        self.assertIsNotNone(qid)
+
+        questions = await database.get_mcq_questions()
+        self.assertEqual(len(questions), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

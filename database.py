@@ -1,5 +1,7 @@
 import aiosqlite
+import json
 import logging
+import os
 
 from datetime import datetime, date
 from typing import Tuple
@@ -102,6 +104,30 @@ async def init_db():
         """)
 
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS sub_admins (
+                user_id INTEGER PRIMARY KEY,
+                role TEXT DEFAULT 'subadmin',
+                permissions TEXT DEFAULT '',
+                added_by INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS mcq_questions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                folder_id INTEGER,
+                question_text TEXT NOT NULL,
+                options_json TEXT NOT NULL,
+                correct_answer_index INTEGER NOT NULL,
+                explanation TEXT,
+                created_by INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (folder_id) REFERENCES folders (id) ON DELETE SET NULL
+            )
+        """)
+
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS ai_registry (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 provider TEXT NOT NULL,
@@ -176,6 +202,11 @@ async def init_db():
         """)
 
         await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_mcq_folder
+            ON mcq_questions(folder_id)
+        """)
+
+        await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_registry_avail
             ON ai_registry(availability)
         """)
@@ -215,6 +246,13 @@ async def _migrate_v1(db):
     try:
         await db.execute("ALTER TABLE content ADD COLUMN created_by INTEGER DEFAULT NULL")
         logger.info("Migration: added created_by to content")
+    except Exception:
+        pass
+    try:
+        await db.execute(
+            "ALTER TABLE users ADD COLUMN notifications_enabled INTEGER DEFAULT 1"
+        )
+        logger.info("Migration: added notifications_enabled to users")
     except Exception:
         pass
 
@@ -714,6 +752,301 @@ async def reject_contribution(contrib_id: int):
     finally:
         await db.close()
 
+
+# ============================================================
+# GAMIFICATION — contributor leaderboard
+# ============================================================
+
+
+async def get_top_contributors(limit: int = 10) -> list:
+    """Return the top approved contributors, ranked by approved count.
+
+    Only `approved` contributions count toward the leaderboard; pending and
+    rejected submissions never award credit. Users are grouped by user_id so
+    that a contributor's name is reported once even if their display name
+    changed between submissions.
+    """
+    try:
+        limit = max(1, min(int(limit), 50))
+    except (TypeError, ValueError):
+        limit = 10
+
+    db = await get_db()
+    try:
+        async with db.execute(
+            """
+            SELECT
+                c.user_id,
+                COALESCE(
+                    (SELECT u.full_name FROM users u WHERE u.user_id = c.user_id),
+                    (SELECT MAX(user_name) FROM contributions c2
+                     WHERE c2.user_id = c.user_id AND c2.user_name IS NOT NULL),
+                    ''
+                ) AS display_name,
+                COALESCE(
+                    (SELECT u.username FROM users u WHERE u.user_id = c.user_id),
+                    ''
+                ) AS username,
+                COUNT(*) AS approved_count
+            FROM contributions c
+            WHERE c.status = 'approved'
+            GROUP BY c.user_id
+            ORDER BY approved_count DESC, c.user_id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        return [
+            {
+                "user_id": row[0],
+                "name": row[1] or str(row[0]),
+                "username": row[2] or "",
+                "approved_count": int(row[3]),
+            }
+            for row in rows
+        ]
+    finally:
+        await db.close()
+
+
+async def get_approved_contribution_count(user_id: int) -> int:
+    """Number of approved contributions for a single student."""
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT COUNT(*) FROM contributions "
+            "WHERE user_id = ? AND status = 'approved'",
+            (user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        await db.close()
+
+
+# ============================================================
+# NOTIFICATIONS — subscriber preferences
+# ============================================================
+
+
+async def get_notification_recipients(exclude_user_id: int = None) -> list:
+    """Return user ids of subscribers who have not opted out.
+
+    Legacy rows created before the preference column existed are treated as
+    subscribed (NULL/1), preserving prior broadcast behaviour.
+    """
+    db = await get_db()
+    try:
+        sql = (
+            "SELECT user_id FROM users "
+            "WHERE COALESCE(notifications_enabled, 1) = 1"
+        )
+        params = ()
+
+        if exclude_user_id is not None:
+            sql += " AND user_id != ?"
+            params = (int(exclude_user_id),)
+
+        async with db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+
+        return [row[0] for row in rows]
+    finally:
+        await db.close()
+
+
+async def set_notifications_enabled(user_id: int, enabled: bool) -> bool:
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "UPDATE users SET notifications_enabled = ? WHERE user_id = ?",
+            (1 if enabled else 0, int(user_id)),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def notifications_enabled(user_id: int) -> bool:
+    """Whether a student currently receives publication alerts."""
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT notifications_enabled FROM users WHERE user_id = ?",
+            (int(user_id),),
+        ) as cur:
+            row = await cur.fetchone()
+
+        if not row or row[0] is None:
+            return True
+        return bool(row[0])
+    finally:
+        await db.close()
+
+
+# ============================================================
+# MCQ — verified question bank
+# ============================================================
+
+
+async def add_mcq_question(
+    folder_id: int,
+    question_text: str,
+    options: list,
+    correct_answer_index: int,
+    explanation: str = None,
+    created_by: int = None,
+) -> int:
+    """Register one MCQ. The caller supplies verified content.
+
+    The database never generates questions: it only stores what an admin
+    explicitly registers.
+    """
+    if not question_text or not str(question_text).strip():
+        raise ValueError("question_text is required")
+
+    if not isinstance(options, list) or len(options) < 2:
+        raise ValueError("at least two options are required")
+
+    try:
+        correct_answer_index = int(correct_answer_index)
+    except (TypeError, ValueError):
+        raise ValueError("correct_answer_index must be an integer")
+
+    if correct_answer_index < 0 or correct_answer_index >= len(options):
+        raise ValueError("correct_answer_index is out of range")
+
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO mcq_questions "
+            "(folder_id, question_text, options_json, correct_answer_index, "
+            " explanation, created_by) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                folder_id,
+                str(question_text).strip(),
+                json.dumps([str(o) for o in options], ensure_ascii=False),
+                correct_answer_index,
+                explanation,
+                created_by,
+            ),
+        )
+        await db.commit()
+        return cursor.lastrowid
+    finally:
+        await db.close()
+
+
+async def get_mcq_questions(folder_id: int = None, limit: int = 100) -> list:
+    """Return MCQs, optionally scoped to one folder (and its descendants).
+
+    The returned dicts are ready for the Telegram layer: options are decoded
+    and the correct index is validated against the stored options.
+    """
+    db = await get_db()
+    try:
+        params = []
+        where = ""
+
+        if folder_id is not None:
+            ids = await _collect_folder_subtree_ids(db, int(folder_id))
+            if not ids:
+                return []
+            placeholders = ",".join("?" for _ in ids)
+            where = f"WHERE folder_id IN ({placeholders})"
+            params.extend(ids)
+
+        sql = (
+            "SELECT id, folder_id, question_text, options_json, "
+            "correct_answer_index, explanation "
+            f"FROM mcq_questions {where} ORDER BY id ASC LIMIT ?"
+        )
+        params.append(max(1, min(int(limit), 500)))
+
+        async with db.execute(sql, tuple(params)) as cur:
+            rows = await cur.fetchall()
+
+        questions = []
+
+        for row in rows:
+            try:
+                options = json.loads(row[3])
+            except Exception:
+                continue
+
+            if not isinstance(options, list) or len(options) < 2:
+                continue
+
+            try:
+                correct = int(row[4])
+            except (TypeError, ValueError):
+                continue
+
+            if correct < 0 or correct >= len(options):
+                continue
+
+            questions.append(
+                {
+                    "id": row[0],
+                    "folder_id": row[1],
+                    "question_text": row[2],
+                    "options": [str(o) for o in options],
+                    "correct_index": correct,
+                    "explanation": row[5] or "",
+                }
+            )
+
+        return questions
+    finally:
+        await db.close()
+
+
+async def _collect_folder_subtree_ids(db, folder_id: int) -> list:
+    """Collect a folder and all of its descendants with cycle protection."""
+    collected = []
+    frontier = [folder_id]
+    seen = set()
+
+    while frontier:
+        current = frontier.pop()
+
+        if current in seen:
+            continue
+
+        seen.add(current)
+        collected.append(current)
+
+        async with db.execute(
+            "SELECT id FROM folders WHERE parent_id = ?", (current,)
+        ) as cur:
+            children = await cur.fetchall()
+
+        frontier.extend(child[0] for child in children)
+
+    return collected
+
+
+async def get_mcq_count(folder_id: int = None) -> int:
+    """Count valid MCQs, optionally scoped to a folder subtree."""
+    return len(await get_mcq_questions(folder_id, limit=500))
+
+
+async def delete_mcq_question(question_id: int) -> bool:
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "DELETE FROM mcq_questions WHERE id = ?", (int(question_id),)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+    finally:
+        await db.close()
+
+
 async def get_pending_contributions():
     db = await get_db()
     async with db.execute("""
@@ -1005,6 +1338,12 @@ async def get_all_admins():
     return rows
 
 async def is_user_admin(telegram_id: int) -> bool:
+    try:
+        if await is_owner(telegram_id):
+            return True
+    except Exception:
+        pass
+
     db = await get_db()
     async with db.execute("SELECT 1 FROM admins WHERE telegram_id = ?", (telegram_id,)) as cur:
         row = await cur.fetchone()
@@ -1048,6 +1387,233 @@ async def get_all_user_ids() -> list:
         rows = await cur.fetchall()
     await db.close()
     return [r[0] for r in rows]
+
+
+# ============================================================
+# RBAC — sub-admin roles & granular permissions
+# ============================================================
+
+PERMISSION_KEYS = ("can_folders", "can_content", "can_contributions", "can_ai")
+
+PERMISSION_LABELS = {
+    "can_folders": "الأقسام والفروع",
+    "can_content": "الموردين (رفع/إدارة)",
+    "can_contributions": "مراجعة المساهمات",
+    "can_ai": "سجل الذكاء الاصطناعي",
+}
+
+
+def _default_permissions() -> dict:
+    return {key: True for key in PERMISSION_KEYS}
+
+
+def permissions_to_string(permissions: dict) -> str:
+    return ",".join(
+        key
+        for key in PERMISSION_KEYS
+        if permissions.get(key)
+    )
+
+
+def permissions_from_string(value: str) -> dict:
+    raw = set(
+        part.strip()
+        for part in str(value or "").split(",")
+        if part.strip()
+    )
+    return {key: (key in raw) for key in PERMISSION_KEYS}
+
+
+async def get_sub_admins() -> list:
+    """Return (user_id, role, permissions_string, added_by, created_at) rows."""
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT user_id, role, permissions, added_by, created_at "
+            "FROM sub_admins ORDER BY created_at ASC"
+        ) as cur:
+            return await cur.fetchall()
+    finally:
+        await db.close()
+
+
+async def get_sub_admin(user_id: int):
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT user_id, role, permissions, added_by, created_at "
+            "FROM sub_admins WHERE user_id = ?",
+            (user_id,),
+        ) as cur:
+            return await cur.fetchone()
+    finally:
+        await db.close()
+
+
+async def add_sub_admin_record(
+    user_id: int,
+    permissions: dict = None,
+    role: str = "subadmin",
+    added_by: int = None,
+) -> bool:
+    permissions = permissions or _default_permissions()
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT OR REPLACE INTO sub_admins "
+            "(user_id, role, permissions, added_by) VALUES (?, ?, ?, ?)",
+            (
+                int(user_id),
+                role,
+                permissions_to_string(permissions),
+                added_by,
+            ),
+        )
+        await db.commit()
+        return True
+    except Exception:
+        logger.exception("add_sub_admin_record failed for %s", user_id)
+        return False
+    finally:
+        await db.close()
+
+
+async def update_admin_permissions(user_id: int, permissions: dict) -> bool:
+    """Persist a permissions dict for a sub-admin. Returns True on success."""
+    if not isinstance(permissions, dict):
+        return False
+
+    normalized = {
+        key: bool(permissions.get(key))
+        for key in PERMISSION_KEYS
+    }
+
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "UPDATE sub_admins SET permissions = ? WHERE user_id = ?",
+            (permissions_to_string(normalized), int(user_id)),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def get_admin_permissions(user_id: int) -> dict:
+    """Resolve the effective permission set for any admin user.
+
+    The configured owner (OWNER_ID/ADMIN_ID) always has full permissions.
+    A sub-admin without a sub_admins row is treated as fully permitted so the
+    pre-existing `admins` table behaviour is preserved.
+    """
+    if await is_owner(user_id):
+        return _default_permissions()
+
+    row = await get_sub_admin(user_id)
+    if row:
+        return permissions_from_string(row[2])
+
+    return _default_permissions()
+
+
+async def user_has_permission(user_id: int, permission: str) -> bool:
+    if permission not in PERMISSION_KEYS:
+        return False
+
+    try:
+        if await is_owner(user_id):
+            return True
+    except Exception:
+        pass
+
+    try:
+        if not await is_user_admin(user_id):
+            return False
+    except Exception:
+        return False
+
+    permissions = await get_admin_permissions(user_id)
+    return bool(permissions.get(permission))
+
+
+async def is_owner(user_id: int) -> bool:
+    """True only for the owner configured via OWNER_ID/ADMIN_ID.
+
+    ADMIN_ID=0 must never promote anyone (legacy safety rule).
+    """
+    for name in ("OWNER_ID", "ADMIN_ID"):
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            continue
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value != 0 and value == int(user_id):
+            return True
+    return False
+
+
+# ============================================================
+# Analytics helpers
+# ============================================================
+
+async def get_system_stats() -> dict:
+    """Return real counts for the admin dashboard. Never fabricates values."""
+    stats = {
+        "total_users": 0,
+        "active_today": 0,
+        "total_folders": 0,
+        "total_resources": 0,
+        "pending_contributions": 0,
+        "total_admins": 0,
+    }
+
+    db = await get_db()
+    try:
+        queries = {
+            "total_users": "SELECT COUNT(*) FROM users",
+            "active_today": (
+                "SELECT COUNT(*) FROM users "
+                "WHERE date(joined_date) = date('now')"
+            ),
+            "total_folders": "SELECT COUNT(*) FROM folders",
+            "total_resources": "SELECT COUNT(*) FROM content",
+            "pending_contributions": (
+                "SELECT COUNT(*) FROM contributions WHERE status = 'pending'"
+            ),
+            "total_admins": "SELECT COUNT(*) FROM admins",
+        }
+
+        for key, sql in queries.items():
+            try:
+                async with db.execute(sql) as cur:
+                    row = await cur.fetchone()
+                stats[key] = int(row[0]) if row else 0
+            except Exception:
+                stats[key] = 0
+
+        return stats
+    finally:
+        await db.close()
+
+
+async def get_active_users_since(days: int = 1) -> int:
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT COUNT(*) FROM users "
+            "WHERE joined_date >= datetime('now', ?)",
+            (f"-{int(days)} day",),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        await db.close()
+
+
+
 
 async def get_pending_contributions_count() -> int:
     db = await get_db()
