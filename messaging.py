@@ -25,6 +25,7 @@ from telegram.ext import (
 )
 
 import database
+import audit
 
 logger = logging.getLogger(__name__)
 
@@ -295,9 +296,21 @@ async def _is_admin(user_id) -> bool:
         return False
 
 
+async def _can_messages(user_id) -> bool:
+    """Admin gate for the messaging surfaces (RBAC: can_messages)."""
+    try:
+        return await database.user_has_permission(user_id, "can_messages")
+    except Exception:
+        return False
+
+
 async def show_admin_messages(query):
     """List messages awaiting an admin decision."""
     if not await _is_admin(query.from_user.id):
+        await _edit(query, "🔒 غير مصرح.", HOME_KEYBOARD)
+        return
+
+    if not await _can_messages(query.from_user.id):
         await _edit(query, "🔒 غير مصرح.", HOME_KEYBOARD)
         return
 
@@ -341,6 +354,10 @@ async def show_admin_messages(query):
 
 async def open_admin_message(query, context, message_id):
     if not await _is_admin(query.from_user.id):
+        await _edit(query, "🔒 غير مصرح.", HOME_KEYBOARD)
+        return
+
+    if not await _can_messages(query.from_user.id):
         await _edit(query, "🔒 غير مصرح.", HOME_KEYBOARD)
         return
 
@@ -407,6 +424,10 @@ async def open_admin_message(query, context, message_id):
 async def request_admin_reply(query, context, message_id):
     """Arm the reply text flow for this admin."""
     if not await _is_admin(query.from_user.id):
+        await _edit(query, "🔒 غير مصرح.", HOME_KEYBOARD)
+        return
+
+    if not await _can_messages(query.from_user.id):
         await _edit(query, "🔒 غير مصرح.", HOME_KEYBOARD)
         return
 
@@ -521,11 +542,22 @@ async def handle_admin_reply_text(update, context):
     except Exception:
         logger.warning("messaging: could not notify owner %s", owner_id)
 
+    await audit.log_action(
+        update.effective_user.id,
+        "message_reply",
+        target_type="message",
+        target_id=mid,
+    )
+
     return True
 
 
 async def change_status(query, context, message_id, status):
     if not await _is_admin(query.from_user.id):
+        await _edit(query, "🔒 غير مصرح.", HOME_KEYBOARD)
+        return
+
+    if not await _can_messages(query.from_user.id):
         await _edit(query, "🔒 غير مصرح.", HOME_KEYBOARD)
         return
 
@@ -551,6 +583,14 @@ async def change_status(query, context, message_id, status):
             ),
         )
         return
+
+    await audit.log_action(
+        query.from_user.id,
+        "message_status",
+        target_type="message",
+        target_id=message_id,
+        details=f"status={status}",
+    )
 
     await open_admin_message(query, context, message_id)
 

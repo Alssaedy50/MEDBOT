@@ -169,6 +169,9 @@ async def init_db():
         await _migrate_v3(db)
         await _migrate_v4(db)
         await _migrate_v5(db)
+        await _migrate_v6(db)
+        await _migrate_v7(db)
+        await _migrate_v8(db)
 
         # ------------------------------------------------------------
         # Performance / integrity indexes
@@ -336,6 +339,149 @@ async def _migrate_v4(db):
 
 
 async def _migrate_v5(db):
+    """RBAC: extend the existing `admins` identity with role + permissions.
+
+    Additive columns only; existing rows default to role='admin' with an empty
+    permissions string, which resolves to full access (no behaviour change).
+    """
+    try:
+        await db.execute("ALTER TABLE admins ADD COLUMN role TEXT DEFAULT 'admin'")
+        logger.info("Migration v5: added role to admins")
+    except Exception:
+        pass
+
+    try:
+        await db.execute("ALTER TABLE admins ADD COLUMN permissions TEXT DEFAULT ''")
+        logger.info("Migration v5: added permissions to admins")
+    except Exception:
+        pass
+
+
+async def _migrate_v6(db):
+    """Audit log: isolated from every other subsystem.
+
+    Creates the `audit_log` table and its indexes if missing. Safe to re-run.
+    """
+    try:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_id INTEGER,
+                actor_role TEXT,
+                action TEXT NOT NULL,
+                target_type TEXT,
+                target_id TEXT,
+                details TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        logger.info("Migration v6: ensured audit_log table")
+    except Exception:
+        pass
+
+    for index_name, column in (
+        ("idx_audit_actor", "actor_id"),
+        ("idx_audit_action", "action"),
+        ("idx_audit_created", "created_at"),
+    ):
+        try:
+            await db.execute(
+                f"CREATE INDEX IF NOT EXISTS {index_name} ON audit_log({column})"
+            )
+        except Exception:
+            pass
+
+
+async def _migrate_v7(db):
+    """Role semantics: revoked admins keep their row with role='none'.
+
+    Purely a data-backfill migration: every existing row with a NULL/empty
+    role is pinned to 'admin' (pre-RBAC legacy = full access, unchanged), so
+    later role comparisons are unambiguous. Safe to re-run.
+    """
+    try:
+        await db.execute(
+            "UPDATE admins SET role = 'admin' "
+            "WHERE role IS NULL OR TRIM(role) = ''"
+        )
+        logger.info("Migration v7: normalised admin roles")
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------
+# RBAC: roles and per-capability permissions
+# ------------------------------------------------------------
+# 'none' keeps the row (and username) but revokes admin access.
+ADMIN_ROLES = ("owner", "admin", "reviewer")
+ROLES = ADMIN_ROLES + ("none",)
+
+PERMISSION_KEYS = (
+    "can_folders",
+    "can_content",
+    "can_contributions",
+    "can_messages",
+    "can_ai",
+    "can_admins",
+)
+
+# Stored in `admins.permissions` to mean "explicitly granted nothing". An empty
+# column instead means "legacy row, keep full access".
+PERMISSIONS_NONE = "none"
+
+PERMISSION_LABELS = {
+    "can_folders": "📁 إدارة المجلدات",
+    "can_content": "📄 إدارة المحتوى",
+    "can_contributions": "📥 مراجعة المساهمات",
+    "can_messages": "📬 رسائل الطلاب",
+    "can_ai": "🤖 الذكاء الاصطناعي",
+    "can_admins": "👥 إدارة المشرفين",
+}
+
+ROLE_LABELS = {
+    "owner": "👑 المالك",
+    "admin": "🛡 مشرف",
+    "reviewer": "🔎 مراجع",
+    "none": "⛔ مُلغى",
+}
+
+
+def _default_permissions() -> dict:
+    return {key: True for key in PERMISSION_KEYS}
+
+
+def permissions_to_string(permissions) -> str:
+    """Serialise a permission mapping to the stored comma-separated form.
+
+    A revoked-everything admin serialises to the explicit `PERMISSIONS_NONE`
+    sentinel rather than an empty string, so it cannot be confused with a
+    pre-migration row (empty = full access).
+    """
+    if not permissions:
+        return ""
+    if isinstance(permissions, str):
+        return permissions
+    granted = [k for k in PERMISSION_KEYS if permissions.get(k)]
+    if not granted:
+        return PERMISSIONS_NONE
+    return ",".join(granted)
+
+
+def permissions_from_string(raw: str) -> dict:
+    """Parse stored permissions.
+
+    Empty/None means 'all granted' (pre-migration admins keep full access).
+    The `PERMISSIONS_NONE` sentinel means 'explicitly granted nothing'.
+    """
+    if raw is None or not str(raw).strip():
+        return _default_permissions()
+    if str(raw).strip() == PERMISSIONS_NONE:
+        return {key: False for key in PERMISSION_KEYS}
+    granted = {part.strip() for part in str(raw).split(",") if part.strip()}
+    return {key: (key in granted) for key in PERMISSION_KEYS}
+
+
+async def _migrate_v8(db):
     """AI resource search: add optional searchable metadata.
 
     Extends the searchable surface beyond folder/title so the
@@ -368,10 +514,9 @@ async def _migrate_v5(db):
     ):
         try:
             await db.execute(ddl)
-            logger.info("Migration v5: added %s.%s", table, column)
+            logger.info("Migration v8: added %s.%s", table, column)
         except Exception:
             pass
-
 
 # Message categories and lifecycle states.
 MESSAGE_CATEGORIES = ("message", "summary", "suggestion", "report")
@@ -424,7 +569,12 @@ async def create_message(user_id: int, user_name: str, category: str, body: str)
         await db.close()
 
 
-async def get_message(message_id: int):
+async def get_message(message_id):
+    """Fetch a message by id. Non-numeric input yields None (never a crash)."""
+    try:
+        message_id = int(message_id)
+    except (TypeError, ValueError):
+        return None
     db = await get_db()
     try:
         async with db.execute(
@@ -877,6 +1027,35 @@ async def folder_accepts_contributions(folder_id: int) -> bool:
         res = await cur.fetchone()
     await db.close()
     return bool(res and res[0])
+
+async def folder_has_contribution_target(folder_id: int) -> bool:
+    """True if this folder or any descendant accepts contributions.
+
+    Lets the contribution wizard hide branches that lead nowhere, so a student
+    can never drill into a dead end looking for a place to upload.
+    """
+    db = await get_db()
+    try:
+        pending = [folder_id]
+        seen = set()
+
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+
+            if await folder_accepts_contributions(current):
+                return True
+
+            async with db.execute(
+                "SELECT id FROM folders WHERE parent_id = ?", (current,)
+            ) as cur:
+                pending.extend(row[0] for row in await cur.fetchall())
+
+        return False
+    finally:
+        await db.close()
 
 async def is_descendant(db, ancestor_id: int, folder_id: int) -> bool:
     """Check if folder_id is a descendant of ancestor_id (for cycle prevention)."""
@@ -1386,18 +1565,34 @@ async def get_contribution(contrib_id: int):
         await db.close()
 
 async def get_user_contributions(user_id: int, limit: int = 20):
-    """Return a contributor's own contributions, newest first."""
+    """Return a contributor's own contributions, newest first.
+
+    Each row carries the full destination path so the student can tell which
+    subject/block a contribution belongs to, not just its title.
+    """
     db = await get_db()
     try:
         async with db.execute("""
             SELECT id, title, file_type, status, created_at,
-                   rejection_reason, review_note
+                   rejection_reason, review_note, folder_id
             FROM contributions
             WHERE user_id = ?
             ORDER BY id DESC
             LIMIT ?
         """, (user_id, limit)) as cur:
-            return await cur.fetchall()
+            rows = await cur.fetchall()
+
+        result = []
+        path_cache = {}
+        for row in rows:
+            folder_id = row[7]
+            if folder_id not in path_cache:
+                try:
+                    path_cache[folder_id] = await get_breadcrumbs_inline(db, folder_id)
+                except Exception:
+                    path_cache[folder_id] = None
+            result.append(tuple(row) + (path_cache[folder_id],))
+        return result
     finally:
         await db.close()
 
@@ -1688,10 +1883,27 @@ async def add_sub_admin(telegram_id: int, username: str = None) -> bool:
     finally:
         await db.close()
 
-async def remove_sub_admin(telegram_id: int) -> bool:
+async def remove_sub_admin(telegram_id: int, reason: str = None) -> bool:
+    """Revoke an admin's access without deleting the row.
+
+    The row (and its username) is kept and the role is set to 'none' so the
+    account stops being an active admin; re-adding it restores the name. The
+    sole owner can never be revoked this way.
+    """
     db = await get_db()
     try:
-        await db.execute("DELETE FROM admins WHERE telegram_id = ?", (telegram_id,))
+        async with db.execute(
+            "SELECT role FROM admins WHERE telegram_id = ?", (telegram_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return False
+        if row[0] == "owner" and await _owner_count(db) <= 1:
+            return False
+
+        await db.execute(
+            "UPDATE admins SET role = 'none' WHERE telegram_id = ?", (telegram_id,)
+        )
         await db.commit()
         return True
     except Exception:
@@ -1699,19 +1911,75 @@ async def remove_sub_admin(telegram_id: int) -> bool:
     finally:
         await db.close()
 
-async def get_all_admins():
+
+async def admin_access_denied(telegram_id) -> bool:
+    """True when the account used to be an admin but was revoked."""
+    if not telegram_id or int(telegram_id) <= 0:
+        return False
     db = await get_db()
-    async with db.execute("SELECT telegram_id, username, added_at FROM admins ORDER BY added_at ASC") as cur:
+    try:
+        async with db.execute(
+            "SELECT role FROM admins WHERE telegram_id = ?", (int(telegram_id),)
+        ) as cur:
+            row = await cur.fetchone()
+    except Exception:
+        return False
+    finally:
+        await db.close()
+    return bool(row) and row[0] == "none"
+
+
+async def get_admins_full_records() -> list:
+    """Admin rows as RBAC dicts, including revoked ('none') rows."""
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT telegram_id FROM admins ORDER BY added_at ASC"
+        ) as cur:
+            ids = [row[0] for row in await cur.fetchall()]
+    except Exception:
+        return []
+    finally:
+        await db.close()
+
+    records = []
+    for telegram_id in ids:
+        record = await get_admin_record(telegram_id)
+        if record:
+            records.append(record)
+    return records
+
+async def get_all_admins():
+    """Active admins only (revoked 'none' rows are excluded)."""
+    db = await get_db()
+    async with db.execute(
+        "SELECT telegram_id, username, added_at FROM admins "
+        "WHERE role IS NULL OR role != 'none' "
+        "ORDER BY added_at ASC"
+    ) as cur:
         rows = await cur.fetchall()
     await db.close()
     return rows
 
 async def is_user_admin(telegram_id: int) -> bool:
+    """True when the user is an active admin.
+
+    A demoted row (role NULL/'none') is not an admin even though it still has
+    an entry in `admins`; the row is kept so a future re-grant keeps the
+    username. Roles are the source of truth once RBAC is enabled.
+    """
     db = await get_db()
-    async with db.execute("SELECT 1 FROM admins WHERE telegram_id = ?", (telegram_id,)) as cur:
+    async with db.execute(
+        "SELECT role FROM admins WHERE telegram_id = ?", (telegram_id,)
+    ) as cur:
         row = await cur.fetchone()
     await db.close()
-    return bool(row)
+    if not row:
+        return False
+    role = row[0]
+    if role is None:
+        return True
+    return role in ADMIN_ROLES
 
 
 # --- دوال الإدارة المتقدمة للمالك ---
@@ -1725,7 +1993,231 @@ async def ensure_configured_admin(telegram_id: int, username: str = None) -> boo
     if not telegram_id or int(telegram_id) <= 0:
         return False
 
-    return await add_sub_admin(int(telegram_id), username)
+    granted = await add_sub_admin(int(telegram_id), username)
+    if not granted:
+        return False
+
+    # The configured ID is the single owner identity: pin role + full perms.
+    # Any other row left holding 'owner' from a previous ADMIN_ID is demoted
+    # so exactly one owner can exist at a time.
+    try:
+        await db_demote_stale_owners(int(telegram_id))
+        await set_admin_role(int(telegram_id), "owner")
+        await update_admin_permissions(int(telegram_id), _default_permissions())
+    except Exception:
+        pass
+    return True
+
+
+async def db_demote_stale_owners(owner_id: int) -> None:
+    """Demote every admin holding 'owner' except `owner_id` to 'admin'."""
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE admins SET role = 'admin' "
+            "WHERE role = 'owner' AND telegram_id != ?",
+            (owner_id,),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+# ------------------------------------------------------------
+# RBAC helpers (extend the existing `admins` identity)
+# ------------------------------------------------------------
+async def get_admin_record(user_id):
+    """Return the admin row as a dict, or None when the user is not an admin."""
+    try:
+        db = await get_db()
+        try:
+            async with db.execute(
+                "SELECT telegram_id, username, added_at, role, permissions "
+                "FROM admins WHERE telegram_id = ?",
+                (user_id,),
+            ) as cur:
+                row = await cur.fetchone()
+        finally:
+            await db.close()
+    except Exception:
+        return None
+
+    if not row:
+        return None
+    return {
+        "telegram_id": row[0],
+        "username": row[1],
+        "added_at": row[2],
+        "role": row[3] or "admin",
+        "permissions_raw": row[4],
+        "permissions": permissions_from_string(row[4]),
+    }
+
+
+async def get_admin_permissions(user_id) -> dict:
+    """Resolved permission map for a user; all-False when not an active admin."""
+    record = await get_admin_record(user_id)
+    if not record or record["role"] == "none":
+        return {key: False for key in PERMISSION_KEYS}
+    if record["role"] == "owner":
+        return _default_permissions()
+    return record["permissions"]
+
+
+async def _owner_count(db) -> int:
+    async with db.execute(
+        "SELECT COUNT(*) FROM admins WHERE role = 'owner'"
+    ) as cur:
+        row = await cur.fetchone()
+    return row[0] if row else 0
+
+
+async def set_admin_role(user_id, role: str) -> bool:
+    """Set an admin's role. Unknown roles are rejected (no write).
+
+    The configured owner is pinned: demoting the only owner to a lesser role
+    is refused, so the owner cannot be turned into a sub-admin by accident.
+    Promoting another account to owner is allowed and leaves two owners until
+    the next `ensure_configured_admin()` run demotes the stale one.
+    """
+    if role not in ROLES:
+        return False
+    db = await get_db()
+    try:
+        if role != "owner":
+            async with db.execute(
+                "SELECT role FROM admins WHERE telegram_id = ?", (user_id,)
+            ) as cur:
+                row = await cur.fetchone()
+            if row and row[0] == "owner" and await _owner_count(db) <= 1:
+                return False
+
+        cur = await db.execute(
+            "UPDATE admins SET role = ? WHERE telegram_id = ?", (role, user_id)
+        )
+        await db.commit()
+        return cur.rowcount > 0
+    except Exception:
+        return False
+    finally:
+        await db.close()
+
+
+async def update_admin_permissions(user_id, permissions: dict) -> bool:
+    """Persist a permission map. Keys outside PERMISSION_KEYS are ignored."""
+    if not isinstance(permissions, dict):
+        return False
+    cleaned = {key: bool(permissions.get(key)) for key in PERMISSION_KEYS}
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "UPDATE admins SET permissions = ? WHERE telegram_id = ?",
+            (permissions_to_string(cleaned), user_id),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+    except Exception:
+        return False
+    finally:
+        await db.close()
+
+
+async def is_owner(user_id) -> bool:
+    """True only for the configured owner ID that holds the owner role.
+
+    Falls back to the stored role so an owner set by another path is honoured;
+    a missing ADMIN_ID (id 0) can never be an owner.
+    """
+    if not user_id or int(user_id) <= 0:
+        return False
+    record = await get_admin_record(user_id)
+    if not record:
+        return False
+    return record["role"] == "owner"
+
+
+async def user_has_permission(user_id, permission: str) -> bool:
+    """Capability check. Owner: always. Non-admin: never.
+
+    An admin whose stored permissions are empty (pre-migration rows) keeps
+    full access, so enabling RBAC does not revoke anything that already worked.
+    A revoked ('none') role never holds a permission.
+    """
+    if permission not in PERMISSION_KEYS:
+        return False
+    record = await get_admin_record(user_id)
+    if not record or record["role"] == "none":
+        return False
+    if record["role"] == "owner":
+        return True
+    return bool(record["permissions"].get(permission))
+
+
+# ------------------------------------------------------------
+# Audit log access (isolated: touches only `audit_log`)
+# ------------------------------------------------------------
+async def add_audit_entry(actor_id, actor_role, action, target_type=None,
+                          target_id=None, details=None) -> bool:
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO audit_log "
+            "(actor_id, actor_role, action, target_type, target_id, details) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (actor_id, actor_role, action, target_type,
+             None if target_id is None else str(target_id), details),
+        )
+        await db.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        await db.close()
+
+
+async def get_audit_entries(limit: int = 50, action: str = None, actor_id=None):
+    """Most recent audit rows first, optionally filtered."""
+    try:
+        limit = max(1, min(int(limit), 500))
+    except (TypeError, ValueError):
+        limit = 50
+
+    clauses, params = [], []
+    if action:
+        clauses.append("action = ?")
+        params.append(action)
+    if actor_id is not None:
+        clauses.append("actor_id = ?")
+        params.append(actor_id)
+
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    sql = (
+        "SELECT id, actor_id, actor_role, action, target_type, target_id, "
+        f"details, created_at FROM audit_log{where} "
+        "ORDER BY id DESC LIMIT ?"
+    )
+    params.append(limit)
+
+    db = await get_db()
+    try:
+        async with db.execute(sql, tuple(params)) as cur:
+            return await cur.fetchall()
+    except Exception:
+        return []
+    finally:
+        await db.close()
+
+
+async def get_audit_count() -> int:
+    db = await get_db()
+    try:
+        async with db.execute("SELECT COUNT(*) FROM audit_log") as cur:
+            row = await cur.fetchone()
+        return row[0] if row else 0
+    except Exception:
+        return 0
+    finally:
+        await db.close()
 
 
 async def add_sub_admin_by_any(identifier: str) -> tuple[bool, str]:

@@ -118,11 +118,13 @@ class FolderManagementTests(unittest.IsolatedAsyncioTestCase):
     async def test_created_section_appears_in_contribution_path(self):
         folder_id = await database.add_folder(0, "Contribs", "general", 1)
 
-        # Contribution flow only lists folders with accepts_contributions = 1.
+        # Contribution flow only offers folders that are targets themselves or
+        # lead to one; a freshly created accepting section must be reachable.
         import main
 
-        folders = await main.contribution_folders()
-        self.assertIn(folder_id, [f[0] for f in folders])
+        buttons = await main._contribution_browse_buttons(0)
+        callback_data = [b.callback_data for row in buttons for b in row]
+        self.assertIn(f"contrib_folder:{folder_id}", callback_data)
 
     async def test_admin_folder_menu_navigates_into_children(self):
         import main
