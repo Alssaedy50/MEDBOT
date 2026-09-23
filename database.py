@@ -157,6 +157,7 @@ async def init_db():
         await _migrate_v1(db)
         await _migrate_v2(db)
         await _migrate_v3(db)
+        await _migrate_v4(db)
 
         # ------------------------------------------------------------
         # Performance / integrity indexes
@@ -274,6 +275,264 @@ REVIEWABLE_STATUSES = ("pending", "needs_revision")
 MAX_CONTRIBUTION_TITLE_LENGTH = 200
 MAX_CONTRIBUTION_FILE_ID_LENGTH = 512
 CONTRIBUTION_FILE_TYPES = ("document", "audio", "video", "photo")
+
+
+async def _migrate_v4(db):
+    """Contact Admin messaging: isolated from content/contributions.
+
+    Creates the `messages` table if missing. Safe to re-run; never touches
+    or recreates existing tables.
+    """
+    try:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                user_name TEXT,
+                category TEXT NOT NULL DEFAULT 'message',
+                body TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'NEW',
+                admin_reply TEXT,
+                reviewed_by INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        logger.info("Migration v4: ensured messages table")
+    except Exception:
+        pass
+
+    try:
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_status
+            ON messages(status)
+        """)
+    except Exception:
+        pass
+
+    try:
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_user
+            ON messages(user_id)
+        """)
+    except Exception:
+        pass
+
+
+# Message categories and lifecycle states.
+MESSAGE_CATEGORIES = ("message", "summary", "suggestion", "report")
+MESSAGE_CATEGORY_LABELS = {
+    "message": "💬 رسالة",
+    "summary": "📑 ملخص",
+    "suggestion": "💡 اقتراح",
+    "report": "🚩 بلاغ",
+}
+MESSAGE_STATUSES = ("NEW", "IN_REVIEW", "REPLIED", "CLOSED")
+MESSAGE_OPEN_STATUSES = ("NEW", "IN_REVIEW")
+MESSAGE_STATUS_LABELS = {
+    "NEW": "🆕 جديدة",
+    "IN_REVIEW": "👀 قيد المراجعة",
+    "REPLIED": "✅ تم الرد",
+    "CLOSED": "🔒 مغلقة",
+}
+MAX_MESSAGE_BODY_LENGTH = 1500
+MAX_MESSAGE_REPLY_LENGTH = 1500
+
+
+async def create_message(user_id: int, user_name: str, category: str, body: str) -> int:
+    """Store a new student message. Raises MessageValidationError."""
+    if category not in MESSAGE_CATEGORIES:
+        raise MessageValidationError("⚠️ نوع الرسالة غير مدعوم.")
+
+    clean_body = (body or "").strip()
+
+    if not clean_body:
+        raise MessageValidationError("⚠️ لا يمكن إرسال رسالة فارغة.")
+
+    if len(clean_body) > MAX_MESSAGE_BODY_LENGTH:
+        raise MessageValidationError(
+            f"⚠️ الرسالة طويلة جداً. الحد الأقصى {MAX_MESSAGE_BODY_LENGTH} حرفاً."
+        )
+
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            """
+            INSERT INTO messages (user_id, user_name, category, body, status)
+            VALUES (?, ?, ?, ?, 'NEW')
+            """,
+            (user_id, user_name, category, clean_body),
+        )
+        message_id = cursor.lastrowid
+        await db.commit()
+        return message_id
+    finally:
+        await db.close()
+
+
+async def get_message(message_id: int):
+    db = await get_db()
+    try:
+        async with db.execute(
+            """
+            SELECT id, user_id, user_name, category, body, status,
+                   admin_reply, reviewed_by, created_at, updated_at
+            FROM messages
+            WHERE id = ?
+            """,
+            (message_id,),
+        ) as cur:
+            return await cur.fetchone()
+    finally:
+        await db.close()
+
+
+async def get_user_messages(user_id: int, limit: int = 20):
+    """Return a student's own messages, newest first."""
+    db = await get_db()
+    try:
+        async with db.execute(
+            """
+            SELECT id, category, body, status, admin_reply, created_at
+            FROM messages
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        ) as cur:
+            return await cur.fetchall()
+    finally:
+        await db.close()
+
+
+async def get_messages_by_status(status: str = None, limit: int = 50):
+    """Admin view: messages filtered by status, or all when status is None."""
+    db = await get_db()
+    try:
+        if status:
+            async with db.execute(
+                """
+                SELECT id, user_id, user_name, category, body, status, created_at
+                FROM messages
+                WHERE status = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (status, limit),
+            ) as cur:
+                return await cur.fetchall()
+
+        async with db.execute(
+            """
+            SELECT id, user_id, user_name, category, body, status, created_at
+            FROM messages
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cur:
+            return await cur.fetchall()
+    finally:
+        await db.close()
+
+
+async def get_open_messages_count() -> int:
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT COUNT(*) FROM messages WHERE status IN ('NEW', 'IN_REVIEW')"
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else 0
+    finally:
+        await db.close()
+
+
+async def reply_to_message(message_id: int, admin_id: int, reply: str) -> tuple:
+    """Record an admin reply and set status REPLIED. Atomic."""
+    clean_reply = (reply or "").strip()
+
+    if not clean_reply:
+        return None
+
+    if len(clean_reply) > MAX_MESSAGE_REPLY_LENGTH:
+        return None
+
+    db = await get_db()
+    try:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            "SELECT user_id, status FROM messages WHERE id = ?",
+            (message_id,),
+        ) as cur:
+            row = await cur.fetchone()
+
+        if not row:
+            await db.rollback()
+            return None
+
+        owner_id, status = row
+
+        if status == "CLOSED":
+            await db.rollback()
+            return None
+
+        await db.execute(
+            """
+            UPDATE messages
+            SET admin_reply = ?,
+                status = 'REPLIED',
+                reviewed_by = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status != 'CLOSED'
+            """,
+            (clean_reply, admin_id, message_id),
+        )
+        await db.commit()
+        return (owner_id, message_id)
+    except Exception:
+        await db.rollback()
+        raise
+    finally:
+        await db.close()
+
+
+async def set_message_status(message_id: int, status: str) -> bool:
+    """Move a message between lifecycle states."""
+    if status not in MESSAGE_STATUSES:
+        return False
+
+    db = await get_db()
+    try:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            "SELECT 1 FROM messages WHERE id = ?",
+            (message_id,),
+        ) as cur:
+            if not await cur.fetchone():
+                await db.rollback()
+                return False
+
+        await db.execute(
+            """
+            UPDATE messages
+            SET status = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (status, message_id),
+        )
+        await db.commit()
+        return True
+    except Exception:
+        await db.rollback()
+        raise
+    finally:
+        await db.close()
+
+
+class MessageValidationError(Exception):
+    """Raised when a message fails basic validation."""
 
 async def register_user(user_id: int, username: str = None, full_name: str = None):
     db = await get_db()
