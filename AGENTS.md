@@ -89,9 +89,39 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
   `TELEGRAM_TEXT_LIMIT` on a line boundary. An oversized `edit_message_text`
   raises and would otherwise leave the caller on a blank, stale screen.
 
+## Platform update subsystems (v9/v10)
+- Migrations are additive: `_migrate_v9` creates `topics`/`topic_folders`;
+  `_migrate_v10` creates `notifications` and adds `users.language`. Never
+  rewrite v1..v8.
+- `i18n.py` is the only localization table. Callers use `i18n.t(key, lang)`;
+  never branch on the language in a handler. Adding a language = extend
+  `_TRANSLATIONS` + `database.SUPPORTED_LANGUAGES`.
+- `platform_settings.py` edits persisted user-facing strings via
+  `database.get_platform_setting`/`set_platform_setting`. Defaults live in
+  `PLATFORM_SETTING_DEFAULTS`; unset keys fall back there, never to a crash.
+  `messaging._contact_label()` reads the configurable contact label.
+- `topics.py` is the Search Topics surface: high-level academic areas linked to
+  folders (`database.link_topic_folder`). Deleting a topic cascades only its
+  links — folders/resources are untouched.
+- `notifications.py` broadcasts to `database.get_all_user_ids()`; per-recipient
+  failures are non-fatal and every send is recorded via `record_notification`.
+- New permission keys: `can_notifications`, `can_settings`, `can_topics`
+  (added to `PERMISSION_KEYS`/labels). The admin panel shows each surface only
+  when the caller holds it; `show_admin` also appends a Runtime row.
+- Ownership transfer: `database.transfer_ownership(current, new)` is atomic and
+  guarantees exactly one owner. It persists `SETTING_OWNER_ID`.
+  `ensure_configured_admin` respects a transferred owner on a same-ADMIN_ID
+  restart (tracked via `SETTING_CONFIGURED_ADMIN`) but re-asserts the owner
+  when ADMIN_ID genuinely changes.
+- Message persistence: `send_safe_message`, search results and resource
+  messages register their ids via `main._register_content_message`.
+  `edit_safe` sends a NEW message instead of editing when the target is
+  registered content, so a navigation tap can never erase a delivered answer.
+  Temporary menus are the only messages edited in place (`CONTENT_MENU_KEY`).
+
 ## Testing
 - `python -m py_compile` all modules.
-- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance`
+- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update`
 - `test_db_patch.py` needs a real `medbot_v2.sqlite3`; it is skipped locally
   when absent.
 - Tests must exercise real code paths against temporary SQLite; no mocks.

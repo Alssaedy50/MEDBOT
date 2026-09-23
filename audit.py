@@ -47,6 +47,15 @@ AUDIT_ACTIONS = (
     "admin_role",
     "admin_permissions",
     "owner_bootstrap",
+    "ownership_transfer",
+    "platform_setting",
+    "topic_create",
+    "topic_link",
+    "topic_unlink",
+    "topic_toggle",
+    "topic_delete",
+    "notification_send",
+    "language_set",
 )
 
 ACTION_LABELS = {
@@ -71,6 +80,15 @@ ACTION_LABELS = {
     "admin_role": "👑 تغيير دور",
     "admin_permissions": "🔐 تغيير صلاحيات",
     "owner_bootstrap": "🔑 تهيئة المالك",
+    "ownership_transfer": "👑 نقل الملكية",
+    "platform_setting": "⚙️ تعديل إعداد المنصة",
+    "topic_create": "🧭 إنشاء موضوع",
+    "topic_link": "🔗 ربط قسم بموضوع",
+    "topic_unlink": "✂️ إزالة رابط موضوع",
+    "topic_toggle": "🔀 تفعيل/تعطيل موضوع",
+    "topic_delete": "🗑 حذف موضوع",
+    "notification_send": "🔔 إرسال إشعار",
+    "language_set": "🌐 تغيير اللغة",
 }
 
 

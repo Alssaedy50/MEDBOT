@@ -172,6 +172,8 @@ async def init_db():
         await _migrate_v6(db)
         await _migrate_v7(db)
         await _migrate_v8(db)
+        await _migrate_v9(db)
+        await _migrate_v10(db)
 
         # ------------------------------------------------------------
         # Performance / integrity indexes
@@ -423,6 +425,9 @@ PERMISSION_KEYS = (
     "can_messages",
     "can_ai",
     "can_admins",
+    "can_notifications",
+    "can_settings",
+    "can_topics",
 )
 
 # Stored in `admins.permissions` to mean "explicitly granted nothing". An empty
@@ -436,6 +441,22 @@ PERMISSION_LABELS = {
     "can_messages": "📬 رسائل الطلاب",
     "can_ai": "🤖 الذكاء الاصطناعي",
     "can_admins": "👥 إدارة المشرفين",
+    "can_notifications": "🔔 الإشعارات",
+    "can_settings": "⚙️ إعدادات المنصة",
+    "can_topics": "🧭 مواضيع البحث",
+}
+
+# Short labels for the compact permission toggles in admin_management.
+PERMISSION_SHORT_LABELS = {
+    "can_folders": "الأقسام",
+    "can_content": "المحتوى",
+    "can_contributions": "المساهمات",
+    "can_messages": "الرسائل",
+    "can_ai": "الذكاء",
+    "can_admins": "المشرفون",
+    "can_notifications": "الإشعارات",
+    "can_settings": "الإعدادات",
+    "can_topics": "المواضيع",
 }
 
 ROLE_LABELS = {
@@ -444,6 +465,64 @@ ROLE_LABELS = {
     "reviewer": "🔎 مراجع",
     "none": "⛔ مُلغى",
 }
+
+# ------------------------------------------------------------
+# Platform settings (admin-editable identity / interface content)
+# ------------------------------------------------------------
+# Stored in the existing `settings` key/value table so no schema change is
+# needed and unset keys fall back to a sensible default (existing installs
+# keep working unchanged). OWNER always has access; sub-admins need
+# `can_settings`.
+PLATFORM_SETTING_KEYS = (
+    "platform_name",
+    "platform_about",
+    "welcome_message",
+    "help_text",
+    "contact_text",
+)
+
+PLATFORM_SETTING_DEFAULTS = {
+    "platform_name": "MEDBOT",
+    "platform_about": (
+        "MEDBOT منصة أكاديمية طبية عبر Telegram لتنظيم والوصول إلى "
+        "الموارد التعليمية الطبية المسجلة."
+    ),
+    "welcome_message": "مرحباً بك في MEDBOT.",
+    "help_text": (
+        "استخدم 📚 الموارد للوصول إلى المكتبة، و🔎 البحث للبحث داخل "
+        "الموارد المسجلة، و🤖 المساعد للأسئلة الطبية."
+    ),
+    "contact_text": "تواصل مع المنصة",
+}
+
+PLATFORM_SETTING_LABELS = {
+    "platform_name": "🏷 اسم المنصة",
+    "platform_about": "ℹ️ نبذة عن المنصة",
+    "welcome_message": "👋 رسالة الترحيب",
+    "help_text": "❓ نص المساعدة",
+    "contact_text": "📮 نص التواصل",
+}
+
+SETTINGS_MAX_LENGTH = 1500
+
+# ------------------------------------------------------------
+# User language preference (i18n)
+# ------------------------------------------------------------
+SUPPORTED_LANGUAGES = ("ar", "en")
+DEFAULT_LANGUAGE = "ar"
+LANGUAGE_LABELS = {
+    "ar": "🇸🇦 العربية",
+    "en": "🇬🇧 English",
+}
+
+# Persisted owner identity. Set by an explicit ownership transfer so a
+# restart (which re-asserts ADMIN_ID) can never silently revert the transfer.
+SETTING_OWNER_ID = "owner_id"
+
+# The ADMIN_ID that was last bootstrapped. Lets a restart (same configured id)
+# preserve an explicit ownership transfer, while a genuine ADMIN_ID change
+# still re-asserts the newly configured owner.
+SETTING_CONFIGURED_ADMIN = "configured_admin_id"
 
 
 def _default_permissions() -> dict:
@@ -517,6 +596,108 @@ async def _migrate_v8(db):
             logger.info("Migration v8: added %s.%s", table, column)
         except Exception:
             pass
+
+
+async def _migrate_v9(db):
+    """Search Topics (مواضيع البحث): high-level academic entry points.
+
+    Two new tables, isolated from the folder/content tree:
+      * `topics`         — a named, ordered, optionally hidden topic
+      * `topic_folders`  — many-to-many link from a topic to folders
+
+    A topic connects to registered resources through the folders it points
+    at; deleting a topic or a folder only removes the link rows
+    (`ON DELETE CASCADE`), never the folders or their resources. Safe to
+    re-run; never rewrites existing data.
+    """
+    try:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS topics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT NULL,
+                icon TEXT DEFAULT NULL,
+                display_order INTEGER DEFAULT 0,
+                active INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        logger.info("Migration v9: ensured topics table")
+    except Exception:
+        pass
+
+    try:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS topic_folders (
+                topic_id INTEGER NOT NULL,
+                folder_id INTEGER NOT NULL,
+                PRIMARY KEY (topic_id, folder_id),
+                FOREIGN KEY (topic_id) REFERENCES topics (id) ON DELETE CASCADE,
+                FOREIGN KEY (folder_id) REFERENCES folders (id) ON DELETE CASCADE
+            )
+        """)
+        logger.info("Migration v9: ensured topic_folders table")
+    except Exception:
+        pass
+
+    for index_name, ddl in (
+        (
+            "idx_topics_order",
+            "CREATE INDEX IF NOT EXISTS idx_topics_order "
+            "ON topics(active, display_order, id)",
+        ),
+        (
+            "idx_topic_folders_folder",
+            "CREATE INDEX IF NOT EXISTS idx_topic_folders_folder "
+            "ON topic_folders(folder_id)",
+        ),
+    ):
+        try:
+            await db.execute(ddl)
+        except Exception:
+            pass
+
+
+async def _migrate_v10(db):
+    """Notifications log + per-user language preference.
+
+    `notifications` records an admin broadcast and its delivery count so the
+    feature is durably auditable (and can be surfaced in the admin panel).
+    `users.language` is nullable so every existing row defaults to Arabic and
+    no data is rewritten. Safe to re-run.
+    """
+    try:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_id INTEGER,
+                title TEXT,
+                body TEXT NOT NULL,
+                audience TEXT NOT NULL DEFAULT 'all',
+                recipients INTEGER DEFAULT 0,
+                delivered INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        logger.info("Migration v10: ensured notifications table")
+    except Exception:
+        pass
+
+    try:
+        await db.execute(
+            "ALTER TABLE users ADD COLUMN language TEXT DEFAULT NULL"
+        )
+        logger.info("Migration v10: added users.language")
+    except Exception:
+        pass
+
+    try:
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notifications_created "
+            "ON notifications(created_at)"
+        )
+    except Exception:
+        pass
 
 # Message categories and lifecycle states.
 MESSAGE_CATEGORIES = ("message", "summary", "suggestion", "report")
@@ -1073,6 +1254,19 @@ async def is_descendant(db, ancestor_id: int, folder_id: int) -> bool:
             break
         current = row[0]
     return False
+
+async def is_descendant_of(ancestor_id: int, folder_id: int) -> bool:
+    """True when `folder_id` is `ancestor_id` itself or lies beneath it.
+
+    Convenience wrapper that owns its connection, for callers outside this
+    module (e.g. the move-destination picker) that must not manage a handle.
+    """
+    db = await get_db()
+    try:
+        return await is_descendant(db, ancestor_id, folder_id)
+    finally:
+        await db.close()
+
 
 async def move_folder(folder_id: int, new_parent_id: int) -> tuple[bool, str]:
     db = await get_db()
@@ -1669,6 +1863,361 @@ async def set_setting(key: str, value: str):
     await db.commit()
     await db.close()
 
+
+# ------------------------------------------------------------
+# Platform settings
+# ------------------------------------------------------------
+async def get_platform_setting(key: str, default: str = None) -> str:
+    """Resolve a platform setting, falling back to the built-in default.
+
+    Unconfigured installations (no row in `settings`) return the default, so
+    every existing install keeps working without a migration step.
+    """
+    fallback = PLATFORM_SETTING_DEFAULTS.get(key) if default is None else default
+    try:
+        value = await get_setting(key)
+    except Exception:
+        return fallback
+    if value is None or not str(value).strip():
+        return fallback
+    return value
+
+
+async def get_platform_settings() -> dict:
+    """All platform settings resolved to their effective values."""
+    return {
+        key: await get_platform_setting(key)
+        for key in PLATFORM_SETTING_KEYS
+    }
+
+
+async def set_platform_setting(key: str, value: str) -> bool:
+    """Persist one platform setting. Unknown keys are rejected."""
+    if key not in PLATFORM_SETTING_KEYS:
+        return False
+    text = (value or "").strip()
+    if not text or len(text) > SETTINGS_MAX_LENGTH:
+        return False
+    try:
+        await set_setting(key, text)
+        return True
+    except Exception:
+        logger.exception("set_platform_setting failed for %s", key)
+        return False
+
+
+# ------------------------------------------------------------
+# User language preference
+# ------------------------------------------------------------
+async def get_user_language(user_id) -> str:
+    """Resolve a user's stored language, defaulting to Arabic."""
+    try:
+        db = await get_db()
+        try:
+            async with db.execute(
+                "SELECT language FROM users WHERE user_id = ?", (user_id,)
+            ) as cur:
+                row = await cur.fetchone()
+        finally:
+            await db.close()
+    except Exception:
+        return DEFAULT_LANGUAGE
+
+    if row and row[0] in SUPPORTED_LANGUAGES:
+        return row[0]
+    return DEFAULT_LANGUAGE
+
+
+async def set_user_language(user_id, language: str) -> bool:
+    """Persist a user's language preference. Unknown languages are rejected."""
+    if language not in SUPPORTED_LANGUAGES:
+        return False
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "UPDATE users SET language = ? WHERE user_id = ?",
+            (language, int(user_id)),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+    except Exception:
+        logger.exception("set_user_language failed for %s", user_id)
+        return False
+    finally:
+        await db.close()
+
+
+# ------------------------------------------------------------
+# Search Topics
+# ------------------------------------------------------------
+def _topic_row_to_dict(row) -> dict:
+    return {
+        "id": row[0],
+        "name": row[1],
+        "description": row[2],
+        "icon": row[3] or "🧭",
+        "display_order": row[4] or 0,
+        "active": bool(row[5]),
+    }
+
+
+async def get_topics(active_only: bool = False) -> list:
+    """Topics in display order. `active_only` hides deactivated topics."""
+    db = await get_db()
+    try:
+        sql = (
+            "SELECT id, name, description, icon, display_order, active "
+            "FROM topics"
+        )
+        if active_only:
+            sql += " WHERE active = 1"
+        sql += " ORDER BY display_order ASC, id ASC"
+        async with db.execute(sql) as cur:
+            return [_topic_row_to_dict(row) for row in await cur.fetchall()]
+    finally:
+        await db.close()
+
+
+async def get_topic(topic_id) -> dict:
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT id, name, description, icon, display_order, active "
+            "FROM topics WHERE id = ?",
+            (int(topic_id),),
+        ) as cur:
+            row = await cur.fetchone()
+        return _topic_row_to_dict(row) if row else None
+    finally:
+        await db.close()
+
+
+async def add_topic(name: str, description: str = None, icon: str = None,
+                    display_order: int = 0) -> int:
+    """Create a topic. Returns the new id, or None on invalid input."""
+    name = (name or "").strip()
+    if not name or len(name) > 120:
+        return None
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO topics (name, description, icon, display_order, active) "
+            "VALUES (?, ?, ?, ?, 1)",
+            (name, description, icon or "🧭", int(display_order or 0)),
+        )
+        await db.commit()
+        return cursor.lastrowid
+    finally:
+        await db.close()
+
+
+async def update_topic(topic_id, name: str = None, description: str = None,
+                       icon: str = None, display_order=None, active=None) -> bool:
+    """Update the supplied topic fields only."""
+    fields, params = [], []
+    if name is not None:
+        name = name.strip()
+        if not name or len(name) > 120:
+            return False
+        fields.append("name = ?")
+        params.append(name)
+    if description is not None:
+        fields.append("description = ?")
+        params.append(description)
+    if icon is not None:
+        fields.append("icon = ?")
+        params.append(icon)
+    if display_order is not None:
+        fields.append("display_order = ?")
+        params.append(int(display_order))
+    if active is not None:
+        fields.append("active = ?")
+        params.append(1 if active else 0)
+
+    if not fields:
+        return False
+
+    params.append(int(topic_id))
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            f"UPDATE topics SET {', '.join(fields)} WHERE id = ?",
+            tuple(params),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def delete_topic(topic_id) -> bool:
+    """Remove a topic. Folder links cascade; folders/resources are untouched."""
+    db = await get_db()
+    try:
+        cur = await db.execute("DELETE FROM topics WHERE id = ?", (int(topic_id),))
+        await db.commit()
+        return cur.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def link_topic_folder(topic_id, folder_id) -> bool:
+    """Associate a folder (and thus its resources) with a topic."""
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT id FROM folders WHERE id = ?", (int(folder_id),)
+        ) as cur:
+            if not await cur.fetchone():
+                return False
+        await db.execute(
+            "INSERT OR IGNORE INTO topic_folders (topic_id, folder_id) "
+            "VALUES (?, ?)",
+            (int(topic_id), int(folder_id)),
+        )
+        await db.commit()
+        return True
+    finally:
+        await db.close()
+
+
+async def unlink_topic_folder(topic_id, folder_id) -> bool:
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "DELETE FROM topic_folders WHERE topic_id = ? AND folder_id = ?",
+            (int(topic_id), int(folder_id)),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def get_topic_folders(topic_id) -> list:
+    """Folders linked to a topic, as the same shape `get_folders` returns."""
+    db = await get_db()
+    try:
+        async with db.execute(
+            """
+            SELECT f.id, f.name, f.node_type, f.accepts_contributions
+            FROM topic_folders tf
+            JOIN folders f ON f.id = tf.folder_id
+            WHERE tf.topic_id = ?
+            ORDER BY f.id ASC
+            """,
+            (int(topic_id),),
+        ) as cur:
+            return await cur.fetchall()
+    finally:
+        await db.close()
+
+
+async def topic_resource_count(topic_id) -> int:
+    """Number of registered resources reachable from a topic.
+
+    Counts every content row in any linked folder or its descendants, so a
+    topic reports the real size of its academic area.
+    """
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT folder_id FROM topic_folders WHERE topic_id = ?",
+            (int(topic_id),),
+        ) as cur:
+            roots = [row[0] for row in await cur.fetchall()]
+
+        total = 0
+        visited = set()
+        pending = list(roots)
+        while pending:
+            current = pending.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            async with db.execute(
+                "SELECT COUNT(*) FROM content WHERE folder_id = ?", (current,)
+            ) as cur:
+                total += (await cur.fetchone())[0]
+            async with db.execute(
+                "SELECT id FROM folders WHERE parent_id = ?", (current,)
+            ) as cur:
+                pending.extend(row[0] for row in await cur.fetchall())
+        return total
+    finally:
+        await db.close()
+
+
+# ------------------------------------------------------------
+# Notifications log
+# ------------------------------------------------------------
+async def record_notification(sender_id, title: str, body: str,
+                              audience: str = "all", recipients: int = 0,
+                              delivered: int = 0) -> int:
+    """Persist a sent notification. Returns its id, or None on failure."""
+    body = (body or "").strip()
+    if not body:
+        return None
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO notifications "
+            "(sender_id, title, body, audience, recipients, delivered) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (sender_id, (title or "").strip() or None, body, audience,
+             int(recipients), int(delivered)),
+        )
+        await db.commit()
+        return cursor.lastrowid
+    finally:
+        await db.close()
+
+
+async def get_notifications(limit: int = 20) -> list:
+    """Most recent notifications first."""
+    try:
+        limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        limit = 20
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT id, sender_id, title, body, audience, recipients, "
+            "delivered, created_at FROM notifications "
+            "ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            return await cur.fetchall()
+    finally:
+        await db.close()
+
+
+async def get_notifications_count() -> int:
+    db = await get_db()
+    try:
+        async with db.execute("SELECT COUNT(*) FROM notifications") as cur:
+            row = await cur.fetchone()
+        return row[0] if row else 0
+    finally:
+        await db.close()
+
+
+async def get_all_user_languages() -> dict:
+    """Map user_id -> language for every user (default when unset)."""
+    db = await get_db()
+    try:
+        async with db.execute("SELECT user_id, language FROM users") as cur:
+            rows = await cur.fetchall()
+    finally:
+        await db.close()
+    result = {}
+    for user_id, language in rows:
+        result[user_id] = (
+            language if language in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
+        )
+    return result
+
+
 async def ai_registry_add(provider: str, model: str = None, endpoint: str = None, availability: str = None, auth_status: str = None, latency_ms: float = None, success_rate: float = None, capabilities: str = None, notes: str = None):
     """Idempotently register an AI provider/model/endpoint.
 
@@ -1989,11 +2538,36 @@ async def ensure_configured_admin(telegram_id: int, username: str = None) -> boo
     Returns True when the configured admin is already present or was added.
     Passing telegram_id <= 0 is a no-op so a missing ADMIN_ID never grants
     privileges to an arbitrary (or the first) user.
+
+    A persisted owner id (set by an explicit ownership transfer) takes
+    precedence for a *restart with the same ADMIN_ID*: the transfer must not be
+    silently reverted. A genuine ADMIN_ID change (a different configured id, or
+    the first bootstrap) still re-asserts the newly configured owner.
     """
     if not telegram_id or int(telegram_id) <= 0:
         return False
 
-    granted = await add_sub_admin(int(telegram_id), username)
+    telegram_id = int(telegram_id)
+    persisted_owner = await get_persisted_owner_id()
+
+    try:
+        configured_raw = await get_setting(SETTING_CONFIGURED_ADMIN)
+        last_configured = int(str(configured_raw).strip())
+    except Exception:
+        last_configured = 0
+
+    # Restart with an unchanged ADMIN_ID after an explicit transfer:
+    # keep the transferred owner, never re-assert the old configured id.
+    if (
+        persisted_owner
+        and persisted_owner != telegram_id
+        and last_configured == telegram_id
+    ):
+        if not await is_user_admin(telegram_id):
+            await add_sub_admin(telegram_id, username)
+        return True
+
+    granted = await add_sub_admin(telegram_id, username)
     if not granted:
         return False
 
@@ -2001,12 +2575,101 @@ async def ensure_configured_admin(telegram_id: int, username: str = None) -> boo
     # Any other row left holding 'owner' from a previous ADMIN_ID is demoted
     # so exactly one owner can exist at a time.
     try:
-        await db_demote_stale_owners(int(telegram_id))
-        await set_admin_role(int(telegram_id), "owner")
-        await update_admin_permissions(int(telegram_id), _default_permissions())
+        await db_demote_stale_owners(telegram_id)
+        await set_admin_role(telegram_id, "owner")
+        await update_admin_permissions(telegram_id, _default_permissions())
+        await set_setting(SETTING_OWNER_ID, str(telegram_id))
+        await set_setting(SETTING_CONFIGURED_ADMIN, str(telegram_id))
     except Exception:
         pass
     return True
+
+
+async def get_persisted_owner_id() -> int:
+    """Return the persisted owner id (0 when unset/invalid)."""
+    try:
+        raw = await get_setting(SETTING_OWNER_ID)
+    except Exception:
+        return 0
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
+async def transfer_ownership(current_owner_id, new_owner_id) -> tuple[bool, str]:
+    """Atomically transfer ownership from the current owner to another admin.
+
+    Guarantees a valid owner at all times:
+      * only the active owner may transfer;
+      * the target must be an existing, active (non-revoked) admin;
+      * the target cannot already be the owner;
+      * the previous owner is demoted to `admin` (never left owner-less).
+
+    Persists the new owner id so a restart cannot silently revert it.
+    Returns (ok, message).
+    """
+    db = await get_db()
+    try:
+        if not current_owner_id or not new_owner_id:
+            return False, "معرّف غير صالح."
+
+        if int(current_owner_id) == int(new_owner_id):
+            return False, "لا يمكن نقل الملكية إلى المالك الحالي."
+
+        async with db.execute(
+            "SELECT role FROM admins WHERE telegram_id = ?",
+            (int(current_owner_id),),
+        ) as cur:
+            actor = await cur.fetchone()
+        if not actor or actor[0] != "owner":
+            return False, "نقل الملكية متاح للمالك الحالي فقط."
+
+        async with db.execute(
+            "SELECT role FROM admins WHERE telegram_id = ?",
+            (int(new_owner_id),),
+        ) as cur:
+            target = await cur.fetchone()
+        if not target or target[0] not in ADMIN_ROLES:
+            return False, "الحساب الهدف ليس مشرفاً نشطاً."
+
+        if target[0] == "owner":
+            return False, "هذا الحساب هو المالك بالفعل."
+
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await db.execute(
+                "UPDATE admins SET role = 'owner', permissions = '' "
+                "WHERE telegram_id = ?",
+                (int(new_owner_id),),
+            )
+            await db.execute(
+                "UPDATE admins SET role = 'admin' WHERE telegram_id = ?",
+                (int(current_owner_id),),
+            )
+            # Exactly one owner must remain.
+            await db.execute(
+                "UPDATE admins SET role = 'admin' "
+                "WHERE role = 'owner' AND telegram_id NOT IN (?, ?)",
+                (int(new_owner_id), int(current_owner_id)),
+            )
+            await db.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (SETTING_OWNER_ID, str(int(new_owner_id))),
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
+        return True, "تم نقل الملكية بنجاح."
+    except Exception:
+        logger.exception("transfer_ownership failed")
+        return False, "تعذّر نقل الملكية."
+    finally:
+        await db.close()
 
 
 async def db_demote_stale_owners(owner_id: int) -> None:

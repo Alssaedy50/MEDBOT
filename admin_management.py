@@ -130,12 +130,20 @@ async def show_admin_detail(query, target_id):
     ]
 
     rows = []
+    perm_buttons = []
     for key in database.PERMISSION_KEYS:
         granted = bool(record["permissions"].get(key))
         mark = "✅" if granted else "⛔"
+        short = database.PERMISSION_SHORT_LABELS.get(
+            key, database.PERMISSION_LABELS.get(key, key)
+        )
         lines.append(f"{mark} {esc(database.PERMISSION_LABELS.get(key, key))}")
-        rows.append([btn(f"{mark} {database.PERMISSION_LABELS.get(key, key)}",
-                         f"amg_perm:{target_id}:{key}")])
+        perm_buttons.append(btn(f"{mark} {short}", f"amg_perm:{target_id}:{key}"))
+
+    # Two toggles per row keeps the keyboard inside Telegram's width and
+    # avoids a very tall menu now that the permission set is larger.
+    for i in range(0, len(perm_buttons), 2):
+        rows.append(perm_buttons[i:i + 2])
 
     lines.append("\n👑 <b>الدور</b>")
     for role in database.ROLES:
@@ -143,11 +151,103 @@ async def show_admin_detail(query, target_id):
         mark = "✅" if record["role"] == role else "▫️"
         rows.append([btn(f"{mark} {label}", f"amg_role:{target_id}:{role}")])
 
+    # Ownership transfer is a distinct, owner-only operation: it swaps two
+    # roles atomically so the platform is never left without an owner.
+    if await database.is_owner(query.from_user.id) and record["role"] != "owner":
+        rows.append([btn("👑 نقل الملكية", f"amg_transfer:{target_id}")])
+
     rows.append([btn("🗑 إزالة المشرف", f"amg_remove:{target_id}")])
     rows.append([btn("⬅️ إدارة المشرفين", "amg_list")])
     rows.append([btn("🏠 الرئيسية", "home")])
 
     await _edit(query, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+async def confirm_transfer(query, target_id):
+    """Owner-only confirmation screen before an ownership transfer."""
+    if not await database.is_owner(query.from_user.id):
+        await _edit(query, "🔒 نقل الملكية متاح للمالك فقط.", _home_keyboard())
+        return
+
+    record = await database.get_admin_record(target_id)
+    if not record:
+        await _edit(
+            query,
+            "⚠️ المشرف غير موجود.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة المشرفين", "amg_list")]]),
+        )
+        return
+
+    if record["role"] == "owner":
+        await _edit(
+            query,
+            "ℹ️ هذا الحساب هو المالك بالفعل.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة المشرفين", "amg_list")]]),
+        )
+        return
+
+    if record["role"] not in database.ADMIN_ROLES:
+        await _edit(
+            query,
+            "⚠️ لا يمكن نقل الملكية إلى حساب ملغى.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة المشرفين", "amg_list")]]),
+        )
+        return
+
+    name = str(record.get("username") or "").strip() or "بدون اسم"
+    await _edit(
+        query,
+        "👑 <b>نقل الملكية</b>\n\n"
+        f"سيصبح الحساب <code>{esc(target_id)}</code> ({esc(name)}) "
+        "هو المالك الجديد، وسيتحوّل دورك إلى «مشرف».\n\n"
+        "هل تريد المتابعة؟",
+        InlineKeyboardMarkup(
+            [
+                [btn("✅ تأكيد نقل الملكية", f"amg_transfer_confirm:{target_id}")],
+                [btn("❌ إلغاء", f"amg_view:{target_id}")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
+async def execute_transfer(query, target_id):
+    if not await database.is_owner(query.from_user.id):
+        await _edit(query, "🔒 نقل الملكية متاح للمالك فقط.", _home_keyboard())
+        return
+
+    ok, message = await database.transfer_ownership(
+        query.from_user.id, target_id
+    )
+
+    if not ok:
+        await _edit(
+            query,
+            f"⚠️ {esc(message)}",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة المشرفين", "amg_list")]]),
+        )
+        return
+
+    await audit.log_action(
+        query.from_user.id,
+        "ownership_transfer",
+        target_type="admin",
+        target_id=target_id,
+    )
+
+    await _edit(
+        query,
+        "✅ <b>تم نقل الملكية بنجاح.</b>\n\n"
+        f"👑 المالك الجديد: <code>{esc(target_id)}</code>\n"
+        "🛡 دورك الحالي: مشرف\n\n"
+        "سيتم تطبيق دور المالك الجديد الكامل من هذه اللحظة.",
+        InlineKeyboardMarkup(
+            [
+                [btn("👥 إدارة المشرفين", "amg_list")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
 
 
 async def toggle_permission(query, target_id, permission):
@@ -406,6 +506,24 @@ async def admin_management_callback_handler(update, context: ContextTypes.DEFAUL
         await change_role(query, target_id, parts[2])
         return
 
+    if data.startswith("amg_transfer_confirm:"):
+        try:
+            target_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await _edit(query, "⚠️ معرف غير صالح.", _home_keyboard())
+            return
+        await execute_transfer(query, target_id)
+        return
+
+    if data.startswith("amg_transfer:"):
+        try:
+            target_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await _edit(query, "⚠️ معرف غير صالح.", _home_keyboard())
+            return
+        await confirm_transfer(query, target_id)
+        return
+
     if data.startswith("amg_remove:"):
         try:
             target_id = int(data.split(":", 1)[1])
@@ -424,6 +542,6 @@ def register_admin_management_handlers(app):
     app.add_handler(
         CallbackQueryHandler(
             admin_management_callback_handler,
-            pattern=r"^(amg_list|amg_add|amg_view:|amg_perm:|amg_role:|amg_remove:)",
+            pattern=r"^(amg_list|amg_add|amg_view:|amg_perm:|amg_role:|amg_remove:|amg_transfer)",
         )
     )
