@@ -130,12 +130,36 @@ async def send_safe_message(update: Update, text: str, reply_markup=None):
                     await asyncio.sleep(1)
 
 
+# Telegram rejects messages longer than this; leave markdown headroom.
+TELEGRAM_TEXT_LIMIT = 4000
+
+
+def _clamp_text(text, limit=TELEGRAM_TEXT_LIMIT):
+    """Keep an inline-edit payload inside Telegram's hard 4096-char limit.
+
+    Exceeding it makes `edit_message_text` raise, which would otherwise leave
+    the caller staring at a stale screen with no hint of what happened.
+    """
+    if len(text) <= limit:
+        return text
+
+    logger.warning("Clamped oversized message (%d chars) to %d", len(text), limit)
+    body = text[:limit]
+    if "\n" in body:
+        # Never end mid-line: a dangling markdown entity fails to parse.
+        body = body.rsplit("\n", 1)[0]
+    return body + "\n\n… (تم اختصار العرض لطوله)"
+
+
 async def edit_safe(query, text, reply_markup=None, parse_mode=ParseMode.MARKDOWN):
     """Safely edit an inline message.
 
     Falls back to plain text if the requested parse mode fails, so a
     malformed entity can never leave the caller stuck on a stale screen.
+    Oversized text is clamped rather than dropped.
     """
+    text = _clamp_text(text or "")
+
     for mode in (parse_mode, None):
         try:
             await query.edit_message_text(
@@ -777,11 +801,15 @@ async def show_my_contributions(query):
                 rejection_reason,
                 review_note,
             ) = item[:7]
+            folder_path = item[8] if len(item) > 8 else None
         except Exception:
             continue
 
         label = CONTRIBUTION_STATUS_LABELS.get(status, status)
         lines.append(f"🆔 `{contribution_id}` — {label}\n📄 {title}")
+
+        if folder_path:
+            lines.append(f"📍 {folder_path}")
 
         if status == "needs_revision" and review_note:
             lines.append(f"✏️ الملاحظات: {review_note}")
@@ -874,59 +902,104 @@ async def begin_resubmission(query, context, contribution_id):
     )
 
 
-async def contribution_folders():
-    db = await database.get_db()
+async def _contribution_browse_buttons(parent_id):
+    """Buttons for one level of the contribution wizard.
 
+    Only folders that can lead to a contribution target (or are themselves a
+    target) are shown, so students are never led into a dead branch. Each
+    button is prefixed with its path so identically named subjects in
+    different blocks are distinguishable.
+    """
     try:
-        sql = """
-            SELECT id, name, node_type
-            FROM folders
-            WHERE accepts_contributions = 1
-            ORDER BY id ASC
-        """
-
-        async with db.execute(sql) as cursor:
-            return await cursor.fetchall()
-    finally:
-        await db.close()
-
-
-async def show_contribute(query):
-    try:
-        folders = await contribution_folders()
+        children = await database.get_folders(parent_id)
     except Exception:
-        folders = []
+        logger.exception("Contribution browse failed")
+        children = []
 
     buttons = []
+    name_counts = {}
+    rows = []
+    for folder in children:
+        try:
+            folder_id, name, _node_type = folder[:3]
+        except Exception:
+            continue
 
-    for folder in folders:
-        folder_id, name, node_type = folder
+        try:
+            is_target = await database.folder_accepts_contributions(folder_id)
+            has_targets = await database.folder_has_contribution_target(folder_id)
+        except Exception:
+            is_target, has_targets = False, False
+
+        if not (is_target or has_targets):
+            continue
+
+        key = str(name).strip()
+        name_counts[key] = name_counts.get(key, 0) + 1
+        rows.append((folder_id, key, is_target))
+
+    for folder_id, name, is_target in rows:
+        label = name[:35]
+        # Same-named siblings in one block are genuinely ambiguous; mark them.
+        if name_counts[name] > 1:
+            label += f" (#{folder_id})"
+
+        icon = "📤" if is_target else "📁"
+        if is_target:
+            # Target leaves start the upload directly, with no empty submenu.
+            callback = f"contrib_folder:{folder_id}"
+        else:
+            callback = f"contrib_browse:{folder_id}"
+        buttons.append([btn(f"{icon} {label}", callback)])
+
+    if parent_id:
+        try:
+            parent = await database.get_folder(parent_id)
+            parent_id_value = parent[1] if parent else None
+        except Exception:
+            parent_id_value = None
         buttons.append(
-            [
-                btn(
-                    f"📤 {str(name)[:35]}",
-                    f"contrib_folder:{folder_id}",
-                )
-            ]
+            [btn("⬅️ رجوع", f"contrib_browse:{parent_id_value or 0}")]
         )
 
-    if not buttons:
+    buttons.append([btn("🏠 الرئيسية", "home")])
+    return buttons
+
+
+async def show_contribute(query, parent_id=0):
+    """Entry point / current level of the contribution wizard."""
+    buttons = await _contribution_browse_buttons(parent_id)
+
+    has_options = any(
+        "contrib_" in (b.callback_data or "")
+        for row in buttons
+        for b in row
+    )
+
+    if has_options:
+        if parent_id:
+            try:
+                breadcrumb = await database.get_breadcrumbs(parent_id)
+            except Exception:
+                breadcrumb = ""
+            text = (
+                "📤 *Student Contributions*\n\n"
+                f"📍 {breadcrumb}\n\n"
+                "اختر القسم الذي تريد إرسال المورد إليه:"
+            )
+        else:
+            text = (
+                "📤 *Student Contributions*\n\n"
+                "تنقّل حتى تصل إلى المادة المطلوبة، ثم أرسل الملف.\n\n"
+                "اختر السنة أو القسم:"
+            )
+    else:
         text = (
             "📤 *Student Contributions*\n\n"
             "لا توجد حالياً مجلدات مفتوحة لاستقبال مساهمات الطلاب."
         )
-    else:
-        text = (
-            "📤 *Student Contributions*\n\n" "اختر القسم الذي تريد إرسال المورد إليه:"
-        )
 
-    buttons.append([btn("🏠 الرئيسية", "home")])
-
-    await edit_safe(
-        query,
-        text,
-        InlineKeyboardMarkup(buttons),
-    )
+    await edit_safe(query, text, InlineKeyboardMarkup(buttons))
 
 
 async def select_contribution_folder(query, context, folder_id):
@@ -935,26 +1008,44 @@ async def select_contribution_folder(query, context, folder_id):
     except Exception:
         accepts = False
 
-    if not accepts:
-        _clear_contribution_state(context)
-        await edit_safe(
-            query,
-            "⚠️ هذا القسم غير متاح لاستقبال المساهمات حالياً.",
-            InlineKeyboardMarkup(
-                [
-                    [btn("📤 Student Contributions", "contribute")],
-                    [btn("🏠 الرئيسية", "home")],
-                ]
-            ),
-        )
-        return
+    if accepts:
+        return await _begin_contribution_upload(query, context, folder_id)
 
+    # Not a target itself: descend if it leads somewhere useful.
+    try:
+        has_targets = await database.folder_has_contribution_target(folder_id)
+    except Exception:
+        has_targets = False
+
+    if has_targets:
+        return await show_contribute(query, folder_id)
+
+    _clear_contribution_state(context)
+    await edit_safe(
+        query,
+        "⚠️ هذا القسم غير متاح لاستقبال المساهمات حالياً.",
+        InlineKeyboardMarkup(
+            [
+                [btn("📤 Student Contributions", "contribute")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
+async def _begin_contribution_upload(query, context, folder_id):
+    """Final step: confirm the chosen destination and ask for the file."""
     context.user_data["contribution_folder"] = folder_id
+
+    try:
+        breadcrumb = await database.get_breadcrumbs(folder_id)
+    except Exception:
+        breadcrumb = str(folder_id)
 
     await edit_safe(
         query,
         "📤 *إرسال مساهمة*\n\n"
-        "تم اختيار القسم.\n\n"
+        f"📍 سيتم الإرسال إلى: {breadcrumb}\n\n"
         "أرسل الآن الملف كـ Document أو Audio أو Video أو Photo.\n\n"
         "سيتم تسجيله كمساهمة *pending* ولن يظهر في المكتبة حتى تتم مراجعته واعتماده.",
         InlineKeyboardMarkup(
@@ -3663,6 +3754,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "contribute":
         _clear_contribution_state(context)
         await show_contribute(query)
+        return
+
+    if data.startswith("contrib_browse:"):
+        try:
+            parent_id = int(data.split(":", 1)[1])
+        except Exception:
+            parent_id = 0
+        await show_contribute(query, parent_id)
         return
 
     if data.startswith("contrib_folder:"):

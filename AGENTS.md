@@ -77,6 +77,15 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
 - `ai_registry` positional columns matter: `last_test` is index 11;
   `_migrate_v2` appends `error_category`/`timeout_behavior`/`rate_limit_behavior`
   at 13/14/15. Never read `last_test` as `row[13]`.
+- Contribution submission is a drill-down wizard, never a flat list:
+  `contrib_browse:<id>` descends, `contrib_folder:<id>` starts the upload.
+  `database.folder_has_contribution_target()` hides branches with no reachable
+  target, and `_contribution_browse_buttons` disambiguates same-named siblings
+  with `(#id)`. The upload prompt always names the full breadcrumb so the
+  student can confirm the exact destination.
+- Any inline edit must go through `edit_safe`, which clamps to
+  `TELEGRAM_TEXT_LIMIT` on a line boundary. An oversized `edit_message_text`
+  raises and would otherwise leave the caller on a blank, stale screen.
 
 ## Testing
 - `python -m py_compile` all modules.

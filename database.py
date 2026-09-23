@@ -878,6 +878,35 @@ async def folder_accepts_contributions(folder_id: int) -> bool:
     await db.close()
     return bool(res and res[0])
 
+async def folder_has_contribution_target(folder_id: int) -> bool:
+    """True if this folder or any descendant accepts contributions.
+
+    Lets the contribution wizard hide branches that lead nowhere, so a student
+    can never drill into a dead end looking for a place to upload.
+    """
+    db = await get_db()
+    try:
+        pending = [folder_id]
+        seen = set()
+
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+
+            if await folder_accepts_contributions(current):
+                return True
+
+            async with db.execute(
+                "SELECT id FROM folders WHERE parent_id = ?", (current,)
+            ) as cur:
+                pending.extend(row[0] for row in await cur.fetchall())
+
+        return False
+    finally:
+        await db.close()
+
 async def is_descendant(db, ancestor_id: int, folder_id: int) -> bool:
     """Check if folder_id is a descendant of ancestor_id (for cycle prevention)."""
     current = folder_id
@@ -1386,18 +1415,34 @@ async def get_contribution(contrib_id: int):
         await db.close()
 
 async def get_user_contributions(user_id: int, limit: int = 20):
-    """Return a contributor's own contributions, newest first."""
+    """Return a contributor's own contributions, newest first.
+
+    Each row carries the full destination path so the student can tell which
+    subject/block a contribution belongs to, not just its title.
+    """
     db = await get_db()
     try:
         async with db.execute("""
             SELECT id, title, file_type, status, created_at,
-                   rejection_reason, review_note
+                   rejection_reason, review_note, folder_id
             FROM contributions
             WHERE user_id = ?
             ORDER BY id DESC
             LIMIT ?
         """, (user_id, limit)) as cur:
-            return await cur.fetchall()
+            rows = await cur.fetchall()
+
+        result = []
+        path_cache = {}
+        for row in rows:
+            folder_id = row[7]
+            if folder_id not in path_cache:
+                try:
+                    path_cache[folder_id] = await get_breadcrumbs_inline(db, folder_id)
+                except Exception:
+                    path_cache[folder_id] = None
+            result.append(tuple(row) + (path_cache[folder_id],))
+        return result
     finally:
         await db.close()
 
