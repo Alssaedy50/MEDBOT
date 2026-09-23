@@ -156,6 +156,7 @@ async def init_db():
         # ------------------------------------------------------------
         await _migrate_v1(db)
         await _migrate_v2(db)
+        await _migrate_v3(db)
 
         # ------------------------------------------------------------
         # Performance / integrity indexes
@@ -235,6 +236,44 @@ async def _migrate_v2(db):
         logger.info("Migration v2: added rate_limit_behavior to ai_registry")
     except Exception:
         pass
+
+async def _migrate_v3(db):
+    """Phase 2: contribution review workflow. Safe to re-run.
+
+    Adds review metadata to `contributions` and widens the accepted status
+    set with `needs_revision`. Existing rows keep status='pending' /
+    'approved' / 'rejected' and get NULL review columns, so old data stays
+    valid without rewriting.
+    """
+    for column, ddl in (
+        ("reviewed_by", "ALTER TABLE contributions ADD COLUMN reviewed_by INTEGER DEFAULT NULL"),
+        ("reviewed_at", "ALTER TABLE contributions ADD COLUMN reviewed_at TIMESTAMP DEFAULT NULL"),
+        ("review_note", "ALTER TABLE contributions ADD COLUMN review_note TEXT DEFAULT NULL"),
+        ("rejection_reason", "ALTER TABLE contributions ADD COLUMN rejection_reason TEXT DEFAULT NULL"),
+        ("resubmitted_count", "ALTER TABLE contributions ADD COLUMN resubmitted_count INTEGER DEFAULT 0"),
+    ):
+        try:
+            await db.execute(ddl)
+            logger.info("Migration v3: added %s to contributions", column)
+        except Exception:
+            pass
+
+    try:
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_contrib_user_status
+            ON contributions(user_id, status)
+        """)
+    except Exception:
+        pass
+
+# Valid contribution status transitions.
+CONTRIBUTION_STATUSES = ("pending", "approved", "rejected", "needs_revision")
+REVIEWABLE_STATUSES = ("pending", "needs_revision")
+
+# Basic submission validation limits.
+MAX_CONTRIBUTION_TITLE_LENGTH = 200
+MAX_CONTRIBUTION_FILE_ID_LENGTH = 512
+CONTRIBUTION_FILE_TYPES = ("document", "audio", "video", "photo")
 
 async def register_user(user_id: int, username: str = None, full_name: str = None):
     db = await get_db()
@@ -638,18 +677,108 @@ async def get_catalog_for_ai() -> str:
     await db.close()
     return "\n".join(summary) if summary else "قاعدة البيانات لا تزال قيد الإنشاء من قبل الإدارة."
 
-async def add_contribution(user_id: int, user_name: str, folder_id: int, title: str, file_id: str, file_type: str) -> int:
-    db = await get_db()
-    cursor = await db.execute("""
-        INSERT INTO contributions (user_id, user_name, folder_id, title, file_id, file_type, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'pending')
-    """, (user_id, user_name, folder_id, title, file_id, file_type))
-    cid = cursor.lastrowid
-    await db.commit()
-    await db.close()
-    return cid
+class ContributionValidationError(Exception):
+    """Raised when a submission fails basic validation."""
 
-async def approve_contribution(contrib_id: int):
+
+async def validate_contribution_submission(
+    folder_id: int,
+    title: str,
+    file_id: str,
+    file_type: str,
+    user_id: int = None,
+) -> str:
+    """Return an error message, or None when the submission is acceptable.
+
+    Checks (all local, no network):
+      - target folder exists and accepts contributions
+      - file id present and within a sane length
+      - title present, non-empty, within length
+      - file type is one of the allowed kinds
+      - no obvious duplicate from the same user in the same folder
+    """
+    if not isinstance(file_id, str) or not file_id.strip():
+        return "⚠️ لم يتم العثور على الملف المرفق. أعد إرساله."
+
+    if len(file_id) > MAX_CONTRIBUTION_FILE_ID_LENGTH:
+        return "⚠️ مُعرّف الملف غير صالح."
+
+    if file_type not in CONTRIBUTION_FILE_TYPES:
+        return (
+            "⚠️ نوع الملف غير مدعوم. الأنواع المسموحة: "
+            "Document / Audio / Video / Photo."
+        )
+
+    clean_title = (title or "").strip()
+
+    if not clean_title:
+        return "⚠️ عنوان المورد مطلوب."
+
+    if len(clean_title) > MAX_CONTRIBUTION_TITLE_LENGTH:
+        return (
+            f"⚠️ العنوان طويل جداً. الحد الأقصى "
+            f"{MAX_CONTRIBUTION_TITLE_LENGTH} حرفاً."
+        )
+
+    folder = await get_folder(folder_id)
+
+    if not folder:
+        return "⚠️ القسم الهدف لم يعد موجوداً."
+
+    if not await folder_accepts_contributions(folder_id):
+        return "⚠️ هذا القسم لا يستقبل مساهمات."
+
+    if user_id is not None:
+        db = await get_db()
+        try:
+            async with db.execute(
+                """
+                SELECT 1 FROM contributions
+                WHERE user_id = ?
+                  AND folder_id = ?
+                  AND title = ?
+                  AND file_id = ?
+                  AND status IN ('pending', 'approved', 'needs_revision')
+                LIMIT 1
+                """,
+                (user_id, folder_id, clean_title, file_id),
+            ) as cur:
+                if await cur.fetchone():
+                    return "⚠️ هذه المساهمة مسجلة مسبقاً."
+        finally:
+            await db.close()
+
+    return None
+
+
+async def add_contribution(user_id: int, user_name: str, folder_id: int, title: str, file_id: str, file_type: str) -> int:
+    """Register a new contribution. Raises ContributionValidationError."""
+    clean_title = (title or "").strip()
+
+    error = await validate_contribution_submission(
+        folder_id,
+        clean_title,
+        file_id,
+        file_type,
+        user_id=user_id,
+    )
+
+    if error:
+        raise ContributionValidationError(error)
+
+    db = await get_db()
+    try:
+        cursor = await db.execute("""
+            INSERT INTO contributions (user_id, user_name, folder_id, title, file_id, file_type, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending')
+        """, (user_id, user_name, folder_id, clean_title, file_id, file_type))
+        cid = cursor.lastrowid
+        await db.commit()
+        return cid
+    finally:
+        await db.close()
+
+async def approve_contribution(contrib_id: int, reviewer_id: int = None):
     db = await get_db()
     try:
         await db.execute("BEGIN IMMEDIATE")
@@ -663,7 +792,7 @@ async def approve_contribution(contrib_id: int):
             await db.rollback()
             return None
         fid, title, file_id, f_type, uid, status = row
-        if status != "pending":
+        if status not in REVIEWABLE_STATUSES:
             await db.rollback()
             return None
         cursor = await db.execute(
@@ -673,9 +802,12 @@ async def approve_contribution(contrib_id: int):
         cid = cursor.lastrowid
         await db.execute("""
             UPDATE contributions
-            SET status = 'approved'
-            WHERE id = ? AND status = 'pending'
-        """, (contrib_id,))
+            SET status = 'approved',
+                reviewed_by = ?,
+                reviewed_at = CURRENT_TIMESTAMP,
+                rejection_reason = NULL
+            WHERE id = ? AND status IN ('pending', 'needs_revision')
+        """, (reviewer_id, contrib_id))
         await db.commit()
         return (fid, title, file_id, f_type, uid)
     except Exception:
@@ -684,7 +816,7 @@ async def approve_contribution(contrib_id: int):
     finally:
         await db.close()
 
-async def reject_contribution(contrib_id: int):
+async def reject_contribution(contrib_id: int, reviewer_id: int = None, reason: str = None):
     db = await get_db()
     try:
         await db.execute("BEGIN IMMEDIATE")
@@ -698,19 +830,179 @@ async def reject_contribution(contrib_id: int):
             await db.rollback()
             return None
         uid, title, status = row
-        if status != "pending":
+        if status not in REVIEWABLE_STATUSES:
             await db.rollback()
             return None
         await db.execute("""
             UPDATE contributions
-            SET status = 'rejected'
-            WHERE id = ? AND status = 'pending'
-        """, (contrib_id,))
+            SET status = 'rejected',
+                reviewed_by = ?,
+                reviewed_at = CURRENT_TIMESTAMP,
+                rejection_reason = ?
+            WHERE id = ? AND status IN ('pending', 'needs_revision')
+        """, (reviewer_id, reason, contrib_id))
         await db.commit()
         return (uid, title)
     except Exception:
         await db.rollback()
         raise
+    finally:
+        await db.close()
+
+async def request_contribution_revision(contrib_id: int, reviewer_id: int = None, note: str = None):
+    """Send a contribution back to the contributor for changes."""
+    db = await get_db()
+    try:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("""
+            SELECT user_id, title, status
+            FROM contributions
+            WHERE id = ?
+        """, (contrib_id,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await db.rollback()
+            return None
+        uid, title, status = row
+        if status not in REVIEWABLE_STATUSES:
+            await db.rollback()
+            return None
+        await db.execute("""
+            UPDATE contributions
+            SET status = 'needs_revision',
+                reviewed_by = ?,
+                reviewed_at = CURRENT_TIMESTAMP,
+                review_note = ?
+            WHERE id = ? AND status IN ('pending', 'needs_revision')
+        """, (reviewer_id, note, contrib_id))
+        await db.commit()
+        return (uid, title)
+    except Exception:
+        await db.rollback()
+        raise
+    finally:
+        await db.close()
+
+async def resubmit_contribution(contrib_id: int, user_id: int, title: str, file_id: str, file_type: str) -> tuple[bool, str]:
+    """Replace a needs_revision contribution's media and return it to pending.
+
+    Only the original contributor may resubmit, and only while the
+    contribution is in `needs_revision`. The title/folder stay owned by the
+    server; only media is replaced.
+    """
+    db = await get_db()
+    try:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("""
+            SELECT user_id, folder_id, status
+            FROM contributions
+            WHERE id = ?
+        """, (contrib_id,)) as cur:
+            row = await cur.fetchone()
+
+        if not row:
+            await db.rollback()
+            return False, "⚠️ المساهمة غير موجودة."
+
+        owner_id, folder_id, status = row
+
+        if int(owner_id) != int(user_id):
+            await db.rollback()
+            return False, "🔒 يمكن لصاحب المساهمة فقط إعادة إرسالها."
+
+        if status != "needs_revision":
+            await db.rollback()
+            return False, "ℹ️ هذه المساهمة ليست بحاجة إلى تعديل."
+
+        clean_title = (title or "").strip()
+
+        if not isinstance(file_id, str) or not file_id.strip():
+            await db.rollback()
+            return False, "⚠️ لم يتم العثور على الملف المرفق."
+
+        if len(file_id) > MAX_CONTRIBUTION_FILE_ID_LENGTH:
+            await db.rollback()
+            return False, "⚠️ مُعرّف الملف غير صالح."
+
+        if file_type not in CONTRIBUTION_FILE_TYPES:
+            await db.rollback()
+            return False, "⚠️ نوع الملف غير مدعوم."
+
+        if not clean_title or len(clean_title) > MAX_CONTRIBUTION_TITLE_LENGTH:
+            await db.rollback()
+            return False, "⚠️ العنوان غير صالح."
+
+        async with db.execute(
+            "SELECT 1 FROM folders WHERE id = ? AND accepts_contributions = 1",
+            (folder_id,),
+        ) as cur:
+            if not await cur.fetchone():
+                await db.rollback()
+                return False, "⚠️ القسم لم يعد يستقبل مساهمات."
+
+        await db.execute("""
+            UPDATE contributions
+            SET title = ?,
+                file_id = ?,
+                file_type = ?,
+                status = 'pending',
+                reviewed_by = NULL,
+                reviewed_at = NULL,
+                review_note = NULL,
+                rejection_reason = NULL,
+                resubmitted_count = COALESCE(resubmitted_count, 0) + 1
+            WHERE id = ? AND status = 'needs_revision'
+        """, (clean_title, file_id, file_type, contrib_id))
+        await db.commit()
+        return True, clean_title
+    except Exception:
+        await db.rollback()
+        raise
+    finally:
+        await db.close()
+
+async def get_contribution(contrib_id: int):
+    db = await get_db()
+    try:
+        async with db.execute("""
+            SELECT id, user_id, user_name, folder_id, title, file_id, file_type,
+                   status, created_at, reviewed_by, reviewed_at, review_note,
+                   rejection_reason, resubmitted_count
+            FROM contributions
+            WHERE id = ?
+        """, (contrib_id,)) as cur:
+            return await cur.fetchone()
+    finally:
+        await db.close()
+
+async def get_user_contributions(user_id: int, limit: int = 20):
+    """Return a contributor's own contributions, newest first."""
+    db = await get_db()
+    try:
+        async with db.execute("""
+            SELECT id, title, file_type, status, created_at,
+                   rejection_reason, review_note
+            FROM contributions
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (user_id, limit)) as cur:
+            return await cur.fetchall()
+    finally:
+        await db.close()
+
+async def get_reviewable_contributions_list():
+    """Pending and needs_revision contributions awaiting an admin decision."""
+    db = await get_db()
+    try:
+        async with db.execute("""
+            SELECT id, user_id, user_name, title, file_id, file_type, folder_id,
+                   status, created_at
+            FROM contributions
+            WHERE status IN ('pending', 'needs_revision')
+            ORDER BY id DESC
+        """) as cur:
+            return await cur.fetchall()
     finally:
         await db.close()
 
@@ -1064,7 +1356,7 @@ async def get_all_user_ids() -> list:
 
 async def get_pending_contributions_count() -> int:
     db = await get_db()
-    async with db.execute("SELECT COUNT(*) FROM contributions WHERE status = 'pending'") as cur:
+    async with db.execute("SELECT COUNT(*) FROM contributions WHERE status IN ('pending', 'needs_revision')") as cur:
         row = await cur.fetchone()
     await db.close()
     return row[0] if row else 0
@@ -1084,7 +1376,7 @@ async def get_pending_contributions_list():
                 status,
                 created_at
             FROM contributions
-            WHERE status = 'pending'
+            WHERE status IN ('pending', 'needs_revision')
             ORDER BY id DESC
         """) as cur:
             rows = await cur.fetchall()
