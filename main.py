@@ -3373,20 +3373,62 @@ async def process_approval(query, contribution_id, approve):
         )
 
 
+# Telegram rejects messages over 4096 chars; keep well under it.
+REGISTRY_MAX_CHARS = 3500
+
+
+def _shorten(value, limit=40):
+    text = str(value) if value is not None else "N/A"
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _registry_summary(rows):
+    """Bounded, grouped rendering of the AI registry.
+
+    The registry can hold hundreds of discovered models, so the viewer must
+    stay under Telegram's message limit and show a count instead of silently
+    dropping (or failing to send) the tail.
+    """
+    by_provider = {}
+    for row in rows:
+        try:
+            by_provider.setdefault(row[1] or "N/A", []).append(row)
+        except Exception:
+            continue
+
+    lines = [f"🤖 *AI Registry* — {len(rows)} models, {len(by_provider)} providers\n"]
+    max_per_provider = 3
+
+    for provider in sorted(by_provider):
+        items = by_provider[provider]
+        lines.append(f"*{_shorten(provider, 30)}* ({len(items)})")
+
+        for row in items[:max_per_provider]:
+            try:
+                model = _shorten(row[2])
+                availability = row[4] or "N/A"
+                auth_status = row[5] or "N/A"
+                last_test = row[11] or "never"
+            except Exception:
+                continue
+
+            lines.append(
+                f"  • `{model}` — `{availability}` / auth `{auth_status}`"
+                f" / test `{_shorten(last_test, 20)}`"
+            )
+
+        if len(items) > max_per_provider:
+            lines.append(f"  … +{len(items) - max_per_provider} more")
+
+    text = "\n".join(lines)
+    if len(text) > REGISTRY_MAX_CHARS:
+        # Cut on a line boundary so markdown entities never end mid-line.
+        text = text[:REGISTRY_MAX_CHARS].rsplit("\n", 1)[0] + "\n… (عرض مختصر)"
+
+    return text
+
+
 async def show_ai_registry(query):
-    try:
-        is_admin = await database.is_user_admin(query.from_user.id)
-    except Exception:
-        is_admin = False
-
-    if not is_admin:
-        await edit_safe(
-            query,
-            "🔒 غير مصرح.",
-            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
-        )
-        return
-
     if not await _require_permission(query, "can_ai"):
         return
 
@@ -3398,24 +3440,7 @@ async def show_ai_registry(query):
     if not rows:
         text = "🤖 *AI Registry*\n\nلا توجد نماذج مسجلة حالياً."
     else:
-        lines = ["🤖 *AI Registry*\n"]
-
-        for row in rows:
-            try:
-                provider = row[1]
-                model = row[2]
-                availability = row[4]
-                auth_status = row[5]
-
-                lines.append(
-                    f"• *{provider}* — `{model or 'N/A'}`\n"
-                    f"  availability: `{availability or 'N/A'}`\n"
-                    f"  auth: `{auth_status or 'N/A'}`"
-                )
-            except Exception:
-                continue
-
-        text = "\n".join(lines)
+        text = _registry_summary(rows)
 
     await edit_safe(
         query,

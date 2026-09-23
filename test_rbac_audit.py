@@ -735,5 +735,125 @@ class HomeKeyboardTests(RBACBase):
         self.assertEqual(callbacks.count("admin_runtime"), 1)
 
 
+class AIRegistryViewerTests(RBACBase):
+    """The AI Registry screen must stay bounded and permission-gated."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        await database.ensure_configured_admin(self.owner_id)
+
+    async def _seed(self, count, provider="P"):
+        for i in range(count):
+            await database.ai_registry_add(
+                provider=f"{provider}{i % 3}",
+                model=f"model-{i}-" + ("x" * 40),
+                endpoint=f"https://example.com/{i}",
+                availability="DISCOVERED",
+                auth_status="valid",
+            )
+
+    async def test_registry_message_stays_under_telegram_limit(self):
+        await self._seed(120)
+        query, _ = await self._route(self.owner_id, "admin_ai")
+        text = query.last_text or ""
+        self.assertTrue(text)
+        self.assertLessEqual(len(text), 4096)
+        self.assertIn("120 models", text)
+
+    async def test_registry_lists_every_provider_header(self):
+        await self._seed(9, provider="Prov")
+        query, _ = await self._route(self.owner_id, "admin_ai")
+        text = query.last_text or ""
+        for idx in range(3):
+            self.assertIn(f"Prov{idx}", text)
+
+    async def test_registry_empty_state(self):
+        query, _ = await self._route(self.owner_id, "admin_ai")
+        self.assertIn("لا توجد نماذج", query.last_text)
+
+    async def test_registry_denied_to_regular_user(self):
+        query, _ = await self._route(self.student_id, "admin_ai")
+        self.assertIn("غير مصرح", query.last_text)
+
+    async def test_registry_denied_without_can_ai(self):
+        perms = dict(await database.get_admin_permissions(self.sub_id))
+        perms["can_ai"] = False
+        await database.update_admin_permissions(self.sub_id, perms)
+
+        query, _ = await self._route(self.sub_id, "admin_ai")
+        self.assertIn("غير مصرح", query.last_text)
+
+
+class AIRegistryTimestampTests(RBACBase):
+    """`_refresh_discovered_models` must read `last_test` (column 11), not the
+    neighbouring `error_category` (column 13), when ordering probes."""
+
+    async def test_migration_added_columns_shift_last_test_away_from_13(self):
+        await database.ai_registry_add(
+            provider="groq",
+            model="llama",
+            endpoint="https://api.groq.com",
+            availability="DISCOVERED",
+            auth_status="valid",
+        )
+        db = await database.get_db()
+        async with db.execute("PRAGMA table_info(ai_registry)") as cur:
+            cols = [row[1] for row in await cur.fetchall()]
+        await db.close()
+
+        self.assertEqual(cols[11], "last_test")
+        self.assertEqual(cols[13], "error_category")
+
+    async def test_probe_order_uses_last_test_not_error_category(self):
+        import ai
+
+        # Two discovered models for one provider; the never-tested one (old id)
+        # must be probed before the recently-tested one.
+        await database.ai_registry_add(
+            provider="groq", model="recent", endpoint="https://a",
+            availability="DISCOVERED", auth_status="valid",
+        )
+        await database.ai_registry_add(
+            provider="groq", model="fresh", endpoint="https://b",
+            availability="DISCOVERED", auth_status="valid",
+        )
+        rows = await database.ai_registry_get_all()
+        by_model = {row[2]: row for row in rows}
+        recent_id = by_model["recent"][0]
+
+        # Mark "recent" as tested just now; stamp error_category too, which is
+        # exactly the column the old buggy code was reading.
+        db = await database.get_db()
+        await db.execute(
+            "UPDATE ai_registry SET last_test = ?, error_category = NULL "
+            "WHERE id = ?",
+            ("2099-01-01 00:00:00", recent_id),
+        )
+        await db.commit()
+        await db.close()
+
+        probed = []
+
+        async def fake_probe(item):
+            probed.append(item["model"])
+
+        original = ai._probe_model
+        ai._probe_model = fake_probe
+        try:
+            candidates = [
+                {"provider": "groq", "model": "recent", "endpoint": "https://a",
+                 "availability": "DISCOVERED", "id": recent_id},
+                {"provider": "groq", "model": "fresh", "endpoint": "https://b",
+                 "availability": "DISCOVERED",
+                 "id": by_model["fresh"][0]},
+            ]
+            await ai._refresh_discovered_models(candidates)
+        finally:
+            ai._probe_model = original
+
+        self.assertIn("fresh", probed)
+        self.assertLess(probed.index("fresh"), probed.index("recent"))
+
+
 if __name__ == "__main__":
     unittest.main()

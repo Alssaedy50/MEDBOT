@@ -623,7 +623,7 @@ async def _refresh_discovered_models(candidates):
     try:
         rows = await database.ai_registry_get_all()
         last_test_by_id = {
-            row[0]: row[13] if len(row) > 13 else None
+            row[0]: row[11] if len(row) > 11 else None
             for row in rows
         }
     except Exception:

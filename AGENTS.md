@@ -71,6 +71,12 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
   never contains the admin entry. Use `await main.home_for(update)` everywhere a
   home keyboard is attached; it appends the Admin Panel only for admins. The
   panel itself lists each permitted surface exactly once.
+- AI Registry viewer (`show_ai_registry`) is gated by `can_ai` and renders a
+  bounded, provider-grouped summary (`_registry_summary`) so it can never exceed
+  Telegram's 4096-char limit, however many models are discovered.
+- `ai_registry` positional columns matter: `last_test` is index 11;
+  `_migrate_v2` appends `error_category`/`timeout_behavior`/`rate_limit_behavior`
+  at 13/14/15. Never read `last_test` as `row[13]`.
 
 ## Testing
 - `python -m py_compile` all modules.
