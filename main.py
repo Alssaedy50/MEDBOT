@@ -1493,7 +1493,7 @@ async def start_admin_mcq_add(query, context):
         rows.append([btn(f"📁 {str(name)[:40]}", f"admin_mcq_folder:{folder_id}")])
 
     rows.append([btn("🌐 بدون قسم (بنك عام)", "admin_mcq_folder_skip")])
-    rows.append([btn("❌ إلغاء", "admin_mcq")])
+    rows.append([btn("❌ إلغاء", "cancel")])
 
     text = (
         "➕ *تسجيل سؤال جديد*\n\n"
@@ -1522,7 +1522,7 @@ async def set_mcq_folder(query, context, folder_id):
                 await edit_safe(
                     query,
                     "⚠️ القسم غير موجود.",
-                    InlineKeyboardMarkup([[btn("❌ إلغاء", "admin_mcq")]]),
+                    InlineKeyboardMarkup([[btn("❌ إلغاء", "cancel")]]),
                 )
                 return
         except Exception:
@@ -1536,7 +1536,7 @@ async def set_mcq_folder(query, context, folder_id):
         "➕ *تسجيل سؤال جديد*\n\n"
         "الخطوة 2 من 4: أرسل نص السؤال.\n\n"
         "أرسل /cancel للإلغاء.",
-        InlineKeyboardMarkup([[btn("❌ إلغاء", "admin_mcq")]]),
+        InlineKeyboardMarkup([[btn("❌ إلغاء", "cancel")]]),
     )
 
 
@@ -1612,7 +1612,7 @@ async def handle_mcq_text_input(update, context):
                 [btn(f"{letter}) {str(option)[:40]}", f"admin_mcq_correct:{index}")]
             )
 
-        rows.append([btn("❌ إلغاء", "admin_mcq")])
+        rows.append([btn("❌ إلغاء", "cancel")])
 
         await update.message.reply_text(
             "➕ *تسجيل سؤال جديد*\n\n"
@@ -1646,7 +1646,7 @@ async def choose_mcq_correct(query, context, correct_index):
         await edit_safe(
             query,
             "⚠️ خيار غير صالح.",
-            InlineKeyboardMarkup([[btn("❌ إلغاء", "admin_mcq")]]),
+            InlineKeyboardMarkup([[btn("❌ إلغاء", "cancel")]]),
         )
         return
 
@@ -1660,7 +1660,7 @@ async def choose_mcq_correct(query, context, correct_index):
         InlineKeyboardMarkup(
             [
                 [btn("⏭ تخطي الشرح", "admin_mcq_skip_explanation")],
-                [btn("❌ إلغاء", "admin_mcq")],
+                [btn("❌ إلغاء", "cancel")],
             ]
         ),
     )
@@ -2238,7 +2238,7 @@ async def start_admin_folder_create(query, context):
         "للإلغاء استخدم /cancel",
         InlineKeyboardMarkup(
             [
-                [btn("❌ إلغاء", "admin_folders")],
+                [btn("❌ إلغاء", "cancel")],
             ]
         ),
     )
@@ -2411,7 +2411,7 @@ async def request_admin_folder_name(update, context):
                 [btn("🎥 فيديو", "admin_folder_type:video")],
                 [btn("📝 MCQ", "admin_folder_type:mcq")],
                 [btn("📑 ملخصات", "admin_folder_type:summaries")],
-                [btn("❌ إلغاء", "admin_folders")],
+                [btn("❌ إلغاء", "cancel")],
             ]
         ),
     )
@@ -2440,7 +2440,7 @@ async def select_admin_folder_parent(query, context, parent_id):
         "للإلغاء استخدم الزر أدناه.",
         InlineKeyboardMarkup(
             [
-                [btn("❌ إلغاء", "admin_folders")],
+                [btn("❌ إلغاء", "cancel")],
             ]
         ),
     )
@@ -2489,7 +2489,7 @@ async def show_admin_folder_types(query, context):
                 [btn("🎥 فيديو", "admin_folder_type:video")],
                 [btn("📝 MCQ", "admin_folder_type:mcq")],
                 [btn("📑 ملخصات", "admin_folder_type:summaries")],
-                [btn("❌ إلغاء", "admin_folders")],
+                [btn("❌ إلغاء", "cancel")],
             ]
         ),
     )
@@ -2538,7 +2538,7 @@ async def admin_folder_type(query, context, node_type):
                 [btn("✅ نعم", "admin_folder_accepts:1")],
                 [btn("❌ لا", "admin_folder_accepts:0")],
                 [btn("⬅️ تغيير النوع", "admin_folder_retype")],
-                [btn("❌ إلغاء", "admin_folders")],
+                [btn("❌ إلغاء", "cancel")],
             ]
         ),
     )
@@ -2656,7 +2656,7 @@ def _folder_type_keyboard(folder_id, cancel_callback=None):
         [
             btn(
                 "❌ إلغاء",
-                cancel_callback or f"admin_folder:{folder_id}",
+                cancel_callback or "cancel",
             )
         ]
     )
@@ -2672,7 +2672,7 @@ def _file_type_keyboard(content_id, cancel_callback=None):
         [
             btn(
                 "❌ إلغاء",
-                cancel_callback or f"admin_file:{content_id}",
+                cancel_callback or "cancel",
             )
         ]
     )
@@ -2752,7 +2752,7 @@ async def start_admin_upload(query, context, folder_id):
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(
             [
-                [btn("❌ إلغاء", f"admin_folder:{folder_id}")],
+                [btn("❌ إلغاء", "cancel")],
                 [btn("🏠 الرئيسية", "home")],
             ]
         ),
@@ -2777,6 +2777,7 @@ _ADMIN_STATE_KEYS = (
     "admin_file_rename",
     "admin_file_rename_id",
     "admin_file_rename_waiting",
+    "admin_file_retype_id",
     "admin_file_move",
     "admin_file_move_id",
     "admin_subadmin_add",
@@ -2797,6 +2798,64 @@ def _clear_admin_state(context, keep=None):
         if keep and key in keep:
             continue
         context.user_data.pop(key, None)
+
+
+def _resolve_cancel_target(context) -> str:
+    """Return the callback that restores the screen a workflow started from.
+
+    Cancelling must never strand the user, so each armed workflow records the
+    screen it was launched from and we route back there. Falls back to home.
+    """
+
+    def _as_int(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    # Resource-level workflows return to the resource they act on.
+    for key in ("admin_file_rename_id", "admin_file_move_id", "admin_file_retype_id"):
+        content_id = _as_int(context.user_data.get(key))
+        if content_id is not None:
+            return f"admin_file:{content_id}"
+
+    # Upload returns to the folder it targets.
+    if context.user_data.get("admin_upload"):
+        folder_id = _as_int(context.user_data.get("admin_upload_folder"))
+        if folder_id is not None:
+            return f"admin_folder:{folder_id}"
+        return "admin_folders"
+
+    # A custom upload title has no upload flag but carries the preview folder.
+    preview = context.user_data.get("admin_upload_preview")
+    if isinstance(preview, dict):
+        folder_id = _as_int(preview.get("folder_id"))
+        if folder_id is not None:
+            return f"admin_folder:{folder_id}"
+
+    # Folder-level workflows return to the folder they act on.
+    for key in ("admin_folder_rename_id", "admin_folder_move_id", "admin_folder_retype_id"):
+        folder_id = _as_int(context.user_data.get(key))
+        if folder_id is not None:
+            return f"admin_folder:{folder_id}"
+
+    # Folder creation returns to the management menu.
+    if context.user_data.get("admin_folder_create"):
+        return "admin_folders"
+
+    if context.user_data.get("admin_mcq_step"):
+        return "admin_mcq"
+
+    if context.user_data.get("admin_subadmin_add"):
+        return "admin_subadmins"
+
+    if context.user_data.get("admin_broadcast"):
+        return "admin"
+
+    if context.user_data.get("contribution_mode"):
+        return "contribute"
+
+    return "home"
 
 
 async def admin_upload_media_handler(update, context):
@@ -2849,7 +2908,7 @@ async def admin_upload_media_handler(update, context):
             "⚠️ أرسل مورداً من الأنواع المدعومة: Document / Photo / Audio / Video.",
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [btn("❌ إلغاء الرفع", f"admin_folder:{folder_id}")],
+                    [btn("❌ إلغاء الرفع", "cancel")],
                 ]
             ),
         )
@@ -2877,7 +2936,7 @@ async def admin_upload_media_handler(update, context):
                     )
                 ],
                 [btn("✏️ إدخال عنوان مخصص", "admin_upload_custom_title")],
-                [btn("❌ إلغاء", f"admin_folder:{folder_id}")],
+                [btn("❌ إلغاء", "cancel")],
             ]
         ),
     )
@@ -2938,7 +2997,7 @@ async def admin_upload_custom_title(query, context, custom_title=None):
                     [
                         btn(
                             "❌ إلغاء",
-                            f"admin_folder:{preview.get('folder_id')}",
+                            "cancel",
                         )
                     ],
                 ]
@@ -3223,7 +3282,7 @@ async def admin_folder_move_menu(query, context):
             ]
         )
 
-    rows.append([btn("❌ إلغاء", f"admin_folder:{folder_id}")])
+    rows.append([btn("❌ إلغاء", "cancel")])
 
     await edit_safe(
         query,
@@ -3399,7 +3458,7 @@ async def admin_file_move_menu(query, context):
             ]
         )
 
-    rows.append([btn("❌ إلغاء", f"admin_file:{content_id}")])
+    rows.append([btn("❌ إلغاء", "cancel")])
 
     await edit_safe(
         query,
@@ -3523,7 +3582,7 @@ async def handle_pending_title_input(update, context):
             reply_markup=InlineKeyboardMarkup(
                 [
                     [btn("✅ تسجيل", "admin_upload_confirm")],
-                    [btn("❌ إلغاء", f"admin_folder:{folder_id}")],
+                    [btn("❌ إلغاء", "cancel")],
                 ]
             ),
         )
@@ -3795,7 +3854,7 @@ async def start_admin_broadcast(query, context):
         "لإلغاء العملية أرسل /cancel",
         InlineKeyboardMarkup(
             [
-                [btn("❌ إلغاء", "home")],
+                [btn("❌ إلغاء", "cancel")],
             ]
         ),
     )
@@ -3847,7 +3906,7 @@ async def handle_pending_broadcast_input(update, context):
         reply_markup=InlineKeyboardMarkup(
             [
                 [btn("✅ إرسال الآن", "admin_broadcast_confirm")],
-                [btn("❌ إلغاء", "admin_broadcast_cancel")],
+                [btn("❌ إلغاء", "cancel")],
             ]
         ),
     )
@@ -4153,7 +4212,7 @@ async def start_add_subadmin(query, context):
         "أرسل الآن الـ Telegram ID الرقمي للمستخدم الجديد، "
         "أو اسمه المسجل في البوت.\n\n"
         "لإلغاء العملية أرسل /cancel",
-        InlineKeyboardMarkup([[btn("❌ إلغاء", "admin_subadmins")]]),
+        InlineKeyboardMarkup([[btn("❌ إلغاء", "cancel")]]),
     )
 
 
@@ -4731,6 +4790,53 @@ async def _admin_route_allowed(query, data: str) -> bool:
     return False
 
 
+async def _show_cancel_target(query, context, update, target: str):
+    """Render the screen a cancelled workflow started from."""
+    if target == "home":
+        await show_home(update)
+        return
+
+    if target.startswith("admin_file:"):
+        try:
+            content_id = int(target.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await show_admin_folders(query)
+            return
+        await show_admin_file(query, content_id)
+        return
+
+    if target.startswith("admin_folder:"):
+        try:
+            folder_id = int(target.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await show_admin_folders(query)
+            return
+        await show_admin_folder(query, folder_id)
+        return
+
+    if target == "admin_folders":
+        await show_admin_folders(query)
+        return
+
+    if target == "admin_mcq":
+        await show_admin_mcq(query, context)
+        return
+
+    if target == "admin_subadmins":
+        await show_subadmins(query)
+        return
+
+    if target == "admin":
+        await show_admin(query)
+        return
+
+    if target == "contribute":
+        await show_contribute(query, context)
+        return
+
+    await show_home(update)
+
+
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
 
@@ -4758,6 +4864,19 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "noop":
+        return
+
+    if data == "cancel":
+        # Cancel any armed workflow, clear every transient state bag, then
+        # return the user to the screen the operation was launched from.
+        target = _resolve_cancel_target(context)
+
+        _clear_admin_state(context)
+        _clear_mcq_admin_state(context)
+        _clear_contribution_state(context)
+        context.user_data.pop("mcq_session", None)
+
+        await _show_cancel_target(query, context, update, target)
         return
 
     if data.startswith("library:"):
@@ -4890,6 +5009,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "contribute":
+        _clear_admin_state(context)
+        _clear_mcq_admin_state(context)
         await show_contribute(query, context)
         return
 
@@ -4965,6 +5086,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---- Admin MCQ bank management ---------------------------
     if data == "admin_mcq":
+        _clear_admin_state(context)
         await show_admin_mcq(query, context)
         return
 
@@ -4983,7 +5105,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await edit_safe(
                 query,
                 "⚠️ معرف القسم غير صالح.",
-                InlineKeyboardMarkup([[btn("❌ إلغاء", "admin_mcq")]]),
+                InlineKeyboardMarkup([[btn("❌ إلغاء", "cancel")]]),
             )
             return
         await set_mcq_folder(query, context, folder_id)
@@ -5034,6 +5156,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "admin":
+        _clear_admin_state(context)
+        _clear_mcq_admin_state(context)
         await show_admin(query)
         return
 
@@ -5100,7 +5224,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "يمكنك إرسال /cancel للإلغاء.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(
-                [[btn("❌ إلغاء", f"admin_file:{content_id}")]]
+                [[btn("❌ إلغاء", "cancel")]]
             ),
         )
         return
@@ -5133,6 +5257,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
             )
             return
+
+        context.user_data["admin_file_retype_id"] = content_id
 
         await edit_safe(
             query,
@@ -5513,7 +5639,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "يمكنك إرسال /cancel للإلغاء.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [btn("❌ إلغاء", f"admin_folder:{folder_id}")]
+                [btn("❌ إلغاء", "cancel")]
             ]),
         )
         return
@@ -5712,6 +5838,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "admin_subadmins":
+        _clear_admin_state(context)
         await show_subadmins(query)
         return
 
@@ -5781,13 +5908,18 @@ async def quota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel any active admin workflow."""
+    """Cancel any active workflow (admin, MCQ or contribution)."""
     if not update.message:
         return
 
     active = any(context.user_data.get(key) for key in _ADMIN_STATE_KEYS)
+    active = active or bool(context.user_data.get("mcq_session"))
+    active = active or contribution_is_active(context)
 
     _clear_admin_state(context)
+    _clear_mcq_admin_state(context)
+    _clear_contribution_state(context)
+    context.user_data.pop("mcq_session", None)
 
     if active:
         await update.message.reply_text(
@@ -5852,7 +5984,7 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "أو اضغط ❌ إلغاء / أرسل /cancel للخروج.",
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [btn("❌ إلغاء", f"admin_folder:{folder_id}")],
+                    [btn("❌ إلغاء", "cancel")],
                     [btn("🏠 الرئيسية", "home")],
                 ]
             ),

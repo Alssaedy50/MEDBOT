@@ -1208,6 +1208,17 @@ class OwnerToolsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(ctx.application.tasks), 1)
         self.assertFalse(ctx.user_data.get("admin_broadcast_confirm"))
 
+    async def test_subadmins_screen_clears_pending_add_state(self):
+        ctx = _FakeContext()
+        add = _FakeQuery(700, "admin_subadmin_add")
+        await main.callback_router(_FakeUpdate(add), ctx)
+        self.assertTrue(ctx.user_data.get("admin_subadmin_add"))
+
+        back = _FakeQuery(700, "admin_subadmins")
+        await main.callback_router(_FakeUpdate(back), ctx)
+
+        self.assertIsNone(ctx.user_data.get("admin_subadmin_add"))
+
     async def test_broadcast_confirm_without_text_is_safe(self):
         ctx = _FakeContext()
         query = _FakeQuery(700, "admin_broadcast_confirm")
@@ -2100,6 +2111,141 @@ class ResourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
 # ============================================================
 # Contribution targeting — media must land in the chosen folder
 # ============================================================
+
+
+class UnifiedCancelTests(unittest.IsolatedAsyncioTestCase):
+    """The `cancel` callback must restore the launching screen and clear state."""
+
+    async def asyncSetUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="medbot-cancel-")
+        self.db_path = os.path.join(self.tmp_dir, "test.sqlite3")
+        self._old = database.DB_NAME
+        database.DB_NAME = self.db_path
+        await database.init_db()
+
+        await database.add_folder(0, "Second Year", "general")
+        self.year_id = (await database.get_folders(0))[0][0]
+
+        await database.add_folder(self.year_id, "Pathology", "general")
+        self.path_id = (await database.get_folders(self.year_id))[0][0]
+
+        await database.add_content(self.path_id, "Lecture 1", "fid-l1", "document")
+        self.content_id = (await database.get_files(self.path_id))[0][0]
+
+        await database.add_sub_admin(500, "admin")
+
+    async def asyncTearDown(self):
+        database.DB_NAME = self._old
+        for name in os.listdir(self.tmp_dir):
+            try:
+                os.remove(os.path.join(self.tmp_dir, name))
+            except OSError:
+                pass
+        os.rmdir(self.tmp_dir)
+
+    async def _route(self, data, context):
+        query = _FakeQuery(500, data)
+        await main.callback_router(_FakeUpdate(query), context)
+        return query
+
+    async def test_cancel_folder_create_returns_to_manager(self):
+        context = _FakeContext()
+        await self._route(f"admin_folder_child:{self.path_id}", context)
+        self.assertTrue(context.user_data.get("admin_folder_create"))
+
+        query = await self._route("cancel", context)
+
+        self.assertIsNone(context.user_data.get("admin_folder_create"))
+        self.assertIn("إدارة الأقسام", query.last_text or "")
+
+    async def test_cancel_folder_rename_returns_to_that_folder(self):
+        context = _FakeContext()
+        await self._route(f"admin_folder_rename:{self.path_id}", context)
+        self.assertTrue(context.user_data.get("admin_folder_rename"))
+
+        query = await self._route("cancel", context)
+
+        self.assertIsNone(context.user_data.get("admin_folder_rename"))
+        self.assertIn("Pathology", query.last_text or "")
+
+    async def test_cancel_file_rename_returns_to_that_resource(self):
+        context = _FakeContext()
+        await self._route(f"admin_file_rename:{self.content_id}", context)
+        self.assertTrue(context.user_data.get("admin_file_rename"))
+
+        query = await self._route("cancel", context)
+
+        self.assertIsNone(context.user_data.get("admin_file_rename"))
+        self.assertIn("Lecture 1", query.last_text or "")
+
+    async def test_cancel_upload_returns_to_target_folder(self):
+        context = _FakeContext()
+        await self._route(f"admin_upload:{self.path_id}", context)
+        self.assertTrue(context.user_data.get("admin_upload"))
+
+        query = await self._route("cancel", context)
+
+        self.assertIsNone(context.user_data.get("admin_upload"))
+        self.assertIn("Pathology", query.last_text or "")
+
+    async def test_cancel_file_retype_returns_to_that_resource(self):
+        context = _FakeContext()
+        await self._route(f"admin_file_retype:{self.content_id}", context)
+        self.assertEqual(
+            context.user_data.get("admin_file_retype_id"), self.content_id
+        )
+
+        query = await self._route("cancel", context)
+
+        self.assertIsNone(context.user_data.get("admin_file_retype_id"))
+        self.assertIn("Lecture 1", query.last_text or "")
+
+    async def test_cancel_with_no_workflow_goes_home(self):
+        context = _FakeContext()
+        query = await self._route("cancel", context)
+
+        self.assertIn("MEDBOT", query.last_text or "")
+
+    async def test_cancel_button_in_type_keyboard_is_unified(self):
+        context = _FakeContext()
+        query = await self._route(
+            f"admin_folder_retype_existing:{self.path_id}", context
+        )
+
+        callbacks = [
+            button.callback_data
+            for row in query.last_markup.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("cancel", callbacks)
+
+    async def test_cancel_mcq_add_returns_to_mcq_bank(self):
+        context = _FakeContext()
+        await database.add_sub_admin(501, "ai-admin")
+        await database.update_admin_permissions(501, {"can_ai": True})
+
+        query = _FakeQuery(501, "admin_mcq_add")
+        await main.callback_router(_FakeUpdate(query), context)
+        self.assertTrue(context.user_data.get("admin_mcq_step"))
+
+        cancel = _FakeQuery(501, "cancel")
+        await main.callback_router(_FakeUpdate(cancel), context)
+
+        self.assertIsNone(context.user_data.get("admin_mcq_step"))
+        self.assertIn("بنك الأسئلة", cancel.last_text or "")
+
+    async def test_slash_cancel_clears_contribution_and_mcq_session(self):
+        context = _FakeContext()
+        context.user_data["contribution_mode"] = True
+        context.user_data["contribution_folder"] = self.path_id
+        context.user_data["mcq_session"] = {"idx": 1}
+
+        msg = _TextMessage("/cancel")
+        await main.cancel_command(_MediaUpdate(500, msg), context)
+
+        self.assertIsNone(context.user_data.get("contribution_mode"))
+        self.assertIsNone(context.user_data.get("contribution_folder"))
+        self.assertIsNone(context.user_data.get("mcq_session"))
 
 
 class ContributionTargetingTests(unittest.IsolatedAsyncioTestCase):
