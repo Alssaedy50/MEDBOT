@@ -22,6 +22,7 @@ ai_router.py (AIFactory → Provider → GroundingValidator → response)
 - `search_engine.py` — Deterministic search with Arabic normalization
 - `ai_router.py` — Provider adapters (Gemini), router with failover, grounding
 - `ai_discovery.py` — CLI discovery tool
+- `messaging.py` — Contact Admin messaging system (isolated; see below)
 
 ## Database Schema
 
@@ -46,28 +47,92 @@ ai_router.py (AIFactory → Provider → GroundingValidator → response)
 ### settings
 `key (PK), value`
 
+### messages
+`id (PK), user_id, user_name, category, body, status, admin_reply, reviewed_by, created_at, updated_at`
+
+Contact Admin messaging only. `category` ∈ {message, summary, suggestion, report};
+`status` ∈ {NEW, IN_REVIEW, REPLIED, CLOSED}. No FK to content/contributions.
+
 ## Migrations
 - _migrate_v1: Added accepts_contributions (folders), source_type/source_contribution_id/created_by (content)
 - _migrate_v2: Added error_category, timeout_behavior, rate_limit_behavior (ai_registry)
+- _migrate_v3: Added reviewed_by, reviewed_at, review_note, rejection_reason, resubmitted_count (contributions) + idx_contrib_user_status
+- _migrate_v4: Created `messages` table (Contact Admin) + idx_messages_status, idx_messages_user
 
-All migrations are idempotent (ALTER TABLE ADD COLUMN wrapped in try/except).
+All migrations are idempotent (ALTER TABLE ADD COLUMN / CREATE TABLE IF NOT EXISTS wrapped in try/except).
+Migrations are additive only: existing rows are never rewritten, so pre-migration data stays valid.
+
+## Modular separation (applied to new systems)
+
+New systems must not accumulate in `main.py`/`database.py`. Each new system gets:
+
+1. its own module (e.g. `messaging.py`),
+2. its own DB access functions, namespaced to that system,
+3. one entry point `register_<name>_handlers(app)` (the pattern used by
+   `mcq_quiz.register_quiz_handlers` and `messaging.register_messaging_handlers`).
+
+Existing working code is not refactored in place; the pattern is applied to new systems only.
+
+### Contact Admin messaging (`messaging.py`)
+
+- Isolated from library, contributions and exams: owns the `messages` table only.
+- Entry point: `messaging.register_messaging_handlers(app)`, called in `main.py`
+  **before** the catch-all `CallbackQueryHandler(callback_router)` so its
+  `contact` / `msg_*` callbacks win.
+- Callback namespace: `contact`, `msg_cat:<category>`, `msg_mine`, `msg_cancel`,
+  `admin_messages`, `msg_open:<id>`, `msg_reply:<id>`, `msg_status:<id>:<status>`.
+- Categories: `message`, `summary`, `suggestion`, `report`.
+- Lifecycle: `NEW → IN_REVIEW → REPLIED → CLOSED`.
+- Student flow: home button **📬 Contact Admin** → category → typed body →
+  stored with status `NEW` + receipt confirmation → **📥 رسائلي** shows status,
+  reply, and history.
+- Admin flow: Admin Panel → **📬 رسائل الطلاب** → open a message → reply /
+  mark in-review / close. Replying notifies the student and sets `REPLIED`.
+- Authorization: every admin callback re-checks `database.is_user_admin()`;
+  callback data is treated as untrusted. Malformed IDs fail safely.
+- State keys (namespaced): `contact_category`, `contact_reply_id`. Cleared on
+  `/cancel`, on returning home, and after a successful action.
+- Text capture is wired into `ai_handler` ahead of the upload/title states, so a
+  message body is never consumed by the AI or upload flows.
 
 ## Contribution Lifecycle
 
 1. Student clicks `contrib_{folder_id}` → sends media
-2. `add_contribution()` creates pending entry
-3. Admin receives file + approve/reject buttons
-4. `approve_contribution()`:
+2. `add_contribution()` validates the submission then creates a pending entry
+3. Admins are notified of the new contribution (per-recipient failures are non-fatal)
+4. Admin opens the review screen: Approve / Reject / Needs Revision
+5. `approve_contribution()`:
    - Transactional: BEGIN IMMEDIATE
-   - Checks status = 'pending'
+   - Checks status ∈ ('pending', 'needs_revision')
    - Inserts into content with source_contribution_id
-   - Updates contribution status to 'approved'
+   - Updates contribution status to 'approved', records `reviewed_by` / `reviewed_at`
    - Notifies student
-5. `reject_contribution()`:
-   - Checks status = 'pending'
-   - Updates status to 'rejected'
-   - Notifies student
-6. Double approval/rejection blocked by status check
+6. `reject_contribution()`:
+   - Checks status ∈ ('pending', 'needs_revision')
+   - Requires a typed reason from the admin; stores it in `rejection_reason`,
+     records `reviewed_by` / `reviewed_at`, sets status 'rejected'
+   - Notifies student with the reason
+7. `request_contribution_revision()`:
+   - Sets status 'needs_revision', stores the admin `review_note`, notifies student
+8. Resubmission — `resubmit_contribution()`:
+   - Owner-only and `needs_revision`-only
+   - Replaces the media, clears review fields, returns status to 'pending',
+     increments `resubmitted_count`
+9. Double approval/rejection blocked by status check; publishing a rejected item is impossible
+
+Statuses: `pending`, `approved`, `rejected`, `needs_revision`
+(`pending` and `needs_revision` are the reviewable set).
+
+## Submission validation
+
+`validate_contribution_submission()` checks, and `add_contribution()` enforces
+by raising `ContributionValidationError`:
+
+- file id present and within `MAX_CONTRIBUTION_FILE_ID_LENGTH`
+- title present and within `MAX_CONTRIBUTION_TITLE_LENGTH`
+- file type ∈ `CONTRIBUTION_FILE_TYPES`
+- target folder exists **and** accepts contributions
+- no obvious duplicate from the same user in the same folder
 
 ## Admin Controls (ADMIN_ID env)
 

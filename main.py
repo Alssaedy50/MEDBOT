@@ -50,6 +50,7 @@ from telegram.ext import (
 )
 
 import database
+import messaging
 from ai import (
     generate_medical_ai_response,
     generate_medbot_assistant_response,
@@ -169,6 +170,7 @@ def home_keyboard():
                 btn("📊 My Account", "account"),
             ],
             [
+                btn("📬 Contact Admin", "contact"),
                 btn("ℹ️ About MEDBOT", "about"),
             ],
             [
@@ -2674,15 +2676,22 @@ async def show_admin(query):
     except Exception:
         pending_count = 0
 
+    try:
+        open_messages = await database.get_open_messages_count()
+    except Exception:
+        open_messages = 0
+
     await edit_safe(
         query,
         "🛠 *MEDBOT Admin Panel*\n\n"
-        f"📤 المساهمات المعلقة: {pending_count}\n\n"
+        f"📤 المساهمات المعلقة: {pending_count}\n"
+        f"📬 رسائل الطلاب غير المغلقة: {open_messages}\n\n"
         "اختر الإجراء:",
         InlineKeyboardMarkup(
             [
                 [btn("🗂 إدارة الأقسام والفروع", "admin_folders")],
                 [btn("📥 مراجعة المساهمات", "admin_pending")],
+                [btn("📬 رسائل الطلاب", "admin_messages")],
                 [btn("🤖 AI Registry", "admin_ai")],
                 [btn("📊 Runtime", "admin_runtime")],
                 [btn("🏠 الرئيسية", "home")],
@@ -3265,6 +3274,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _clear_admin_state(context)
         _clear_review_state(context)
         _clear_contribution_state(context)
+        messaging._clear_contact_state(context)
         await show_home(update)
         return
 
@@ -4167,11 +4177,17 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         or context.user_data.get("contribution_resubmit_id")
     )
 
+    contact_active = bool(
+        context.user_data.get("contact_category")
+        or context.user_data.get("contact_reply_id")
+    )
+
     _clear_admin_state(context)
     _clear_review_state(context)
     _clear_contribution_state(context)
+    messaging._clear_contact_state(context)
 
-    if active or review_active:
+    if active or review_active or contact_active:
         await update.message.reply_text(
             "❌ تم إلغاء العملية الجارية.",
             reply_markup=home_keyboard(),
@@ -4200,6 +4216,13 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Typed rejection reason / revision note takes absolute priority.
     if await process_review_text(update, context):
+        return
+
+    # Contact Admin captures: student message body / admin reply.
+    if await messaging.handle_contact_text(update, context):
+        return
+
+    if await messaging.handle_admin_reply_text(update, context):
         return
 
     # Custom title input (upload / resource rename) has the highest priority.
@@ -4431,6 +4454,10 @@ def main():
     app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("ask", ai_handler))
+
+    # Contact Admin messaging (isolated module). Must register before the
+    # catch-all inline UI handler so its `msg_*`/`contact` callbacks win.
+    messaging.register_messaging_handlers(app)
 
     # Inline UI
     app.add_handler(CallbackQueryHandler(callback_router))
