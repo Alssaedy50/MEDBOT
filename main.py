@@ -53,6 +53,10 @@ import database
 import messaging
 import audit
 import admin_management
+import i18n
+import platform_settings
+import topics
+import notifications
 from ai import (
     generate_medical_ai_response,
     generate_medbot_assistant_response,
@@ -96,7 +100,11 @@ logger = logging.getLogger(__name__)
 
 
 async def send_safe_message(update: Update, text: str, reply_markup=None):
-    """Send long messages safely."""
+    """Send long messages safely.
+
+    Delivered as a NEW message and registered as persistent content, so it is
+    never overwritten in place by a later navigation action.
+    """
     if not text:
         text = "لا توجد بيانات متاحة حالياً."
 
@@ -104,24 +112,31 @@ async def send_safe_message(update: Update, text: str, reply_markup=None):
     if not message:
         return
 
+    user = getattr(update, "effective_user", None)
+    user_id = getattr(user, "id", None)
+
     chunk_size = 4000
     chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
 
     for index, chunk in enumerate(chunks):
         for attempt in range(2):
             try:
-                await message.reply_text(
+                sent = await message.reply_text(
                     chunk,
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=reply_markup if index == len(chunks) - 1 else None,
                 )
+                _register_content_message(user_id, getattr(sent, "message_id", None))
                 break
             except Exception:
                 try:
-                    await message.reply_text(
+                    sent = await message.reply_text(
                         chunk,
                         parse_mode=None,
                         reply_markup=reply_markup if index == len(chunks) - 1 else None,
+                    )
+                    _register_content_message(
+                        user_id, getattr(sent, "message_id", None)
                     )
                     break
                 except Exception as exc:
@@ -151,14 +166,98 @@ def _clamp_text(text, limit=TELEGRAM_TEXT_LIMIT):
     return body + "\n\n… (تم اختصار العرض لطوله)"
 
 
+# ============================================================
+# MESSAGE LIFECYCLE
+# ============================================================
+# Educational content (AI answers, search results, resource messages) is
+# delivered as NEW messages and its id is remembered. Navigation screens are
+# edited in place, but `edit_safe` refuses to edit a message that is
+# registered content and sends a fresh one instead — so a later callback can
+# never wipe out something the user is meant to keep.
+
+# Module-level mirror of delivered content message ids, keyed by user id. It
+# lets `edit_safe` (which only receives a query) recognise that the message a
+# button lives on is *delivered content* and must not be overwritten in place.
+# Bounded on both axes so it can never grow without limit.
+_CONTENT_MESSAGES_BY_USER = {}
+_CONTENT_REGISTRY_LIMIT = 200
+_CONTENT_REGISTRY_MAX_USERS = 5000
+
+
+def _register_content_message(user_id, message_id):
+    if user_id is None or message_id is None:
+        return
+    try:
+        uid = int(user_id)
+        tracked = _CONTENT_MESSAGES_BY_USER.setdefault(uid, [])
+        tracked.append(int(message_id))
+        del tracked[:-_CONTENT_REGISTRY_LIMIT]
+        # Keep the per-user map bounded: drop the oldest users when it grows.
+        while len(_CONTENT_MESSAGES_BY_USER) > _CONTENT_REGISTRY_MAX_USERS:
+            _CONTENT_MESSAGES_BY_USER.pop(next(iter(_CONTENT_MESSAGES_BY_USER)))
+    except Exception:
+        pass
+
+
+def _is_content_message(user_id, message_id) -> bool:
+    if user_id is None or message_id is None:
+        return False
+    try:
+        return int(message_id) in _CONTENT_MESSAGES_BY_USER.get(int(user_id), [])
+    except Exception:
+        return False
+
+
+# ============================================================
+# LOCALIZATION
+# ============================================================
+
+
+async def user_lang(user_id) -> str:
+    """Resolve the caller's language for interface strings."""
+    try:
+        return await database.get_user_language(user_id)
+    except Exception:
+        return i18n.DEFAULT_LANGUAGE
+
+
+async def _platform_name() -> str:
+    try:
+        return await database.get_platform_setting("platform_name")
+    except Exception:
+        return "MEDBOT"
+
+
+
 async def edit_safe(query, text, reply_markup=None, parse_mode=ParseMode.MARKDOWN):
     """Safely edit an inline message.
 
     Falls back to plain text if the requested parse mode fails, so a
     malformed entity can never leave the caller stuck on a stale screen.
     Oversized text is clamped rather than dropped.
+
+    If the message being edited is *delivered content* (an AI answer, search
+    results or a resource message), the screen is sent as a NEW message
+    instead. This is the fix for the reported bug where navigating away from a
+    delivered answer wiped it out: a later tap can never overwrite content the
+    user is meant to keep.
     """
     text = _clamp_text(text or "")
+
+    message = getattr(query, "message", None)
+    user = getattr(query, "from_user", None)
+    message_id = getattr(message, "message_id", None)
+    user_id = getattr(user, "id", None)
+
+    if _is_content_message(user_id, message_id):
+        try:
+            await message.reply_text(
+                text, parse_mode=None, reply_markup=reply_markup
+            )
+            return
+        except Exception as exc:
+            logger.warning("Failed to send navigation message: %s", exc)
+            return
 
     for mode in (parse_mode, None):
         try:
@@ -201,8 +300,12 @@ def home_keyboard():
                 btn("📊 My Account", "account"),
             ],
             [
-                btn("📬 Contact Admin", "contact"),
-                btn("ℹ️ About MEDBOT", "about"),
+                btn("🧭 المواضيع", "topics"),
+                btn("🌐 اللغة", "language"),
+            ],
+            [
+                btn("📬 تواصل مع المنصة", "contact"),
+                btn("ℹ️ عن المنصة", "about"),
             ],
         ]
     )
@@ -251,13 +354,17 @@ async def show_home(update: Update):
         max_limit=DAILY_LIMIT,
     )
 
+    lang = await user_lang(user.id)
+    platform = await _platform_name()
+
+    welcome = await database.get_platform_setting("welcome_message")
+
     text = (
-        f"🩺 *MEDBOT*\n\n"
+        f"🩺 *{platform}*\n\n"
         f"مرحباً بك دكتور {user.first_name}.\n\n"
-        "منصة أكاديمية طبية تساعدك على الوصول إلى مكتبة MEDBOT "
-        "والبحث في الموارد المسجلة واستخدام المساعد الذكي ضمن محتوى MEDBOT.\n\n"
+        f"{welcome}\n\n"
         f"📊 *رصيد الذكاء الاصطناعي اليوم:* {remaining}/{DAILY_LIMIT}\n\n"
-        "اختر الخدمة التي تريد استخدامها:"
+        + i18n.t("choose_service", lang)
     )
 
     if update.callback_query:
@@ -568,11 +675,12 @@ async def open_file(query, context, content_id):
         return
 
     chat_id = query.message.chat_id
+    user_id = getattr(query.from_user, "id", None)
 
     try:
         await _send_registered_media(context, chat_id, file_id, file_type, title)
 
-        await context.bot.send_message(
+        sent = await context.bot.send_message(
             chat_id=chat_id,
             text="📚 يمكنك العودة إلى المكتبة من هنا:",
             reply_markup=InlineKeyboardMarkup(
@@ -583,6 +691,9 @@ async def open_file(query, context, content_id):
                 ]
             ),
         )
+        # The resource message is educational content: keep it out of reach of
+        # in-place navigation edits.
+        _register_content_message(user_id, getattr(sent, "message_id", None))
 
     except Exception:
         logger.exception("File send failed for content id=%s", content_id)
@@ -709,10 +820,16 @@ async def run_search(update: Update, query_text):
     buttons.append([btn("🤖 العودة للمساعد", "assistant")])
     buttons.append([btn("🏠 الرئيسية", "home")])
 
-    await update.message.reply_text(
+    sent = await update.message.reply_text(
         "\n".join(lines),
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    # Search results are persistent educational content: register them so a
+    # later navigation tap cannot overwrite them in place.
+    user = getattr(update, "effective_user", None)
+    _register_content_message(
+        getattr(user, "id", None), getattr(sent, "message_id", None)
     )
 
 
@@ -727,11 +844,15 @@ async def show_account(query):
     except Exception:
         remaining = "غير متاح"
 
+    lang = await user_lang(user.id)
+    language_label = database.LANGUAGE_LABELS.get(lang, lang)
+
     text = (
-        "📊 *My Account*\n\n"
+        f"{i18n.t('account_title', lang)}\n\n"
         f"👤 الاسم: {user.full_name}\n"
         f"🆔 Telegram ID: `{user.id}`\n\n"
         f"🤖 رصيد AI اليومي: {remaining}/{DAILY_LIMIT}\n\n"
+        f"{i18n.t('account_language', lang)}: {language_label}\n\n"
         "يتم تجديد الرصيد تلقائياً مع بداية يوم جديد."
     )
 
@@ -740,7 +861,59 @@ async def show_account(query):
         text,
         InlineKeyboardMarkup(
             [
-                [btn("🏠 الرئيسية", "home")],
+                [btn(i18n.t("menu_language", lang), "language")],
+                [btn(i18n.t("home", lang), "home")],
+            ]
+        ),
+    )
+
+
+async def show_language(query):
+    user = query.from_user
+    lang = await user_lang(user.id)
+
+    rows = []
+    for code in database.SUPPORTED_LANGUAGES:
+        mark = "✅" if code == lang else "▫️"
+        rows.append(
+            [btn(f"{mark} {database.LANGUAGE_LABELS.get(code, code)}",
+                 f"lang_set:{code}")]
+        )
+    rows.append([btn(i18n.t("home", lang), "home")])
+
+    await edit_safe(
+        query,
+        i18n.t("language_title", lang),
+        InlineKeyboardMarkup(rows),
+    )
+
+
+async def set_language(query, context, code):
+    user = query.from_user
+
+    ok = await database.set_user_language(user.id, code)
+
+    if not ok:
+        await edit_safe(
+            query,
+            "⚠️ لغة غير مدعومة.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    await audit.log_action(
+        user.id, "language_set", target_type="user",
+        target_id=user.id, details=code,
+    )
+
+    lang = await user_lang(user.id)
+    await edit_safe(
+        query,
+        i18n.t("language_saved", lang),
+        InlineKeyboardMarkup(
+            [
+                [btn(i18n.t("menu_language", lang), "language")],
+                [btn(i18n.t("home", lang), "home")],
             ]
         ),
     )
@@ -748,7 +921,7 @@ async def show_account(query):
 
 async def show_about(query):
     try:
-        about = await database.get_about_us()
+        about = await database.get_platform_setting("platform_about")
     except Exception:
         about = None
 
@@ -758,12 +931,15 @@ async def show_about(query):
             "لتنظيم والوصول إلى الموارد التعليمية الطبية المسجلة."
         )
 
+    platform = await _platform_name()
+    lang = await user_lang(query.from_user.id)
+
     await edit_safe(
         query,
-        f"ℹ️ *About MEDBOT*\n\n{about}",
+        f"ℹ️ *{platform}*\n\n{about}",
         InlineKeyboardMarkup(
             [
-                [btn("🏠 الرئيسية", "home")],
+                [btn(i18n.t("home", lang), "home")],
             ]
         ),
     )
@@ -2514,7 +2690,12 @@ async def admin_file_delete(query, context, content_id):
 
 
 async def admin_folder_move_menu(query, context):
-    """Show target folders for moving a folder."""
+    """Show the hierarchy so the admin can pick any valid destination.
+
+    Offers Root plus the whole tree (with cycle-safe candidates excluded), so a
+    branch can be moved from one part of the hierarchy to another without
+    losing its children or resources.
+    """
     if not await _admin_check(query):
         await edit_safe(
             query,
@@ -2556,29 +2737,67 @@ async def admin_folder_move_menu(query, context):
 
     context.user_data["admin_folder_move"] = True
 
-    rows = [[btn("🏠 نقل إلى الجذر", f"admin_folder_move_to:{folder_id}:0")]]
+    await _render_move_targets(query, context, folder_id, folder, parent_id=0)
 
+
+async def _render_move_targets(query, context, folder_id, folder, parent_id=0):
+    """Render one level of the destination picker for moving `folder_id`."""
     try:
-        roots = await database.get_folders(0)
+        children = await database.get_folders(parent_id)
     except Exception:
-        roots = []
+        children = []
 
-    for item in roots:
+    if parent_id:
         try:
-            target_id, name, _node_type, _acc = item[:4]
+            breadcrumb = await database.get_breadcrumbs(parent_id)
+        except Exception:
+            breadcrumb = f"#{parent_id}"
+    else:
+        breadcrumb = "الجذر 🏠"
+
+    rows = []
+    if parent_id == 0:
+        rows.append(
+            [btn("🏠 نقل إلى الجذر", f"admin_folder_move_to:{folder_id}:0")]
+        )
+
+    for item in children:
+        try:
+            target_id, name, node_type, _acc = item[:4]
         except Exception:
             continue
 
-        if int(target_id) == folder_id:
+        # A section cannot be moved into itself or one of its descendants.
+        if int(target_id) == int(folder_id):
+            continue
+
+        try:
+            if await database.is_descendant_of(int(folder_id), target_id):
+                # target lies inside the moved folder -> invalid destination.
+                continue
+        except Exception:
             continue
 
         rows.append(
             [
                 btn(
-                    f"📁 {str(name)[:35]}",
-                    f"admin_folder_move_to:{folder_id}:{target_id}",
-                )
+                    f"{resource_icon(node_type)} {str(name)[:18]}",
+                    f"admin_folder_move_browse:{folder_id}:{target_id}",
+                ),
+                btn("✅ هنا", f"admin_folder_move_to:{folder_id}:{target_id}"),
             ]
+        )
+
+    if not children and parent_id == 0:
+        rows.append([btn("ℹ️ لا توجد أقسام أخرى", "noop")])
+
+    if parent_id:
+        try:
+            real_parent = await database.get_parent_id(parent_id) or 0
+        except Exception:
+            real_parent = 0
+        rows.append(
+            [btn("⬅️ رجوع", f"admin_folder_move_browse:{folder_id}:{real_parent}")]
         )
 
     rows.append([btn("❌ إلغاء", f"admin_folder:{folder_id}")])
@@ -2586,8 +2805,10 @@ async def admin_folder_move_menu(query, context):
     await edit_safe(
         query,
         "🚚 *نقل القسم*\n\n"
-        f"📁 القسم: <b>{escape(str(folder[2]))}</b>\n\n"
-        "اختر القسم الهدف (الجذر أو قسم رئيسي):",
+        f"📁 القسم: <b>{escape(str(folder[2]))}</b>\n"
+        f"📍 الموقع الحالي للاختيار: {breadcrumb}\n\n"
+        "ادخل بين الأقسام لاختيار القسم الأب الجديد، "
+        "ثم اضغط «✅ هنا» بجانب القسم المطلوب، أو «🏠 نقل إلى الجذر».",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(rows),
     )
@@ -3017,6 +3238,12 @@ async def show_admin(query):
         rows.append([btn("📬 رسائل الطلاب", "admin_messages")])
     if await _allowed("can_ai"):
         rows.append([btn("🤖 AI Registry", "admin_ai")])
+    if await _allowed("can_notifications"):
+        rows.append([btn("🔔 الإشعارات", "admin_notifications")])
+    if await _allowed("can_topics"):
+        rows.append([btn("🧭 مواضيع البحث", "admin_topics")])
+    if await _allowed("can_settings"):
+        rows.append([btn("⚙️ إعدادات المنصة", "admin_settings")])
 
     rows.append([btn("📊 Runtime", "admin_runtime")])
 
@@ -3673,6 +3900,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "noop":
         return
 
+    if data == "language":
+        await show_language(query)
+        return
+
+    if data.startswith("lang_set:"):
+        await set_language(query, context, data.split(":", 1)[1])
+        return
+
     if data.startswith("library:"):
         try:
             parent_id = int(data.split(":", 1)[1])
@@ -4119,6 +4354,47 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⚠️ معرف غير صالح.",
                 InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
             )
+        return
+
+    if data.startswith("admin_folder_move_browse:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            await edit_safe(
+                query,
+                "⚠️ بيانات غير صالحة.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+        if not await _admin_check(query):
+            await edit_safe(
+                query, "🔒 غير مصرح.",
+                InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+            )
+            return
+        if not await _require_permission(query, "can_folders"):
+            return
+        try:
+            folder_id = int(parts[1])
+            parent_id = int(parts[2])
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                "⚠️ معرف غير صالح.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+        folder = await database.get_folder(folder_id)
+        if not folder:
+            _clear_admin_state(context)
+            await edit_safe(
+                query,
+                "⚠️ القسم غير موجود.",
+                InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
+            )
+            return
+        context.user_data["admin_folder_move"] = True
+        context.user_data["admin_folder_move_id"] = folder_id
+        await _render_move_targets(query, context, folder_id, folder, parent_id)
         return
 
     if data.startswith("admin_folder_move:"):
@@ -4619,12 +4895,26 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         or context.user_data.get("contact_reply_id")
     )
 
+    other_active = bool(
+        context.user_data.get("settings_edit_key")
+        or context.user_data.get("topics_create")
+        or context.user_data.get("topics_link_id")
+        or context.user_data.get("notifications_body")
+    )
+
     _clear_admin_state(context)
     _clear_review_state(context)
     _clear_contribution_state(context)
     messaging._clear_contact_state(context)
+    for key in (
+        "settings_edit_key",
+        "topics_create",
+        "topics_link_id",
+        "notifications_body",
+    ):
+        context.user_data.pop(key, None)
 
-    if active or review_active or contact_active:
+    if active or review_active or contact_active or other_active:
         await update.message.reply_text(
             "❌ تم إلغاء العملية الجارية.",
             reply_markup=await home_for(update),
@@ -4664,6 +4954,18 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Owner adding a sub-admin by ID/@username.
     if await admin_management.handle_add_admin_text(update, context):
+        return
+
+    # Platform Settings: admin typing a new setting value.
+    if await platform_settings.handle_settings_text(update, context):
+        return
+
+    # Search Topics: admin typing a topic name / folder id.
+    if await topics.handle_topics_text(update, context):
+        return
+
+    # Notifications: admin typing a broadcast body.
+    if await notifications.handle_notification_text(update, context):
         return
 
     # Custom title input (upload / resource rename) has the highest priority.
@@ -4915,6 +5217,9 @@ def main():
     messaging.register_messaging_handlers(app)
     audit.register_audit_handlers(app)
     admin_management.register_admin_management_handlers(app)
+    platform_settings.register_platform_settings_handlers(app)
+    topics.register_topics_handlers(app)
+    notifications.register_notifications_handlers(app)
 
     # Inline UI
     app.add_handler(CallbackQueryHandler(callback_router))

@@ -442,7 +442,9 @@ class MainIntegrationTests(MessagingBase):
         """`contact` must resolve to messaging, not fall through silently."""
         query, _ = await self._route(self.student_id, "contact")
         self.assertIsNotNone(query.last_text)
-        self.assertIn("التواصل مع الإدارة", query.last_text)
+        # The contact label is platform-configurable and defaults to the
+        # broader "تواصل مع المنصة" concept.
+        self.assertIn("تواصل مع المنصة", query.last_text)
 
     async def test_ai_handler_routes_contact_state(self):
         """ai_handler must consume the body via messaging, not the AI path."""

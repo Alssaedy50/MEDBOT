@@ -46,6 +46,14 @@ HOME_KEYBOARD = InlineKeyboardMarkup(
 )
 
 
+async def _contact_label() -> str:
+    """Platform-configurable contact label (defaults to 'تواصل مع المنصة')."""
+    try:
+        return await database.get_platform_setting("contact_text")
+    except Exception:
+        return "تواصل مع المنصة"
+
+
 def _contact_keyboard():
     rows = [
         [btn("💬 رسالة", "msg_cat:message")],
@@ -98,9 +106,10 @@ async def _reply(update, text, markup=None):
 
 async def contact_admin_screen(query, context):
     _clear_contact_state(context)
+    label = await _contact_label()
     await _edit(
         query,
-        "📬 <b>التواصل مع الإدارة</b>\n\n"
+        f"📬 <b>{esc(label)}</b>\n\n"
         "اختر نوع الرسالة التي تريد إرسالها.\n"
         "يمكنك إرسال رسالة، طلب ملخص، اقتراح، أو بلاغ.",
         _contact_keyboard(),
