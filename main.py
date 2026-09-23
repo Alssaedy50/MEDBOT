@@ -165,7 +165,10 @@ def home_keyboard():
                 btn("📤 Student Contributions", "contribute"),
             ],
             [
+                btn("📄 مساهماتي", "my_contributions"),
                 btn("📊 My Account", "account"),
+            ],
+            [
                 btn("ℹ️ About MEDBOT", "about"),
             ],
             [
@@ -689,6 +692,153 @@ async def show_about(query):
 # ============================================================
 
 
+CONTRIBUTION_STATUS_LABELS = {
+    "pending": "⏳ قيد المراجعة",
+    "approved": "✅ معتمدة ومنشورة",
+    "rejected": "❌ مرفوضة",
+    "needs_revision": "✏️ بحاجة إلى تعديل",
+}
+
+
+async def show_my_contributions(query):
+    """List the caller's own contributions with a resubmit option."""
+    user = query.from_user
+
+    try:
+        items = await database.get_user_contributions(user.id)
+    except Exception:
+        logger.exception("Loading user contributions failed")
+        items = []
+
+    if not items:
+        text = (
+            "📄 *مساهماتي*\n\n"
+            "لم ترسل أي مساهمة بعد.\n\n"
+            "استخدم «📤 Student Contributions» لإرسال مورد."
+        )
+        await edit_safe(
+            query,
+            text,
+            InlineKeyboardMarkup(
+                [
+                    [btn("📤 Student Contributions", "contribute")],
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
+        )
+        return
+
+    buttons = []
+    lines = ["📄 *مساهماتي*\n"]
+
+    for item in items:
+        try:
+            (
+                contribution_id,
+                title,
+                _file_type,
+                status,
+                created_at,
+                rejection_reason,
+                review_note,
+            ) = item[:7]
+        except Exception:
+            continue
+
+        label = CONTRIBUTION_STATUS_LABELS.get(status, status)
+        lines.append(f"🆔 `{contribution_id}` — {label}\n📄 {title}")
+
+        if status == "needs_revision" and review_note:
+            lines.append(f"✏️ الملاحظات: {review_note}")
+
+        if status == "rejected" and rejection_reason:
+            lines.append(f"❌ السبب: {rejection_reason}")
+
+        lines.append("")
+
+        if status == "needs_revision":
+            buttons.append(
+                [
+                    btn(
+                        f"✏️ إعادة إرسال {str(title)[:20]}",
+                        f"resubmit:{contribution_id}",
+                    )
+                ]
+            )
+
+    buttons.append([btn("📤 Student Contributions", "contribute")])
+    buttons.append([btn("🏠 الرئيسية", "home")])
+
+    await edit_safe(
+        query,
+        "\n".join(lines),
+        InlineKeyboardMarkup(buttons),
+    )
+
+
+async def begin_resubmission(query, context, contribution_id):
+    """Verify ownership/status, then ask the contributor for new media."""
+    try:
+        record = await database.get_contribution(contribution_id)
+    except Exception:
+        record = None
+
+    if not record:
+        await edit_safe(
+            query,
+            "⚠️ المساهمة غير موجودة.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    owner_id, status, folder_id = record[1], record[7], record[3]
+
+    if int(owner_id) != int(query.from_user.id):
+        await edit_safe(
+            query,
+            "🔒 يمكن لصاحب المساهمة فقط إعادة إرسالها.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    if status != "needs_revision":
+        await edit_safe(
+            query,
+            "ℹ️ هذه المساهمة ليست بحاجة إلى تعديل.",
+            InlineKeyboardMarkup(
+                [
+                    [btn("📄 مساهماتي", "my_contributions")],
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
+        )
+        return
+
+    if not await database.folder_accepts_contributions(folder_id):
+        await edit_safe(
+            query,
+            "⚠️ القسم لم يعد يستقبل مساهمات.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    context.user_data["contribution_resubmit_id"] = int(contribution_id)
+    context.user_data.pop("contribution_folder", None)
+
+    await edit_safe(
+        query,
+        "✏️ *إعادة إرسال المساهمة*\n\n"
+        f"رقم المساهمة: `{contribution_id}`\n\n"
+        "أرسل الآن النسخة المعدّلة كـ Document أو Audio أو Video أو Photo.",
+        InlineKeyboardMarkup(
+            [
+                [btn("❌ إلغاء", "my_contributions")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
 async def contribution_folders():
     db = await database.get_db()
 
@@ -783,19 +933,61 @@ async def select_contribution_folder(query, context, folder_id):
 
 def _clear_contribution_state(context):
     context.user_data.pop("contribution_folder", None)
+    context.user_data.pop("contribution_resubmit_id", None)
+
+
+async def notify_admins_new_contribution(bot, contribution_id: int, title: str, contributor: str):
+    """Ping every admin about a new/reopened contribution.
+
+    Failures are per-recipient and non-fatal: a blocked admin must never
+    prevent the contribution from being recorded.
+    """
+    try:
+        admins = await database.get_all_admins()
+    except Exception:
+        logger.exception("Could not load admins for contribution notification")
+        return 0
+
+    text = (
+        "📥 *مساهمة جديدة بانتظار المراجعة*\n\n"
+        f"🆔 المساهمة: `{contribution_id}`\n"
+        f"📄 العنوان: <b>{escape(str(title))}</b>\n"
+        f"👤 من: {escape(str(contributor or 'طالب'))}\n\n"
+        "افتح لوحة الإدارة للمراجعة."
+    )
+
+    delivered = 0
+
+    for row in admins:
+        admin_id = row[0]
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+            delivered += 1
+        except Exception:
+            logger.warning(
+                "Contribution notification failed for admin %s", admin_id
+            )
+
+    return delivered
 
 
 async def contribution_media_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     folder_id = context.user_data.get("contribution_folder")
+    resubmit_id = context.user_data.get("contribution_resubmit_id")
 
-    if not folder_id:
+    if not folder_id and not resubmit_id:
         return False
 
     user = update.effective_user
     file_id = None
     file_type = None
+    title = None
 
     if update.message.document:
         file_id = update.message.document.file_id
@@ -823,6 +1015,47 @@ async def contribution_media_handler(
         )
         return True
 
+    # --- Resubmission of a needs_revision contribution ---------------
+    if resubmit_id:
+        try:
+            ok, result = await database.resubmit_contribution(
+                int(resubmit_id),
+                user.id,
+                title,
+                file_id,
+                file_type,
+            )
+        except Exception:
+            logger.exception("Contribution resubmission failed")
+            ok, result = False, "⚠️ تعذر إعادة إرسال المساهمة حالياً."
+
+        if not ok:
+            await update.message.reply_text(
+                result,
+                reply_markup=home_keyboard(),
+            )
+            return True
+
+        _clear_contribution_state(context)
+
+        await update.message.reply_text(
+            "✅ *تم استلام التعديل وإعادة إرسال المساهمة.*\n\n"
+            f"رقم المساهمة: `{resubmit_id}`\n"
+            "الحالة الحالية: `pending`\n\n"
+            "ستتم مراجعتها من جديد.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=home_keyboard(),
+        )
+
+        await notify_admins_new_contribution(
+            context.bot,
+            int(resubmit_id),
+            result,
+            user.full_name,
+        )
+        return True
+
+    # --- New submission ----------------------------------------------
     try:
         contribution_id = await database.add_contribution(
             user.id,
@@ -832,24 +1065,37 @@ async def contribution_media_handler(
             file_id,
             file_type,
         )
-
-        context.user_data.pop("contribution_folder", None)
-
+    except database.ContributionValidationError as exc:
         await update.message.reply_text(
-            "✅ *تم استلام مساهمتك بنجاح.*\n\n"
-            f"رقم المساهمة: `{contribution_id}`\n"
-            "الحالة الحالية: `pending`\n\n"
-            "سيتمكن المشرفون من مراجعتها قبل نشرها في المكتبة.",
-            parse_mode=ParseMode.MARKDOWN,
+            str(exc),
             reply_markup=home_keyboard(),
         )
-
-    except Exception as exc:
+        return True
+    except Exception:
         logger.exception("Contribution failed")
         await update.message.reply_text(
             "⚠️ تعذر تسجيل المساهمة حالياً. لم يتم تأكيد نجاح الإضافة.",
             reply_markup=home_keyboard(),
         )
+        return True
+
+    _clear_contribution_state(context)
+
+    await update.message.reply_text(
+        "✅ *تم استلام مساهمتك بنجاح.*\n\n"
+        f"رقم المساهمة: `{contribution_id}`\n"
+        "الحالة الحالية: `pending`\n\n"
+        "سيتمكن المشرفون من مراجعتها قبل نشرها في المكتبة.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=home_keyboard(),
+    )
+
+    await notify_admins_new_contribution(
+        context.bot,
+        contribution_id,
+        title,
+        user.full_name,
+    )
 
     return True
 
@@ -2579,6 +2825,7 @@ async def review_contribution(query, context, contribution_id):
         f"📄 العنوان: {title}\n"
         f"📁 Folder ID: `{folder_id}`\n"
         f"📎 النوع: {file_type}\n"
+        f"🏷 الحالة: `{status}`\n"
         f"🕒 التاريخ: {created_at}\n"
     )
 
@@ -2591,11 +2838,230 @@ async def review_contribution(query, context, contribution_id):
                     btn("✅ Approve", f"approve:{contribution_id}"),
                     btn("❌ Reject", f"reject:{contribution_id}"),
                 ],
+                [btn("✏️ Needs Revision", f"revise:{contribution_id}")],
                 [btn("⬅️ Pending", "admin_pending")],
                 [btn("🏠 الرئيسية", "home")],
             ]
         ),
     )
+
+
+REVIEW_NOTE_MAX_LENGTH = 400
+
+
+async def _prompt_review_text(query, contribution_id, kind):
+    """Ask the admin to type a rejection reason or revision note."""
+    if kind == "reject":
+        prompt = (
+            "❌ *سبب الرفض*\n\n"
+            f"اكتب سبب رفض المساهمة رقم `{contribution_id}`.\n"
+            "سيُرسل السبب إلى صاحب المساهمة.\n\n"
+            "أو اضغط إلغاء للتراجع."
+        )
+    else:
+        prompt = (
+            "✏️ *ملاحظات التعديل*\n\n"
+            f"اكتب ما يجب تعديله في المساهمة رقم `{contribution_id}`.\n"
+            "ستُرسل الملاحظات إلى صاحب المساهمة.\n\n"
+            "أو اضغط إلغاء للتراجع."
+        )
+
+    await edit_safe(
+        query,
+        prompt,
+        InlineKeyboardMarkup(
+            [
+                [btn("❌ إلغاء", f"review:{contribution_id}")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
+async def process_review_text(update, context):
+    """Consume typed review text when an admin is replying to a prompt.
+
+    Returns True when the message was handled here.
+    """
+    pending_kind = context.user_data.get("review_note_kind")
+    pending_id = context.user_data.get("review_note_id")
+
+    if not pending_kind or not pending_id:
+        return False
+
+    try:
+        is_admin = await database.is_user_admin(update.effective_user.id)
+    except Exception:
+        is_admin = False
+
+    if not is_admin:
+        _clear_review_state(context)
+        await update.message.reply_text(
+            "🔒 غير مصرح.",
+            reply_markup=home_keyboard(),
+        )
+        return True
+
+    text = (update.message.text or "").strip()
+
+    if text == "/cancel":
+        _clear_review_state(context)
+        await update.message.reply_text(
+            "❌ تم إلغاء المراجعة.",
+            reply_markup=home_keyboard(),
+        )
+        return True
+
+    if not text:
+        await update.message.reply_text("⚠️ النص فارغ. اكتب سبباً واضحاً.")
+        return True
+
+    if len(text) > REVIEW_NOTE_MAX_LENGTH:
+        await update.message.reply_text(
+            f"⚠️ النص طويل جداً (الحد {REVIEW_NOTE_MAX_LENGTH} حرفاً)."
+        )
+        return True
+
+    contribution_id = int(pending_id)
+    reviewer_id = update.effective_user.id
+    kind = pending_kind
+
+    _clear_review_state(context)
+
+    if kind == "reject":
+        try:
+            result = await database.reject_contribution(
+                contribution_id,
+                reviewer_id=reviewer_id,
+                reason=text,
+            )
+        except Exception:
+            logger.exception("Contribution rejection with reason failed")
+            result = None
+
+        if not result:
+            await update.message.reply_text(
+                "ℹ️ المساهمة غير موجودة أو تمت معالجتها مسبقاً.",
+                reply_markup=home_keyboard(),
+            )
+            return True
+
+        contributor_id, title = result[0], result[1]
+
+        await update.message.reply_text(
+            f"✅ تم رفض المساهمة رقم `{contribution_id}`.\n"
+            "تم إرسال سبب الرفض إلى صاحب المساهمة.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=home_keyboard(),
+        )
+
+        await _notify_contributor(
+            context.bot,
+            contributor_id,
+            (
+                "📢 تحديث مساهمتك في MEDBOT\n\n"
+                f"تم رفض المساهمة رقم `{contribution_id}`.\n\n"
+                f"السبب:\n{text}"
+            ),
+        )
+        return True
+
+    # kind == "revise"
+    try:
+        result = await database.request_contribution_revision(
+            contribution_id,
+            reviewer_id=reviewer_id,
+            note=text,
+        )
+    except Exception:
+        logger.exception("Contribution revision request failed")
+        result = None
+
+    if not result:
+        await update.message.reply_text(
+            "ℹ️ المساهمة غير موجودة أو تمت معالجتها مسبقاً.",
+            reply_markup=home_keyboard(),
+        )
+        return True
+
+    contributor_id = result[0]
+
+    await update.message.reply_text(
+        f"✅ تم طلب تعديل المساهمة رقم `{contribution_id}`.\n"
+        "تم إرسال الملاحظات إلى صاحب المساهمة.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=home_keyboard(),
+    )
+
+    await _notify_contributor(
+        context.bot,
+        contributor_id,
+        (
+            "📢 تحديث مساهمتك في MEDBOT\n\n"
+            f"المساهمة رقم `{contribution_id}` بحاجة إلى تعديل.\n\n"
+            f"الملاحظات:\n{text}\n\n"
+            "يمكنك إعادة إرسال المساهمة بعد التعديل من "
+            "«📄 مساهماتي»."
+        ),
+    )
+    return True
+
+
+async def _notify_contributor(bot, contributor_id, text):
+    """Best-effort contributor notification. Never raises."""
+    try:
+        await bot.send_message(
+            chat_id=contributor_id,
+            text=text,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        logger.warning("Contributor notification failed for %s", contributor_id)
+
+
+def _clear_review_state(context):
+    context.user_data.pop("review_note_kind", None)
+    context.user_data.pop("review_note_id", None)
+
+
+async def request_review_note(query, context, contribution_id, kind):
+    """Authorize, then arm the typed-text review flow for this admin."""
+    try:
+        is_admin = await database.is_user_admin(query.from_user.id)
+    except Exception:
+        is_admin = False
+
+    if not is_admin:
+        await edit_safe(
+            query,
+            "🔒 غير مصرح لك بمراجعة المساهمات.",
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    try:
+        record = await database.get_contribution(contribution_id)
+    except Exception:
+        record = None
+
+    if not record or record[7] not in database.REVIEWABLE_STATUSES:
+        await edit_safe(
+            query,
+            "ℹ️ المساهمة غير موجودة أو تمت معالجتها مسبقاً.",
+            InlineKeyboardMarkup(
+                [
+                    [btn("📥 Pending", "admin_pending")],
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
+        )
+        return
+
+    if context is not None:
+        context.user_data["review_note_kind"] = kind
+        context.user_data["review_note_id"] = contribution_id
+
+    await _prompt_review_text(query, contribution_id, kind)
 
 
 async def process_approval(query, contribution_id, approve):
@@ -2616,12 +3082,21 @@ async def process_approval(query, contribution_id, approve):
         )
         return
 
+    reviewer_id = query.from_user.id
+
     try:
         if approve:
-            result = await database.approve_contribution(contribution_id)
+            result = await database.approve_contribution(
+                contribution_id,
+                reviewer_id=reviewer_id,
+            )
             action = "اعتماد"
         else:
-            result = await database.reject_contribution(contribution_id)
+            result = await database.reject_contribution(
+                contribution_id,
+                reviewer_id=reviewer_id,
+                reason=None,
+            )
             action = "رفض"
 
         if not result:
@@ -2650,20 +3125,17 @@ async def process_approval(query, contribution_id, approve):
             ),
         )
 
-        # Notify contributor when possible.
-        try:
-            if result and len(result) >= 5:
-                contributor_id = result[4]
-                await query.get_bot().send_message(
-                    chat_id=contributor_id,
-                    text=(
-                        "📢 تحديث مساهمتك في MEDBOT\n\n"
-                        f"تم {action} المساهمة رقم `{contribution_id}`."
-                    ),
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-        except Exception:
-            pass
+        # Only approval carries the contributor id at index 4.
+        if approve and len(result) >= 5:
+            await _notify_contributor(
+                query.get_bot(),
+                result[4],
+                (
+                    "📢 تحديث مساهمتك في MEDBOT\n\n"
+                    f"تم اعتماد المساهمة رقم `{contribution_id}` "
+                    "ونشرها في المكتبة."
+                ),
+            )
 
     except Exception as exc:
         logger.exception("Contribution approval/rejection failed")
@@ -2791,6 +3263,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["search_mode"] = False
         context.user_data["assistant_mode"] = None
         _clear_admin_state(context)
+        _clear_review_state(context)
+        _clear_contribution_state(context)
         await show_home(update)
         return
 
@@ -2920,6 +3394,19 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "about":
         await show_about(query)
+        return
+
+    if data == "my_contributions":
+        _clear_contribution_state(context)
+        await show_my_contributions(query)
+        return
+
+    if data.startswith("resubmit:"):
+        try:
+            contribution_id = int(data.split(":", 1)[1])
+            await begin_resubmission(query, context, contribution_id)
+        except Exception:
+            logger.exception("Resubmission start failed")
         return
 
     if data == "contribute":
@@ -3570,7 +4057,15 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("reject:"):
         try:
             contribution_id = int(data.split(":", 1)[1])
-            await process_approval(query, contribution_id, False)
+            await request_review_note(query, context, contribution_id, "reject")
+        except Exception:
+            pass
+        return
+
+    if data.startswith("revise:"):
+        try:
+            contribution_id = int(data.split(":", 1)[1])
+            await request_review_note(query, context, contribution_id, "revise")
         except Exception:
             pass
         return
@@ -3666,9 +4161,17 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     )
 
-    _clear_admin_state(context)
+    review_active = bool(
+        context.user_data.get("review_note_kind")
+        or context.user_data.get("contribution_folder")
+        or context.user_data.get("contribution_resubmit_id")
+    )
 
-    if active:
+    _clear_admin_state(context)
+    _clear_review_state(context)
+    _clear_contribution_state(context)
+
+    if active or review_active:
         await update.message.reply_text(
             "❌ تم إلغاء العملية الجارية.",
             reply_markup=home_keyboard(),
@@ -3694,6 +4197,10 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     query = update.message.text.strip()
+
+    # Typed rejection reason / revision note takes absolute priority.
+    if await process_review_text(update, context):
+        return
 
     # Custom title input (upload / resource rename) has the highest priority.
     if context.user_data.get("admin_upload_waiting_title") or (
