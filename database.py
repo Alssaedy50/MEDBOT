@@ -1013,6 +1013,19 @@ async def is_user_admin(telegram_id: int) -> bool:
 
 
 # --- دوال الإدارة المتقدمة للمالك ---
+async def ensure_configured_admin(telegram_id: int, username: str = None) -> bool:
+    """Grant admin to the explicitly configured owner ID, idempotently.
+
+    Returns True when the configured admin is already present or was added.
+    Passing telegram_id <= 0 is a no-op so a missing ADMIN_ID never grants
+    privileges to an arbitrary (or the first) user.
+    """
+    if not telegram_id or int(telegram_id) <= 0:
+        return False
+
+    return await add_sub_admin(int(telegram_id), username)
+
+
 async def add_sub_admin_by_any(identifier: str) -> tuple[bool, str]:
     db = await get_db()
     identifier = identifier.strip().lstrip("@")

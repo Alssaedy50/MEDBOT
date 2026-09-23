@@ -88,77 +88,66 @@ All sensitive operations require `is_admin(user_id)`:
 
 ## AI Architecture
 
-### Provider Discovery
-- ai_discovery.py scans env vars and tests connectivity
-- Results stored in ai_registry with availability status
+### Module layout (single source of truth)
+- `ai.py` — the ONLY active AI implementation: provider discovery, adapters
+  (Gemini / Groq / OpenRouter), error classification, failover, grounding
+  validation, and the MEDBOT-grounded assistant.
+- `ai_router.py` — thin compatibility facade that re-exports `ai.py`. It holds
+  no provider logic; it exists only so older callers keep working.
+- `ai_discovery.py` — CLI health/verification tool using the shared layer.
 
-### Current Available Providers
-- Google Gemini (gemini-flash-lite-latest): AVAILABLE, ~1.7s latency
-- Google Gemini (gemma-4-26b-a4b-it): AVAILABLE, ~2.9s latency
+### Corrected provider class names
+Earlier revisions of this document referenced `AIFactory`, `GeminiProvider`,
+`OpenRouterProvider`, `OpenAIProvider`, `AIRouter`, `generate_with_failover`,
+and `ai_generate_grounded`. Those names never existed in this codebase. The
+real functions are:
+
+- `_discover_gemini_models`, `_discover_groq_models`, `_discover_openrouter_models`
+- `_get_candidates` (discovery → registry health → probe → VERIFIED pool)
+- `_gemini_request`, `_openai_compatible_request`, `_request`
+- `_classify_error`, `_record_success`, `_record_failure`
+- `GroundingValidator`, `build_library_context`
+- `generate_medical_ai_response` (general medical AI path)
+- `generate_medbot_assistant_response` (MEDBOT-grounded resource path)
+
+### Grounding (implemented)
+`generate_medbot_assistant_response` enforces the required pipeline:
+
+```
+prompt → deterministic SQLite search (search_engine) → grounding context
+       → AI Router/provider → GroundingValidator → Telegram text
+```
+
+- Search results (folders/content only) are injected as the sole permitted
+  context. The full MEDBOT tree is never sent to the model.
+- If search finds nothing, the model is NOT called and the exact refusal is
+  returned: `الموارد المطلوبة غير مسجلة حالياً في MEDBOT.`
+- If no provider is available, deterministic library results are returned
+  instead of hallucinated content.
+
+### Provider Discovery
+- `ai_discovery.py` scans configured env vars and tests connectivity.
+- Results are stored in `ai_registry` with availability status.
 
 ### Router/Failover
-- `_get_healthy_providers_ranked()`: sorts by success_rate/latency
-- `generate_with_failover()`: tries providers in rank order
-- Transient errors (timeout, 429, 5xx): retry next provider
-- Permanent errors (401, 403, model not found): skip immediately
-- Updates registry on each success/failure
+- `_get_candidates()` builds a pool of `VERIFIED` models only.
+- Transient errors (timeout, 429, 5xx): try next candidate.
+- Permanent errors (401, 403, model not found): classified and skipped.
+- Registry is updated on each success/failure. Secrets are never logged.
 
-### Grounding
-- `ai_generate_grounded()`: searches library, builds system prompt with found resources
-- System prompt instructs AI not to invent resources
-- Absent resources return: "الموارد المطلوبة غير مسجلة حالياً في MEDBOT."
+## Known limitations (verified, not assumed)
 
-## Benchmark Results (2026-09-16)
+- Provider health numbers in this document are historical and depend on live
+  keys/network on the operator's Termux host; they are not reproducible in CI.
+- Live Telegram delivery of each media type requires a real bot token and
+  network, so it is validated by dispatch logic rather than an end-to-end call.
+- `ai_registry` may accumulate repeated discovery rows over time.
 
-| Provider | Model | Latency | Availability | Auth |
-|----------|-------|---------|-------------|------|
-| google_gemini | gemini-flash-lite-latest | 1664ms | AVAILABLE | valid |
-| google_gemini | gemma-4-26b-a4b-it | 2850ms | AVAILABLE | valid |
+## Admin bootstrap (implemented)
 
-Grounding tests: 7/7 pass. Non-existent resources correctly rejected.
-
-## Routing/Failover
-
-- Default order: gemini-flash-lite-latest → gemma-4-26b-a4b-it
-- Each test updates registry with latency/status
-- No retries for permanent errors (auth, model)
-- Max 1 retry for transient errors before fallback
-
-## Legacy Repair
-
-Contribution #1: Approved contribution in folder 21 (Pharmacology) had no corresponding content row.
-- file_id verified from contribution record
-- Content inserted with source_type='contribution', source_contribution_id=1, created_by=contributor
-- Contribution remains approved
-- Content exists exactly once in folder 21
-
-Contributions 3 and 4: Had content rows but missing source metadata.
-- source_type updated from 'direct' to 'contribution'
-- source_contribution_id set to correct contribution ID
-- created_by set to contributor ID
-
-## QA Results
-
-All tests pass:
-- Python compilation (5 files)
-- Database integrity (PRAGMA integrity_check: ok)
-- Foreign keys enforced via get_db()
-- Schema with all migration columns
-- Tree navigation and breadcrumbs
-- Arabic and English search
-- Content retrieval and delivery dispatch
-- Contribution lifecycle (double approval/rejection blocked)
-- Admin authorization (all sensitive callbacks)
-- First-user security (ADMIN_ID != 0)
-- Folder safety (cycle prevention, invalid target)
-- Content safety (rename, move, delete)
-- About Us (editable, factual)
-- AI discovery, registry, health, benchmark, routing, failover, grounding
-
-## Remaining Warnings
-
-1. Only Google Gemini provider has keys configured. OpenRouter and OpenAI require keys for redundancy.
-2. AI grounding validator's `validate()` method is a pass-through; no active hallucination filtering beyond system prompt.
-3. No integration test with live Telegram API (requires real token and network).
-4. AI registry has duplicate rows from repeated discovery runs.
-5. IPv4 workaround is applied globally to socket.getaddrinfo — may affect other HTTP clients.
+- `ADMIN_ID` (environment variable) is the only source of admin identity.
+- `configured_admin_id()` returns `0` for unset / blank / `0` / non-numeric.
+- `database.ensure_configured_admin()` is an idempotent no-op for IDs `<= 0`,
+  so a missing `ADMIN_ID` never promotes the first (or any) user.
+- `/whoami` lets the owner discover their numeric Telegram ID and shows
+  whether they are currently an admin. It grants nothing.

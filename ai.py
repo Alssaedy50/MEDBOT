@@ -8,6 +8,7 @@ import httpx
 from dotenv import load_dotenv
 
 import database
+import search_engine
 from medical_sources import search_pubmed, build_source_context
 
 # Force IPv4 to avoid IPv6/network issues in Termux.
@@ -54,9 +55,31 @@ SYSTEM_PROMPT = """أنت المساعد الطبي الذكي لمنصة MEDBOT
 15. إذا لم توجد مصادر موثقة، لا تقل إنك تحققت من مصدر؛ أجب بحذر ولا تنشئ مرجعاً من نفسك.
 """
 
+MEDBOT_ASSISTANT_PROMPT = """أنت مساعد منصة MEDBOT، وهي منصة تعليمية طبية على Telegram.
+
+دورك محدد وليس دور طبيب أو شات طبي عام:
+- التعريف بمنصة MEDBOT وشرح طريقة استخدامها.
+- فهم ما يريده الطالب داخل MEDBOT.
+- مساعدته في الوصول إلى الموارد المسجّلة في المكتبة (أقسام/ملفات).
+
+قواعد إلزامية:
+1. اعتمد فقط على "نتائج البحث" المزوّدة من قاعدة بيانات MEDBOT في سياق الرسالة.
+2. ممنوع تماماً اختراع ملف أو قسم أو مسار أو رابط أو محاضرة أو مورد.
+3. إذا كانت نتائج البحث فارغة، أو لم يوجد المورد المطلوب، فرد حرفياً بهذه الجملة دون إضافة:
+الموارد المطلوبة غير مسجلة حالياً في MEDBOT.
+4. لا تكرر شجرة MEDBOT كاملة ولا تخمّن موارد غير مذكورة في السياق.
+5. اجعل الإجابة قصيرة: عنوان المورد ومساره الفعلي فقط.
+6. إذا سأل الطالب عن طريقة استخدام MEDBOT، اشرح الاستخدام باختصار دون اختلاق موارد.
+"""
+
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GROQ_KEY = os.getenv("GROQ_API_KEY", "").strip()
 OR_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+
+# Exact refusal string required by the MEDBOT specification.
+NOT_REGISTERED_MESSAGE = (
+    "الموارد المطلوبة غير مسجلة حالياً في MEDBOT."
+)
 
 TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
@@ -786,7 +809,7 @@ async def _get_candidates():
     return active_pool
 
 
-async def _gemini_request(client, item, prompt):
+async def _gemini_request(client, item, prompt, system_prompt=SYSTEM_PROMPT):
     endpoint = item["endpoint"]
     if not endpoint:
         endpoint = (
@@ -799,7 +822,7 @@ async def _gemini_request(client, item, prompt):
         params={"key": GEMINI_KEY},
         json={
             "system_instruction": {
-                "parts": [{"text": SYSTEM_PROMPT}]
+                "parts": [{"text": system_prompt}]
             },
             "contents": [
                 {
@@ -839,7 +862,7 @@ async def _gemini_request(client, item, prompt):
     return text
 
 
-async def _openai_compatible_request(client, item, prompt):
+async def _openai_compatible_request(client, item, prompt, system_prompt=SYSTEM_PROMPT):
     provider = item["provider"]
 
     if provider == "groq":
@@ -867,7 +890,7 @@ async def _openai_compatible_request(client, item, prompt):
         json={
             "model": item["model"],
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
@@ -895,12 +918,12 @@ async def _openai_compatible_request(client, item, prompt):
     return text
 
 
-async def _request(client, item, prompt):
+async def _request(client, item, prompt, system_prompt=SYSTEM_PROMPT):
     if item["provider"] == "google_gemini":
-        return await _gemini_request(client, item, prompt)
+        return await _gemini_request(client, item, prompt, system_prompt)
 
     if item["provider"] in {"groq", "openrouter"}:
-        return await _openai_compatible_request(client, item, prompt)
+        return await _openai_compatible_request(client, item, prompt, system_prompt)
 
     raise RuntimeError(f"Unsupported AI provider: {item['provider']}")
 
@@ -1047,6 +1070,161 @@ async def _record_failure(item, exc):
         )
     except Exception:
         logger.exception("Failed to record AI failure")
+
+
+def _result_line(item: dict) -> str:
+    title = item.get("title") or item.get("name") or "بدون عنوان"
+    path = item.get("path") or "بدون مسار"
+    kind = "قسم" if item.get("result_type") in ("FOLDER", "EMPTY_FOLDER") else "مورد"
+    return f"- [{kind}] {title} | المسار: {path}"
+
+
+def build_library_context(results: list) -> str:
+    """Render deterministic search results into a compact grounding context."""
+    if not results:
+        return "لا توجد نتائج مطابقة في قاعدة بيانات MEDBOT."
+
+    return "\n".join(_result_line(item) for item in results)
+
+
+class GroundingValidator:
+    """Reject/handle answers that are not grounded in registered MEDBOT data.
+
+    The validator is intentionally conservative: when the model returns an
+    empty answer, or the deterministic search found nothing, the caller is
+    told to fall back to the exact refusal message. It never rewrites a
+    grounded answer or invents content.
+    """
+
+    def allows(self, answer: str) -> bool:
+        return bool((answer or "").strip())
+
+
+async def _search_medbot(query: str) -> list:
+    try:
+        response = await search_engine.search_library_summary(query, limit=10)
+    except Exception:
+        logger.exception("MEDBOT search failed during AI grounding")
+        return []
+
+    if not isinstance(response, dict):
+        return []
+
+    results = response.get("results", [])
+    return results if isinstance(results, list) else []
+
+
+async def generate_medbot_assistant_response(
+    prompt: str,
+    user_id: int = None,
+) -> str:
+    """MEDBOT-grounded assistant.
+
+    Pipeline:
+        prompt
+        -> deterministic SQLite search
+        -> grounding context (registered folders/content only)
+        -> AI Router / provider
+        -> grounding validation
+        -> Telegram text
+
+    The AI never receives the full MEDBOT tree and never invents resources.
+    """
+    prompt = (prompt or "").strip()
+
+    if not prompt:
+        return "⚠️ يرجى كتابة سؤال واضح."
+
+    results = await _search_medbot(prompt)
+
+    # No registered resource -> deterministic refusal, no model call.
+    if not results:
+        return NOT_REGISTERED_MESSAGE
+
+    context = build_library_context(results)
+
+    candidates = await _get_candidates()
+
+    if not candidates:
+        # Fall back to deterministic results rather than hallucinating.
+        return (
+            "📚 *نتائج البحث داخل MEDBOT*\n\n"
+            f"{context}\n\n"
+            "⚠️ خدمة الذكاء الاصطناعي غير متاحة حالياً."
+        )
+
+    grounded_prompt = (
+        f"نتائج البحث داخل MEDBOT (المصدر الوحيد المسموح):\n"
+        f"{context}\n\n"
+        f"طلب المستخدم:\n{prompt}\n\n"
+        "اعرض للمستخدم المورد/القسم المناسب مع مساره الفعلي فقط. "
+        "لا تخترع أي مورد غير مذكور أعلاه."
+    )
+
+    validator = GroundingValidator()
+
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        for item in candidates:
+            provider = item["provider"]
+
+            try:
+                started = time.perf_counter()
+
+                answer = await _request(
+                    client,
+                    item,
+                    grounded_prompt,
+                    MEDBOT_ASSISTANT_PROMPT,
+                )
+
+                if not validator.allows(answer):
+                    raise RuntimeError("Grounding validator rejected empty answer")
+
+                latency_ms = round(
+                    (time.perf_counter() - started) * 1000,
+                    1,
+                )
+
+                registry_id = item.get("id")
+                if registry_id:
+                    try:
+                        await database.ai_usage_record(
+                            registry_id=registry_id,
+                            user_id=user_id,
+                            latency_ms=latency_ms,
+                            success=True,
+                        )
+                    except Exception:
+                        logger.exception("Failed to record AI usage success")
+
+                await _record_success(item, latency_ms)
+
+                logger.info(
+                    "MEDBOT assistant success provider=%s model=%s latency_ms=%s",
+                    provider,
+                    item["model"],
+                    latency_ms,
+                )
+
+                return answer
+
+            except Exception as exc:
+                logger.warning(
+                    "MEDBOT assistant provider failed provider=%s model=%s error=%s",
+                    provider,
+                    item["model"],
+                    exc,
+                )
+
+                await _record_failure(item, exc)
+
+    # All providers failed: return grounded deterministic results.
+    return (
+        "📚 *نتائج البحث داخل MEDBOT*\n\n"
+        f"{context}\n\n"
+        "⚠️ تعذر الوصول إلى خدمة الذكاء الاصطناعي؛ النتائج أعلاه مأخوذة "
+        "مباشرة من قاعدة بيانات MEDBOT."
+    )
 
 
 async def generate_medical_ai_response(prompt: str, user_id: int = None) -> str:
