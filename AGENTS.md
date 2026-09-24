@@ -1,7 +1,8 @@
 # MEDBOT — Repository Notes for Agents
 
 MEDBOT is a Telegram medical-education LMS (study library, deterministic
-search, student contributions, admin panel, MEDBOT-grounded AI assistant).
+search, student contributions, admin panel, and two separate AI modes:
+platform resource search and AI chat).
 
 ## Critical operating rules
 - NEVER delete or recreate `medbot_v2.sqlite3`. It is the source of truth and
@@ -40,66 +41,98 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
 - `ai_router.py` — compatibility facade re-exporting `ai.py`. No logic here.
 - `ai_discovery.py` — CLI health/verification tool over the shared layer.
 
-## AI entry points
-- `generate_medbot_unified_result(prompt, user_id)` — the SINGLE assistant
-  exposed in the UI. It classifies the message first (`ai.classify_intent`) and
-  routes to the lightest reliable workflow:
-  - `overview` ("what exists on MEDBOT?") — answered from `build_registry_overview`
-    over registered `folders` only. No search, no model.
-  - `resource` ("where is X?", "does X exist?") — deterministic
-    `search_engine` lookup, then `_genuine_registry_matches` keeps only hits
-    that really correspond to what was named (so "First Year" is never answered
-    with "Second Year"); rendered by `build_registry_answer`. No model.
-  - `medical` — `UNIFIED_ASSISTANT_PROMPT` + NCBI PubMed sources, then the model.
-  - `general` — `GENERAL_ASSISTANT_PROMPT`, no PubMed, then the model.
-  A navigation answer therefore never reaches a model, so it cannot invent a
-  section. Consumes one daily quota unit per call. Returns
-  `{"text": str, "actions": [{"label", "callback"}]}`.
-- Policy: platform facts (anything equivalent to "MEDBOT contains X") may only
-  come from the registry. The model is never handed the platform tree to "read",
-  so its own idea of a medical-school curriculum can never become a MEDBOT fact.
-  The hierarchy is never hardcoded: an admin addition appears automatically.
-- `generate_medbot_unified_response(prompt, user_id)` — thin text-only wrapper
-  over the above (kept for CLI/legacy callers).
-- Direct access: `ai.build_result_actions(results)` turns deterministic search
-  hits into `folder:<id>` / `file:<id>` buttons (max `ai.MAX_RESULT_ACTIONS`)
-  shown under the answer, so a matched resource/section opens in one tap. Ids
-  come only from real results; labels carry `(#id)` and are plain text. Both the
-  resource path and the medical/general path filter actions through
-  `_genuine_registry_matches`, so an unrelated neighbour never gets a button.
-- Trusted sources: `ai._fetch_pubmed_sources` feeds NCBI PubMed records to the
-  model; `ai.build_sources_footer` renders a `🔬 مصادر موثوقة (NCBI PubMed)`
-  footer with real links, skipped by `ai._ensure_sources_footer` when the model
-  already cited PubMed/PMID. Only the medical path fetches PubMed; the
-  general path skips it. The no-provider fallback (`_no_provider_answer`) shows
-  no source footer, because no answer was actually generated from those sources.
-- Medical-answer contract: `UNIFIED_ASSISTANT_PROMPT` requires a model academic
-  answer in ENGLISH first, then a separate faithful Arabic summary section
-  (`English (academic):` before `العربية — شرح مختصر:`), and forbids any
-  platform/navigation talk. General (navigation/general) questions are answered
-  in Arabic without the English block.
+## AI architecture — TWO separate modes
+The assistant is deliberately split into two INDEPENDENT workflows. They are
+never merged again: platform navigation must not rely on a general model, and
+conversational answers must not read the platform database.
+- MODE 1 — 🔎 Platform resource search: `ai.generate_platform_search_result`.
+  "Tell me what exists in MEDBOT and take me there."
+- MODE 2 — 🤖 AI Chat: `ai.generate_ai_chat_result`.
+  "Talk to me and explain things intelligently."
+Both consume one daily quota unit per call and return
+`{"text": str, "actions": [{"label", "callback"}, ...]}`.
+
+### MODE 1 — Platform resource search (`generate_platform_search_result`)
+- Purpose: discovery + speed + accuracy. The user should reach real registered
+  resources in one tap, not walk the menus.
+- It MAY read the complete current platform catalog (folders, sections,
+  subjects, blocks, files/resources, titles, descriptions, paths) so it can
+  understand natural-language Arabic/English resource queries. That is
+  intentional.
+- Fast path (no model): `classify_intent` + deterministic
+  `_search_medbot` (search_engine), then `_genuine_registry_matches` keeps only
+  hits that really correspond to what was named (so "First Year" is never
+  answered with "Second Year"). Rendered by `build_platform_search_answer`.
+- Overview ("what exists on MEDBOT?") is answered from `build_registry_overview`
+  over registered `folders` only — no search, no model.
+- Catalog fallback (model, only when the deterministic pass found nothing and a
+  provider is reachable): the model receives the full catalog via
+  `build_platform_catalog` + `PLATFORM_SEARCH_PROMPT` and may reason over it,
+  but `_verify_catalog_answer` iterates the REAL catalog rows and keeps a row
+  only when the model explicitly named it. The model can therefore only
+  *select* an existing row — it can never create one. No provider -> the honest
+  `PLATFORM_SEARCH_NO_MATCH`.
+- ABSOLUTE RULE: no platform claim without a real registry entity, and no
+  Telegram access button without a verified registry id (built by
+  `build_result_actions` from real ids only, capped by `MAX_RESULT_ACTIONS`).
+- It never calls PubMed; `PLATFORM_SEARCH_PROMPT` forbids the model from
+  emitting callbacks/ids/links.
+
+### MODE 2 — AI Chat (`generate_ai_chat_result`)
+- Purpose: conversational answers. It does NOT navigate the platform and never
+  reads the registry (no `_search_medbot`, no catalog), so it cannot expose or
+  invent platform structure. Actions are always empty.
+- Medical question (`_is_medical_question`: `INTENT_MEDICAL` or any recognized
+  medical concept): `UNIFIED_ASSISTANT_PROMPT` requires a model academic answer
+  in ENGLISH first, then a separate faithful Arabic summary section
+  (`English (academic):` before `العربية — شرح مختصر:`); NCBI PubMed sources
+  ground the answer via `ai._fetch_pubmed_sources`. Brief by default.
+- General question: `GENERAL_ASSISTANT_PROMPT`, Arabic, concise, no PubMed.
+- `_is_medical_question` uses `search_engine.implied_concepts` (shared with the
+  search engine) plus `MEDICAL_CONCEPT_KEYS`/`_MEDICAL_KEYWORDS`, so a
+  navigation-flavoured message that names a medical concept ("ويـن الميكرو؟")
+  is answered as medical in chat.
+- Trusted sources: `ai.build_sources_footer` renders a
+  `🔬 مصادر موثوقة (NCBI PubMed)` footer with real links, skipped by
+  `ai._ensure_sources_footer` when the model already cited PubMed/PMID. The
+  no-provider fallback shows no source footer.
+
+### Policy, compat, and latency
+- Platform facts (anything equivalent to "MEDBOT contains X") in Mode 1 may only
+  come from the registry. The hierarchy is never hardcoded: an admin addition
+  appears automatically. Do not hardcode subjects.
+- `generate_medbot_unified_result` / `generate_medbot_unified_response` are
+  legacy thin dispatchers kept for CLI/auto-routing callers: they classify and
+  delegate to the matching mode. New callers use the two mode functions.
+- `generate_medical_ai_response` / `generate_medbot_assistant_response` remain
+  for compatibility but are no longer wired to the student UI.
 - Latency: classification is local and free; the overview path does one registry
-  read and the resource path one search. The medical path runs SQLite search,
-  candidate pool, and PubMed concurrently via `asyncio.gather`. The general path
-  deliberately skips both the registry search and PubMed (neither is relevant to
-  a non-platform question) and loads only the candidate pool. Provider discovery
-  and the probe batch are concurrent; generation is capped by
-  `ai.MAX_OUTPUT_TOKENS`; `warm_ai_pool()` runs once at startup (best-effort) so
-  the first student reply does not pay for discovery.
-- `generate_medical_ai_response(prompt, user_id)` — general medical AI
-  (retained; `/ask`-era path, no longer wired to the student UI).
-- `generate_medbot_assistant_response(prompt, user_id)` — legacy
-  MEDBOT-grounded resource assistant. Search first; if nothing is found it
-  returns exactly `الموارد المطلوبة غير مسجلة حالياً في MEDBOT.` without
-  calling a model. (Retained for compatibility; the UI now uses the unified
-  assistant.)
-- The student UI has ONE assistant option (`assistant` callback). The former
-  `assistant_search`/`assistant_medical` two-option gateway is gone; those
-  callbacks still resolve so old messages never dead-end. `assistant_mode`
-  holds `"unified"` while the student is inside the assistant; a typed
-  message outside it only points the student at the entry button (no quota
-  consumed). The assistant screen states its purpose in one line
-  (`main.ASSISTANT_PURPOSE`).
+  read and the deterministic search path one query. The catalog fallback runs
+  only when deterministic search fails. AI chat's medical path fetches the
+  candidate pool and PubMed concurrently via `asyncio.gather`; its general path
+  loads only the candidate pool. Provider discovery and the probe batch are
+  concurrent; generation is capped by `ai.MAX_OUTPUT_TOKENS`; `warm_ai_pool()`
+  runs once at startup (best-effort) so the first student reply does not pay for
+  discovery.
+
+### Student UI (main.py)
+- The assistant entry (`assistant` callback) opens a mode chooser
+  (`main.ASSISTANT_MENU_TEXT` + `_assistant_menu_keyboard`): 🔎
+  `main.MODE_PLATFORM` or 🤖 `main.MODE_CHAT`. Selecting one stores it in
+  `assistant_mode` and shows that mode's screen (`PLATFORM_SEARCH_SCREEN_TEXT`
+  / `AI_CHAT_SCREEN_TEXT` + `_mode_keyboard`).
+- `ai_handler` dispatches on `assistant_mode`: `MODE_CHAT` ->
+  `generate_ai_chat_result`; `PLATFORM_MODES` (`MODE_PLATFORM`, legacy
+  `"unified"`) -> `generate_platform_search_result`. Outside both modes a typed
+  message opens the chooser (no quota consumed). `/ask` selects `MODE_CHAT`.
+- Legacy callbacks still resolve so old messages never dead-end:
+  `assistant_search`/`assistant_start` -> `MODE_PLATFORM`, `assistant_medical`
+  -> `MODE_CHAT`.
+- `/search` (`run_search`) uses the platform-search workflow and registers its
+  reply as content (`_register_content_message`) so a later navigation tap
+  cannot overwrite it.
+- `_feature_for_callback` maps `assistant`, both mode callbacks and the legacy
+  ones to the `assistant` feature, so the visibility gate covers every entry.
 
 ## Daily allowance UX
 - The remaining balance is never shown: it is gone from the home screen, the
@@ -240,10 +273,16 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
 
 ## Testing
 - `python -m py_compile` all modules.
-- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update test_medbot_fixes test_visibility test_ai_policy`
-- `test_ai_policy.py` pins the AI behavior policy: intent classification, the
-  four workflows, resource-hallucination refusal, and that only the medical
-  path fetches PubMed. It never calls a real provider.
+- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update test_medbot_fixes test_visibility test_ai_policy test_ai_modes`
+- `test_ai_policy.py` pins the AI behavior policy: intent classification,
+  resource-hallucination refusal, and that only the medical path fetches
+  PubMed. It never calls a real provider.
+- `test_ai_modes.py` pins the two-mode separation: platform search resolves
+  colloquial Arabic/English to real resources and returns only verified-id
+  buttons (discarding an invented entity the model names), and AI chat keeps
+  the bilingual medical contract, skips the registry for general questions,
+  and never exposes platform structure. It replaces only provider functions
+  (no business logic mocked).
 - `test_db_patch.py` needs a real `medbot_v2.sqlite3`; it is skipped locally
   when absent.
 - Tests must exercise real code paths against temporary SQLite; no mocks.

@@ -503,9 +503,9 @@ class CallbackDeliveryTests(FixBase):
 
 
 class UnifiedAssistantRoutingTests(FixBase):
-    """The two former assistant modes are now one option."""
+    """The assistant is a chooser over two explicit, separate modes."""
 
-    async def test_assistant_button_opens_single_unified_screen(self):
+    async def test_assistant_button_opens_mode_chooser(self):
         query = _FakeQuery(self.student_id, "assistant")
         ctx = _FakeContext()
         await main.callback_router(_FakeUpdate(query), ctx)
@@ -516,18 +516,36 @@ class UnifiedAssistantRoutingTests(FixBase):
             for row in query.last_markup.inline_keyboard
             for b in row
         }
-        # The old two-option gateway is gone.
-        self.assertNotIn("assistant_search", callbacks)
-        self.assertNotIn("assistant_medical", callbacks)
-        self.assertEqual(ctx.user_data.get("assistant_mode"), "unified")
+        # Both explicit modes are offered and no mode is preselected.
+        self.assertIn(main.MODE_PLATFORM, callbacks)
+        self.assertIn(main.MODE_CHAT, callbacks)
+        self.assertIsNone(ctx.user_data.get("assistant_mode"))
+
+    async def test_mode_buttons_select_their_mode(self):
+        for mode, marker in (
+            (main.MODE_PLATFORM, "بحث موارد MEDBOT"),
+            (main.MODE_CHAT, "المحادثة الذكية"),
+        ):
+            query = _FakeQuery(self.student_id, mode)
+            ctx = _FakeContext()
+            await main.callback_router(_FakeUpdate(query), ctx)
+            self.assertIn(marker, query.last_text or "")
+            self.assertEqual(ctx.user_data.get("assistant_mode"), mode)
 
     async def test_legacy_mode_buttons_never_dead_end(self):
-        for legacy in ("assistant_search", "assistant_medical"):
+        # `assistant_medical` was the conversational path; the other two were
+        # resource lookup. Each maps to its closest surviving mode.
+        expected = {
+            "assistant_medical": main.MODE_CHAT,
+            "assistant_search": main.MODE_PLATFORM,
+            "assistant_start": main.MODE_PLATFORM,
+        }
+        for legacy, mode in expected.items():
             query = _FakeQuery(self.student_id, legacy)
             ctx = _FakeContext()
             await main.callback_router(_FakeUpdate(query), ctx)
-            self.assertIn("مساعد MEDBOT", query.last_text or "")
-            self.assertEqual(ctx.user_data.get("assistant_mode"), "unified")
+            self.assertTrue(query.last_text)
+            self.assertEqual(ctx.user_data.get("assistant_mode"), mode)
 
     async def test_typed_question_outside_assistant_points_to_entry(self):
         ctx = _FakeContext()
@@ -544,7 +562,7 @@ class UnifiedAssistantRoutingTests(FixBase):
 
     async def test_unified_answer_consumes_one_quota_unit(self):
         ctx = _FakeContext()
-        ctx.user_data["assistant_mode"] = "unified"
+        ctx.user_data["assistant_mode"] = main.MODE_PLATFORM
         ctx.bot = _RecordingBot()
 
         await database.add_content(self.section, "Lecture", "fid", "document")
@@ -559,7 +577,7 @@ class UnifiedAssistantRoutingTests(FixBase):
 
     async def test_unified_answer_never_invents_unregistered_resource(self):
         ctx = _FakeContext()
-        ctx.user_data["assistant_mode"] = "unified"
+        ctx.user_data["assistant_mode"] = main.MODE_PLATFORM
         ctx.bot = _RecordingBot()
 
         msg = _TextMessage("zzz-unregistered-resource-zzz")
@@ -606,7 +624,7 @@ class DailyAllowanceDisplayTests(FixBase):
 
     async def test_answer_footer_has_no_balance_counter(self):
         ctx = _FakeContext()
-        ctx.user_data["assistant_mode"] = "unified"
+        ctx.user_data["assistant_mode"] = main.MODE_PLATFORM
         ctx.bot = _RecordingBot()
 
         await database.add_content(self.section, "Lecture", "fid", "document")
@@ -619,7 +637,7 @@ class DailyAllowanceDisplayTests(FixBase):
 
     async def test_exhausted_allowance_reports_limit_reached(self):
         ctx = _FakeContext()
-        ctx.user_data["assistant_mode"] = "unified"
+        ctx.user_data["assistant_mode"] = main.MODE_PLATFORM
         ctx.bot = _RecordingBot()
 
         for _ in range(main.DAILY_LIMIT):
@@ -688,7 +706,7 @@ class DirectAccessActionTests(FixBase):
 
     async def test_answer_carries_direct_access_keyboard(self):
         ctx = _FakeContext()
-        ctx.user_data["assistant_mode"] = "unified"
+        ctx.user_data["assistant_mode"] = main.MODE_PLATFORM
         ctx.bot = _RecordingBot()
 
         folder_id = await database.add_folder(0, "Anatomy", "general")
@@ -815,10 +833,10 @@ class ProviderDiscoveryParallelismTests(unittest.TestCase):
 
         self.assertIsNone(asyncio.run(run()))
 
-    def test_unified_pipeline_loads_data_concurrently(self):
+    def test_ai_chat_medical_path_loads_data_concurrently(self):
         import inspect
 
-        source = inspect.getsource(ai.generate_medbot_unified_result)
+        source = inspect.getsource(ai.generate_ai_chat_result)
         self.assertIn("asyncio.gather", source)
 
     def test_text_wrapper_delegates_to_unified_result(self):
