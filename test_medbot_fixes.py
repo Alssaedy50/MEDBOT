@@ -635,8 +635,12 @@ class DailyAllowanceDisplayTests(FixBase):
         # The student is told when it refills and why it stopped.
         self.assertIn("سيتجدد العداد", combined)
         self.assertIn("لا خطأ عندك", combined)
-        # The exact limit number is not disclosed.
-        self.assertNotIn(str(main.DAILY_LIMIT), combined)
+        # The exact limit number is not disclosed. The reset countdown is a
+        # time ("خلال 7 ساعة و25 دقيقة") and may legitimately equal the limit,
+        # so the cap itself must be checked, not any stray digits.
+        limit_clause = combined.split("سيتجدد العداد")[0]
+        self.assertNotIn(str(main.DAILY_LIMIT), limit_clause)
+        self.assertNotIn(f"{main.DAILY_LIMIT} طلب", combined)
 
 
 class DirectAccessActionTests(FixBase):

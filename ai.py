@@ -1,4 +1,5 @@
 import os
+import re
 import socket
 import asyncio
 import logging
@@ -73,17 +74,11 @@ MEDBOT_ASSISTANT_PROMPT = """أنت مساعد منصة MEDBOT، وهي منصة
 6. إذا سأل الطالب عن طريقة استخدام MEDBOT، اشرح الاستخدام باختصار دون اختلاق موارد.
 """
 
-UNIFIED_ASSISTANT_PROMPT = """أنت مساعد منصة MEDBOT، وهي منصة تعليمية طبية على Telegram.
+UNIFIED_ASSISTANT_PROMPT = """أنت المساعد الطبي لمنصة MEDBOT، منصة تعليمية طبية على Telegram.
 
-دورك واحد ومزدوج في الوقت نفسه:
-- الإجابة عن أسئلة الطالب العامة، بما فيها الأسئلة الطبية، بشرح دقيق ومختصر.
-- مساعدته في الوصول إلى البيانات المسجّلة في المنصة (الأقسام والموارد).
+هذا المسار مخصّص للأسئلة الطبية/العلمية فقط.
 
-تُزوَّد بمصدرين للمعلومة في سياق الرسالة:
-1. بيانات المنصة الكاملة (كل الأقسام والموارد مع مساراتها الفعلية).
-2. نتائج البحث المباشرة عن طلب المستخدم، ومصادر طبية موثّقة عند توفرها.
-
-أسلوب الإجابة عن الأسئلة الطبية (إلزامي):
+أسلوب الإجابة الطبية (إلزامي):
 - اكتب أولاً إجابة أكاديمية نموذجية *باللغة الإنجليزية*، بأسلوب مرجعي دقيق
   (تعريف، ثم النقاط الأساسية، ثم الأهمية السريرية عند الحاجة)، في فقرة إلى
   ثلاث فقرات قصيرة.
@@ -97,23 +92,32 @@ UNIFIED_ASSISTANT_PROMPT = """أنت مساعد منصة MEDBOT، وهي منص�
   **العربية — شرح مختصر:**
   <الشرح العربي الموجز>
 
-- إن كان السؤال عاماً غير طبي (مثل سؤال عن مورد داخل المنصة)، أجب بالعربية
-  مباشرة مع ذكر المسار الفعلي، دون فرض القسم الإنجليزي.
+قواعد إلزامية:
+1. ابدأ بالجواب المباشر ثم تفسير موجز؛ لا مقدّمات ولا حشو ولا تكرار.
+2. لا تُطل: أهم النقاط فقط، ولا فقرات إنشائية عامة.
+3. اعتمد على المصادر الموثوقة المزوّدة (NCBI PubMed) عند وجودها؛ لا تخترع
+   معلومة أو مرجعاً أو PMID، ولا تنسب معلومة إلى مصدر لم يُزوَّد لك.
+4. إن كانت المعلومة غير مؤكدة أو الأدلة غير كافية، قل ذلك بوضوح وقدّم أأمن
+   إجابة دقيقة بدلاً من التخمين أو ادّعاء اليقين.
+5. اجعل الإجابة تعليمية، ولا تقدّم تشخيصاً شخصياً أو وصفة علاجية شخصية؛
+   واذكر أن الأمر لا يغني عن تقييم الطبيب عند الحاجة فقط.
+6. أي كلام عن المنصة أو مواردها أو مساراتها ممنوع في هذا المسار؛ حقائق المنصة
+   تُعالَج في مسار الموارد المخصّص، ولا تُشتق من معرفتك الطبية.
+7. اذكر المراجع (PMID) فقط إن وُجدت فعلاً في المصادر المزوّدة.
+"""
+
+GENERAL_ASSISTANT_PROMPT = """أنت مساعد منصة MEDBOT التعليمية على Telegram.
+
+هذا المسار للأسئلة العامة غير الطبية.
 
 قواعد إلزامية:
-1. عند ذكر أي مورد أو قسم أو مسار، اعتمد حرفياً على بيانات المنصة المزوّدة؛
-   ممنوع اختراع مورد أو قسم أو مسار أو رابط غير مذكور في السياق.
-2. إن لم يوجد المورد المطلوب في بيانات المنصة، قل بوضوح إنه غير مسجّل حالياً
-   داخل MEDBOT، ثم أجب عن الجزء المعرفي من السؤال إن وُجد.
-3. اجعل الإجابة قصيرة منظّمة: أهم النقاط فقط، دون حشو.
-4. اعتمد في الأسئلة الطبية على المصادر الموثوقة المزوّدة (NCBI PubMed) وأعطِ
-   نتيجة واضحة ومؤكدة مبنية عليها؛ لا تخترع معلومة أو مرجعاً أو PMID، ولا
-   تنسب معلومة إلى مصدر لم يُزوَّد لك.
-5. إذا لم تكن متأكدة من معلومة، قل إنك غير متأكد بدلاً من التخمين.
-6. اجعل الإجابة تعليمية، ولا تقدّم تشخيصاً شخصياً أو وصفة علاجية شخصية.
-7. لا تكرّر قائمة المنصة كاملة داخل الإجابة؛ اذكر فقط ما يخص سؤال الطالب.
-8. إن سأل الطالب سؤالاً جانبياً غير طبي، أجب عنه مباشرة وباختصار دون اعتذار.
-9. اذكر المراجع (PMID) فقط إن وُجدت فعلاً في المصادر المزوّدة.
+1. أجب عن السؤال مباشرة وبقدر ما يكفي لفهمه؛ لا تُطل ولا تكثر التفاصيل.
+2. لا تكرّر الفكرة نفسها ولا تعيد صياغة ما قلته.
+3. لا تضف تنبيهات أو تحذيرات أو اعتذارات غير مطلوبة.
+4. لا تكتب فقرات عامة طويلة؛ توقّف عندما تكون حاجة المستخدم للمعلومة قد لُبّيت.
+5. لا تتحدّث عن موارد المنصة أو أقسامها إطلاقاً؛ حقائق المنصة في مسارها
+   المخصّص فقط.
+6. لا تخترع أي معلومة، وإذا لم تكن متأكداً قل ذلك باختصار.
 """
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -1383,6 +1387,216 @@ def build_platform_catalog(folders, contents, paths) -> str:
     return catalog
 
 
+# ---------------------------------------------------------------------------
+# Intent classification (deterministic, no network, no extra DB round-trip)
+# ---------------------------------------------------------------------------
+# The unified assistant answers four kinds of request, each with a different
+# source of truth and a different latency budget:
+#
+#   overview  -> "what exists on MEDBOT?"  -> answered from registered data only
+#   resource  -> "where is X?"             -> deterministic search of the registry
+#   medical   -> a medical/scientific question -> verified answer + PubMed
+#   general   -> any other question        -> direct, concise answer
+#
+# Classifying first is what keeps a navigation question from being answered
+# with the model's own idea of a medical-school curriculum.
+
+INTENT_OVERVIEW = "overview"
+INTENT_RESOURCE = "resource"
+INTENT_MEDICAL = "medical"
+INTENT_GENERAL = "general"
+
+# Canonical medical concepts (from the search engine's concept table) that mark
+# a question as medical/scientific rather than platform navigation.
+MEDICAL_CONCEPT_KEYS = frozenset({
+    "cbc", "hemoglobin", "esr", "crp", "electrolytes", "renal", "liver",
+    "lipid", "glucose", "thyroid", "urinalysis", "anatomy", "physiology",
+    "pathology", "pharmacology", "microbiology", "biochemistry", "immunology",
+})
+
+# Extra medical keywords that are not part of the synonym table.
+_MEDICAL_KEYWORDS = frozenset({
+    "دواء", "ادويه", "علاج", "مرض", "امراض", "اعراض", "عرض", "تشخيص",
+    "فيروس", "عدوى", "التهاب", "سرطان", "لقاح", "جرعه", "مضاعفات",
+    "قلب", "دم", "كبد", "كليه", "رئه", "دماغ", "عصب", "عضله", "عظم",
+    "هرمون", "هرمونات", "مناعه", "بكتيريا", "سكر", "ضغط", "تنفس",
+    "جهاز", "خليه", "خلايا", "انزيم", "بروتين", "فيتامين", "دوره",
+    "دورة", "حيض", "حمل", "ورم", "تضخم", "قصور", "انسداد", "جراحه",
+    "disease", "treatment", "symptom", "symptoms", "diagnosis", "infection",
+    "cancer", "vaccine", "drug", "drugs", "dose", "therapy", "organ",
+    "cell", "cells", "enzyme", "protein", "vitamin", "hormone", "cardiac",
+    "clinical", "physiological", "pathological", "syndrome", "disorder",
+})
+
+# Filler words that carry no subject on their own, used only to decide whether
+# a platform-structure question names a specific subject.
+_GENERIC_TOKENS = frozenset({
+    "هي", "هو", "هما", "هم", "هن", "حاليا", "الان", "الموجود", "الموجوده",
+    "كل", "جميع", "list", "show", "available", "current", "currently", "now",
+})
+
+
+def _bare_token(token: str) -> str:
+    """Drop a leading Arabic definite article, keeping the root otherwise.
+
+    ``normalize_text`` keeps the ``ال`` prefix, so "الأقسام" and "أقسام" would
+    otherwise be different signals. Words whose ``ال`` is part of the root
+    (e.g. "التهاب") are matched as written, so they are still present in the
+    token sets returned by :func:`_match_tokens`.
+    """
+    if token.startswith("ال") and len(token) > 3:
+        return token[2:]
+    return token
+
+
+def _match_tokens(text: str) -> set:
+    """Tokens used for keyword matching: each token plus its article-less form."""
+    tokens = set(search_engine.meaningful_terms(text))
+
+    for token in list(tokens):
+        bare = _bare_token(token)
+        if bare != token:
+            tokens.add(bare)
+
+    return tokens
+
+
+def _bare_tokens(text: str) -> set:
+    """Article-less tokens, used to tell a specific subject from bare filler."""
+    return {_bare_token(token) for token in search_engine.meaningful_terms(text)}
+
+# Nouns that refer to the platform itself or its structure.
+_PLATFORM_NOUNS = frozenset({
+    "اقسام", "قسم", "فروع", "فرع", "محتوي", "محتوى", "محتويات", "مواد",
+    "مقرر", "مقررات", "بوت", "منصه", "شجره", "تصنيف", "قائمه",
+    "sections", "section", "subjects", "subject", "blocks", "block",
+    "content", "contents", "bot", "platform", "medbot", "dictionary",
+    "structure", "hierarchy", "tree", "categories", "category",
+})
+
+# Tokens that signal an access/location question rather than an enumeration.
+# "أين"/"وين" are search stop words, so these are matched against the raw
+# normalized tokens rather than the intent-carrying ones.
+_WHERE_TOKENS = frozenset({
+    "وين", "اين", "where", "مسار", "path", "مكان", "اماكن", "افتح",
+    "open", "find", "locate", "reach", "اصل", "اوصل", "اجد", "القي", "ألقى",
+})
+
+_WHERE_PHRASES = ("كيف اصل", "كيف اوصل", "how to reach", "how do i find")
+
+# Tokens that signal an existence question ("does X exist?").
+_EXISTENCE_TOKENS = frozenset({
+    "يوجد", "موجود", "موجوده", "متوفر", "متوفره", "متاح", "متاحه",
+    "exist", "exists", "available", "there",
+})
+
+_EXISTENCE_PHRASES = ("is there", "are there", "do you have")
+
+
+def classify_intent(prompt: str) -> str:
+    """Classify a student message into one of the four MEDBOT intents.
+
+    Deterministic and local: it only looks at the message text, so it adds no
+    latency and can never disagree with the registry search (both use the same
+    ``search_engine`` normalization/concept table).
+    """
+    raw = (prompt or "").strip()
+
+    if not raw:
+        return INTENT_GENERAL
+
+    norm = search_engine.normalize_text(raw)
+    tokens = _match_tokens(raw)
+    # Full normalized token set, including search stop words such as "أين".
+    all_tokens = set(norm.split())
+    concepts = search_engine.implied_concepts(raw)
+
+    is_medical = bool(concepts & MEDICAL_CONCEPT_KEYS) or bool(
+        tokens & _MEDICAL_KEYWORDS
+    )
+    has_platform_noun = bool(tokens & _PLATFORM_NOUNS)
+
+    # "Where do I find X?" / "how do I reach X?" -> registry lookup.
+    if (
+        all_tokens & _WHERE_TOKENS
+        or tokens & _WHERE_TOKENS
+        or any(p in norm for p in _WHERE_PHRASES)
+    ):
+        return INTENT_RESOURCE
+
+    # A platform noun plus a specific subject is a lookup for that subject;
+    # with no subject left it is a bare "what exists" enumeration.
+    if has_platform_noun:
+        if is_medical:
+            return INTENT_RESOURCE
+
+        residual = (
+            _bare_tokens(raw)
+            - _PLATFORM_NOUNS
+            - _GENERIC_TOKENS
+            - _EXISTENCE_TOKENS
+        )
+        if residual:
+            return INTENT_RESOURCE
+        return INTENT_OVERVIEW
+
+    # "Does X exist?" -> a named lookup; absence is answered deterministically.
+    existence = bool(tokens & _EXISTENCE_TOKENS) or any(
+        p in norm for p in _EXISTENCE_PHRASES
+    )
+    if existence and (tokens - _EXISTENCE_TOKENS - _GENERIC_TOKENS):
+        return INTENT_RESOURCE
+
+    if is_medical:
+        return INTENT_MEDICAL
+
+    return INTENT_GENERAL
+
+
+# Bounds for the deterministic registry overview (a full-tree answer must stay
+# Telegram-sized and readable).
+OVERVIEW_MAX_DEPTH = 6
+OVERVIEW_MAX_CHARS = 3500
+
+
+def build_registry_overview(folders) -> str:
+    """Render the registered section hierarchy — and nothing else.
+
+    This is the ONLY answer source for "what exists on MEDBOT?" questions. It
+    walks the real ``folders`` rows, so a section the admin never added can
+    never appear, and a future addition shows up automatically.
+    """
+    if not folders:
+        return "📚 لا توجد أقسام مسجلة حالياً في MEDBOT."
+
+    children = {}
+    for row in folders:
+        children.setdefault(row[1], []).append(row)
+
+    lines = ["📚 *الأقسام المتوفرة حالياً في MEDBOT:*", ""]
+
+    def walk(parent_id, depth):
+        if depth > OVERVIEW_MAX_DEPTH:
+            return
+        rows = sorted(
+            children.get(parent_id, []),
+            key=lambda r: (search_engine.normalize_text(r[2]), r[0]),
+        )
+        for row in rows:
+            lines.append("  " * (depth - 1) + f"• {row[2]}")
+            walk(row[0], depth + 1)
+
+    walk(None, 1)
+
+    text = "\n".join(lines)
+
+    if len(text) > OVERVIEW_MAX_CHARS:
+        text = text[:OVERVIEW_MAX_CHARS].rsplit("\n", 1)[0]
+        text += "\n… (توجد أقسام إضافية داخل المنصة)"
+
+    return text
+
+
 class GroundingValidator:
     """Reject/handle answers that are not grounded in registered MEDBOT data.
 
@@ -1532,108 +1746,129 @@ async def _fetch_pubmed_sources(prompt: str) -> list:
         return []
 
 
-async def _platform_catalog_text() -> str:
-    """Load the full registered platform tree as a compact text catalog."""
-    try:
-        folders, contents, paths = await database.get_searchable_records()
-    except Exception:
-        logger.exception("Could not load MEDBOT catalog for the AI assistant")
-        return ""
+async def _load_registry():
+    """Load the registered rows, degrading to empty on failure.
 
-    return build_platform_catalog(folders, contents, paths)
-
-
-async def generate_medbot_unified_result(
-    prompt: str,
-    user_id: int = None,
-) -> dict:
-    """The single MEDBOT assistant: answers questions AND navigates the platform.
-
-    Pipeline:
-        prompt
-        -> full registered platform catalog (read/compare the whole library)
-        -> deterministic SQLite search for the request
-        -> trusted global sources (NCBI PubMed) + AI provider (failover), concurrently
-        -> grounded answer + direct-access buttons for the matched items
-
-    Returns ``{"text": str, "actions": [{"label", "callback"}, ...]}``. The
-    actions are built only from real registered ids, so a tap opens the exact
-    resource/section without the student walking the tree.
-
-    The model may read and compare the entire registered catalog, so it can
-    point at the exact location of a resource, but it may only mention items
-    present in that catalog — nothing is invented.
+    Never raises into the caller: a database hiccup must become an honest
+    "nothing registered" answer, not an invented one.
     """
-    prompt = (prompt or "").strip()
+    try:
+        return await database.get_searchable_records()
+    except Exception:
+        logger.exception("Could not load MEDBOT registry for the AI assistant")
+        return [], [], {}
 
-    if not prompt:
-        return {"text": "⚠️ يرجى كتابة سؤال واضح.", "actions": []}
 
-    # All four are independent, so they run concurrently: the answer waits for
-    # the slowest instead of the sum. The candidate pool (discovery + probes),
-    # the platform catalog and the PubMed round-trip were the main serial
-    # latency contributors on a cold cache.
-    catalog, results, candidates, sources = await asyncio.gather(
-        _platform_catalog_text(),
-        _search_medbot(prompt),
-        _get_candidates(),
-        _fetch_pubmed_sources(prompt),
-        return_exceptions=True,
+# Structural words that describe a place in a hierarchy rather than a subject.
+# A query made only of these must match a registered title exactly (or by whole
+# phrase), otherwise "First Year" would be answered with "Second Year" just
+# because both contain "year".
+_GENERIC_SUBJECT_TOKENS = frozenset({
+    "first", "second", "third", "fourth", "fifth", "sixth", "year", "years",
+    "level", "stage", "semester", "term", "block", "blocks", "module",
+    "section", "subject", "course",
+    "سنه", "سنوات", "مستوي", "مرحله", "فصل", "ترم", "بلوك", "بلوكات",
+    "دراسي", "دراسيه",
+})
+
+
+def _genuine_registry_matches(prompt: str, results: list) -> list:
+    """Keep only the hits that really correspond to what the student named.
+
+    The deterministic search is intentionally recall-oriented, so a query like
+    "First Year" can surface "Second Year" through the shared word "year". A
+    hit counts only if a subject concept matches, a specific (non-structural)
+    subject word appears in the hit, or a structural phrase is matched whole.
+    Returns the genuinely-matching rows (possibly empty), so a "does X exist?"
+    question is never answered with an unrelated registered neighbour.
+    """
+    concepts = search_engine.implied_concepts(prompt)
+    subject = (
+        _bare_tokens(prompt)
+        - _PLATFORM_NOUNS
+        - _EXISTENCE_TOKENS
+        - _WHERE_TOKENS
+        - _GENERIC_TOKENS
     )
+    specific = subject - _GENERIC_SUBJECT_TOKENS
+    structural = subject & _GENERIC_SUBJECT_TOKENS
 
-    if isinstance(catalog, BaseException):
-        logger.warning("Catalog load failed: %s", catalog)
-        catalog = ""
-    if isinstance(results, BaseException):
-        logger.warning("Library search failed: %s", results)
-        results = []
-    if isinstance(candidates, BaseException):
-        logger.warning("Candidate pool failed: %s", candidates)
-        candidates = []
-    if isinstance(sources, BaseException):
-        logger.warning("PubMed retrieval failed: %s", sources)
-        sources = []
+    matched = []
 
-    library_context = build_library_context(results)
-    actions = build_result_actions(results)
-    sources_footer = build_sources_footer(sources)
+    for item in results or []:
+        title = search_engine.normalize_text(
+            item.get("title") or item.get("name") or ""
+        )
+        path = search_engine.normalize_text(item.get("path") or "")
+        blob = f"{title} {path}"
 
-    # No provider: fall back to the deterministic, grounded library results.
-    if not candidates:
-        if results:
-            return {
-                "text": (
-                    "📚 *نتائج البحث داخل MEDBOT*\n\n"
-                    f"{library_context}\n\n"
-                    "⚠️ خدمة الذكاء الاصطناعي غير متاحة حالياً."
-                    f"{sources_footer}"
-                ),
-                "actions": actions,
-            }
-        return {
-            "text": (
-                "⚠️ لا توجد خدمة ذكاء اصطناعي متاحة حالياً، ولم أجد مورداً "
-                "مطابقاً في MEDBOT."
-                f"{sources_footer}"
-            ),
-            "actions": actions,
-        }
+        if concepts and concepts & search_engine.implied_concepts(blob):
+            matched.append(item)
+        elif specific and any(term in blob for term in specific):
+            matched.append(item)
+        elif not specific and structural and all(
+            term in blob for term in structural
+        ):
+            matched.append(item)
 
-    source_context = build_source_context(sources) if sources else "لا توجد مصادر خارجية."
+    return matched
 
-    grounded_prompt = (
-        "بيانات منصة MEDBOT الكاملة (الأقسام والموارد المسجّلة، وهي المرجع "
-        "الوحيد لأي مورد أو مسار):\n"
-        f"{catalog}\n\n"
-        "نتائج البحث المباشرة عن طلب الطالب:\n"
-        f"{library_context}\n\n"
-        "مصادر طبية موثّقة (NCBI PubMed):\n"
+
+def build_registry_answer(results: list) -> str:
+    """Render matched registered items and their real paths — deterministically.
+
+    Platform facts are never delegated to a model: the matched rows are the
+    registry's own rows, so the answer can only name sections/resources that
+    actually exist, with the exact breadcrumb used across the platform.
+    """
+    lines = ["📚 *هذه الموارد موجودة فعلاً في MEDBOT:*", ""]
+
+    for item in results[:MAX_RESULT_ACTIONS]:
+        result_type = item.get("result_type")
+        title = item.get("title") or item.get("name") or "بدون عنوان"
+        path = item.get("path") or "الرئيسية 🏠"
+
+        if result_type in ("FOLDER", "EMPTY_FOLDER"):
+            lines.append(f"📂 *{title}*")
+            lines.append(f"   المسار: {path}")
+        else:
+            lines.append(f"📄 *{title}*")
+            lines.append(f"   داخل: {path}")
+
+    return "\n".join(lines)
+
+
+def _medical_prompt(prompt: str, sources: list) -> str:
+    source_context = (
+        build_source_context(sources)
+        if sources
+        else "لا توجد مصادر PubMed متاحة لهذا السؤال؛ إن لم تكن متأكداً فاذكر ذلك."
+    )
+    return (
+        "مصادر طبية موثّقة (NCBI PubMed) — استخدمها كمصدر وحيد لأي ادّعاء مصدر:\n"
         f"{source_context}\n\n"
-        f"طلب الطالب:\n{prompt}\n\n"
-        "أجب عن سؤال الطالب (طبي أو عام) بشرح قصير، وإن تعلّق بسؤال عن مورد "
-        "داخل المنصة فاذكر اسمه ومساره الفعلي من البيانات أعلاه فقط."
+        f"سؤال الطالب:\n{prompt}"
     )
 
+
+def _general_prompt(prompt: str) -> str:
+    return f"سؤال الطالب:\n{prompt}"
+
+
+async def _provider_failover(
+    grounded_prompt: str,
+    system_prompt: str,
+    candidates: list,
+    user_id,
+    label: str,
+    sources_footer: str = "",
+) -> str:
+    """Send one grounded prompt through the candidate pool with failover.
+
+    Returns the answer text, or ``""`` when every provider failed. Keeps the
+    usage/health bookkeeping in one place so each intent shares the same
+    provider contract.
+    """
     validator = GroundingValidator()
 
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
@@ -1647,7 +1882,7 @@ async def generate_medbot_unified_result(
                     client,
                     item,
                     grounded_prompt,
-                    UNIFIED_ASSISTANT_PROMPT,
+                    system_prompt,
                 )
 
                 if not validator.allows(answer):
@@ -1673,20 +1908,19 @@ async def generate_medbot_unified_result(
                 await _record_success(item, latency_ms)
 
                 logger.info(
-                    "Unified assistant success provider=%s model=%s latency_ms=%s",
+                    "%s success provider=%s model=%s latency_ms=%s",
+                    label,
                     provider,
                     item["model"],
                     latency_ms,
                 )
 
-                return {
-                    "text": _ensure_sources_footer(answer, sources_footer),
-                    "actions": actions,
-                }
+                return _ensure_sources_footer(answer, sources_footer)
 
             except Exception as exc:
                 logger.warning(
-                    "Unified assistant provider failed provider=%s model=%s error=%s",
+                    "%s provider failed provider=%s model=%s error=%s",
+                    label,
                     provider,
                     item["model"],
                     exc,
@@ -1707,28 +1941,146 @@ async def generate_medbot_unified_result(
                     except Exception:
                         logger.exception("Failed to record AI usage failure")
 
-    # Every provider failed: return grounded deterministic results when we have
-    # them, otherwise tell the student the service is down.
+    return ""
+
+
+def _no_provider_answer(results: list) -> str:
+    """Honest fallback when no model is reachable: registered facts or nothing.
+
+    No source footer is attached because no answer was actually generated from
+    those sources; showing citations under a service-down notice would imply a
+    grounding that never happened.
+    """
     if results:
+        return (
+            "📚 *نتائج البحث داخل MEDBOT*\n\n"
+            f"{build_library_context(results)}\n\n"
+            "⚠️ تعذر الوصول إلى خدمة الذكاء الاصطناعي؛ النتائج أعلاه مأخوذة "
+            "مباشرة من قاعدة بيانات MEDBOT."
+        )
+
+    return (
+        "⚠️ تعذر الوصول إلى خدمة الذكاء الاصطناعي حالياً؛ لم تُنشأ إجابة "
+        "غير مؤكدة من MEDBOT.\nيرجى المحاولة بعد قليل."
+    )
+
+
+async def generate_medbot_unified_result(
+    prompt: str,
+    user_id: int = None,
+) -> dict:
+    """The single MEDBOT assistant.
+
+    The message is first classified by ``classify_intent`` so each kind of
+    request uses the lightest reliable workflow:
+
+        resource/navigation -> registered rows only, deterministic (no model)
+        overview            -> registered hierarchy only, deterministic (no model)
+        medical             -> concise verified answer + PubMed, then the model
+        general             -> direct concise answer from the model, no PubMed
+
+    Platform facts are never produced by the model: the model never receives a
+    tree to "read" for a navigation question, so it cannot invent a section.
+    It only ever phrases real matched rows (navigation) or answers a
+    medical/general question (which is forbidden from discussing the platform).
+
+    Returns ``{"text": str, "actions": [{"label", "callback"}, ...]}``. Actions
+    are built only from real registered ids found by deterministic search.
+    """
+    prompt = (prompt or "").strip()
+
+    if not prompt:
+        return {"text": "⚠️ يرجى كتابة سؤال واضح.", "actions": []}
+
+    intent = classify_intent(prompt)
+    logger.info("Assistant intent=%s", intent)
+
+    # --- Resource / navigation: deterministic registry facts, no model -----
+    if intent == INTENT_OVERVIEW:
+        # "What exists?" needs the structure only: no text search, no model.
+        folders, _contents, _paths = await _load_registry()
+        return {"text": build_registry_overview(folders), "actions": []}
+
+    if intent == INTENT_RESOURCE:
+        results = await _search_medbot(prompt)
+
+        # A recall-oriented hit is not proof the named item exists: keep only
+        # the hits that really match, so "First Year" cannot be answered with
+        # "Second Year".
+        matches = _genuine_registry_matches(prompt, results)
+
+        if not matches:
+            return {"text": NOT_REGISTERED_MESSAGE, "actions": []}
+
         return {
-            "text": (
-                "📚 *نتائج البحث داخل MEDBOT*\n\n"
-                f"{library_context}\n\n"
-                "⚠️ تعذر الوصول إلى خدمة الذكاء الاصطناعي؛ النتائج أعلاه مأخوذة "
-                "مباشرة من قاعدة بيانات MEDBOT."
-                f"{sources_footer}"
-            ),
+            "text": build_registry_answer(matches),
+            "actions": build_result_actions(matches),
+        }
+
+    # --- Medical / general: one grounded generation with provider failover -
+    if intent == INTENT_MEDICAL:
+        # A medical question may still map to a registered subject, so the
+        # registry search runs here and can yield direct-access buttons.
+        results, candidates, sources = await asyncio.gather(
+            _search_medbot(prompt),
+            _get_candidates(),
+            _fetch_pubmed_sources(prompt),
+            return_exceptions=True,
+        )
+    else:
+        # A general question is not about the platform: no registry search and
+        # no PubMed. That is the lightest reliable path, and it avoids
+        # attaching a platform action or citation the user never asked for.
+        results = []
+        sources = []
+        candidates = await _get_candidates()
+
+    if isinstance(results, BaseException):
+        logger.warning("Library search failed: %s", results)
+        results = []
+    if isinstance(candidates, BaseException):
+        logger.warning("Candidate pool failed: %s", candidates)
+        candidates = []
+    if isinstance(sources, BaseException):
+        logger.warning("PubMed retrieval failed: %s", sources)
+        sources = []
+
+    # Offer direct access only to genuinely related registered items.
+    related = _genuine_registry_matches(prompt, results)
+    actions = build_result_actions(related)
+    sources_footer = build_sources_footer(sources)
+
+    if not candidates:
+        return {
+            "text": _no_provider_answer(related),
             "actions": actions,
         }
 
-    return {
-        "text": (
-            "⚠️ تعذر الوصول إلى خدمة الذكاء الاصطناعي حالياً.\n"
-            "يرجى المحاولة بعد قليل."
-            f"{sources_footer}"
-        ),
-        "actions": actions,
-    }
+    if intent == INTENT_MEDICAL:
+        answer = await _provider_failover(
+            _medical_prompt(prompt, sources),
+            UNIFIED_ASSISTANT_PROMPT,
+            candidates,
+            user_id,
+            "Medical assistant",
+            sources_footer,
+        )
+    else:
+        answer = await _provider_failover(
+            _general_prompt(prompt),
+            GENERAL_ASSISTANT_PROMPT,
+            candidates,
+            user_id,
+            "General assistant",
+        )
+
+    if not answer:
+        return {
+            "text": _no_provider_answer(related),
+            "actions": actions,
+        }
+
+    return {"text": answer, "actions": actions}
 
 
 async def generate_medbot_unified_response(

@@ -42,35 +42,50 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
 
 ## AI entry points
 - `generate_medbot_unified_result(prompt, user_id)` — the SINGLE assistant
-  exposed in the UI. It answers general and medical questions AND navigates
-  the platform, comparing the whole registered library. Pipeline: full
-  platform catalog (`build_platform_catalog`) + deterministic search +
-  trusted global sources (NCBI PubMed) + provider candidates, all four loaded
-  concurrently -> failover provider -> answer + direct-access actions. It may
-  only mention items present in the catalog; the catalog is bounded by
-  `ai.CATALOG_MAX_CHARS`. On no provider it falls back to deterministic
-  grounded results. It consumes one daily quota unit per call. Returns
+  exposed in the UI. It classifies the message first (`ai.classify_intent`) and
+  routes to the lightest reliable workflow:
+  - `overview` ("what exists on MEDBOT?") — answered from `build_registry_overview`
+    over registered `folders` only. No search, no model.
+  - `resource` ("where is X?", "does X exist?") — deterministic
+    `search_engine` lookup, then `_genuine_registry_matches` keeps only hits
+    that really correspond to what was named (so "First Year" is never answered
+    with "Second Year"); rendered by `build_registry_answer`. No model.
+  - `medical` — `UNIFIED_ASSISTANT_PROMPT` + NCBI PubMed sources, then the model.
+  - `general` — `GENERAL_ASSISTANT_PROMPT`, no PubMed, then the model.
+  A navigation answer therefore never reaches a model, so it cannot invent a
+  section. Consumes one daily quota unit per call. Returns
   `{"text": str, "actions": [{"label", "callback"}]}`.
+- Policy: platform facts (anything equivalent to "MEDBOT contains X") may only
+  come from the registry. The model is never handed the platform tree to "read",
+  so its own idea of a medical-school curriculum can never become a MEDBOT fact.
+  The hierarchy is never hardcoded: an admin addition appears automatically.
 - `generate_medbot_unified_response(prompt, user_id)` — thin text-only wrapper
   over the above (kept for CLI/legacy callers).
 - Direct access: `ai.build_result_actions(results)` turns deterministic search
   hits into `folder:<id>` / `file:<id>` buttons (max `ai.MAX_RESULT_ACTIONS`)
   shown under the answer, so a matched resource/section opens in one tap. Ids
-  come only from real results; labels carry `(#id)` and are plain text.
+  come only from real results; labels carry `(#id)` and are plain text. Both the
+  resource path and the medical/general path filter actions through
+  `_genuine_registry_matches`, so an unrelated neighbour never gets a button.
 - Trusted sources: `ai._fetch_pubmed_sources` feeds NCBI PubMed records to the
   model; `ai.build_sources_footer` renders a `🔬 مصادر موثوقة (NCBI PubMed)`
   footer with real links, skipped by `ai._ensure_sources_footer` when the model
-  already cited PubMed/PMID. Side (non-medical) questions are answered briefly.
+  already cited PubMed/PMID. Only the medical path fetches PubMed; the
+  general path skips it. The no-provider fallback (`_no_provider_answer`) shows
+  no source footer, because no answer was actually generated from those sources.
 - Medical-answer contract: `UNIFIED_ASSISTANT_PROMPT` requires a model academic
   answer in ENGLISH first, then a separate faithful Arabic summary section
-  (`English (academic):` before `العربية — شرح مختصر:`). General
-  (platform/navigation) questions are answered in Arabic without the English
-  block.
-- Latency: the independent loads in the unified pipeline (platform catalog,
-  SQLite search, candidate pool, PubMed) run concurrently via `asyncio.gather`;
-  provider discovery and the probe batch are also concurrent; generation is
-  capped by `ai.MAX_OUTPUT_TOKENS`; `warm_ai_pool()` runs once at startup
-  (best-effort) so the first student reply does not pay for discovery.
+  (`English (academic):` before `العربية — شرح مختصر:`), and forbids any
+  platform/navigation talk. General (navigation/general) questions are answered
+  in Arabic without the English block.
+- Latency: classification is local and free; the overview path does one registry
+  read and the resource path one search. The medical path runs SQLite search,
+  candidate pool, and PubMed concurrently via `asyncio.gather`. The general path
+  deliberately skips both the registry search and PubMed (neither is relevant to
+  a non-platform question) and loads only the candidate pool. Provider discovery
+  and the probe batch are concurrent; generation is capped by
+  `ai.MAX_OUTPUT_TOKENS`; `warm_ai_pool()` runs once at startup (best-effort) so
+  the first student reply does not pay for discovery.
 - `generate_medical_ai_response(prompt, user_id)` — general medical AI
   (retained; `/ask`-era path, no longer wired to the student UI).
 - `generate_medbot_assistant_response(prompt, user_id)` — legacy
@@ -225,7 +240,10 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
 
 ## Testing
 - `python -m py_compile` all modules.
-- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update test_medbot_fixes test_visibility`
+- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update test_medbot_fixes test_visibility test_ai_policy`
+- `test_ai_policy.py` pins the AI behavior policy: intent classification, the
+  four workflows, resource-hallucination refusal, and that only the medical
+  path fetches PubMed. It never calls a real provider.
 - `test_db_patch.py` needs a real `medbot_v2.sqlite3`; it is skipped locally
   when absent.
 - Tests must exercise real code paths against temporary SQLite; no mocks.

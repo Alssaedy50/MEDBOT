@@ -73,10 +73,15 @@ def normalize_text(value: str) -> str:
         "ة": "ه",
     }))
 
+    # Separate punctuation (including the Arabic question mark U+061F) from
+    # words so a trailing "؟" never glues to the token and hides it from the
+    # matchers. \w covers Arabic letters but not Arabic punctuation.
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+
     # Collapse whitespace.
     text = re.sub(r"\s+", " ", text)
 
-    return text
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -135,17 +140,18 @@ _CONCEPT_SURFACES = {
         "urinalysis", "urine analysis", "urine test", "تحليل البول", "بول",
     ],
     "anatomy": [
-        "anatomy", "تشريح", "علم التشريح",
+        "anatomy", "تشريح", "علم التشريح", "تشريحي",
     ],
     "physiology": [
-        "physiology", "فسيولوجيا", "علم وظائف الاعضاء", "وظائف الاعضاء",
+        "physiology", "فسيولوجيا", "فسيولوجي", "فسيولوجى",
+        "علم وظائف الاعضاء", "وظائف الاعضاء",
     ],
     "pathology": [
-        "pathology", "علم الامراض", "باثولوجي",
+        "pathology", "علم الامراض", "باثولوجي", "باثولوجيا",
     ],
     "pharmacology": [
         "pharmacology", "pharma", "drugs", "drug", "فارماكولوجي",
-        "علم الادويه", "الادويه",
+        "فارماكولوجيا", "علم الادويه", "الادويه",
     ],
     "microbiology": [
         "microbiology", "micro", "بكتيريا", "ميكروبيولوجي",
@@ -229,6 +235,17 @@ def _build_indexes() -> None:
 _build_indexes()
 
 
+def _strip_article(token: str) -> str:
+    """Drop a leading Arabic definite article, keeping the root otherwise.
+
+    ``ال`` is part of some roots (e.g. "التهاب"), so this is only used as an
+    additional lookup candidate, never as a replacement for the token itself.
+    """
+    if token.startswith("ال") and len(token) > 3:
+        return token[2:]
+    return token
+
+
 def _lookup_concepts(text: str) -> set:
     """Return canonical concepts implied by a piece of text."""
     norm = normalize_text(text)
@@ -247,12 +264,34 @@ def _lookup_concepts(text: str) -> set:
             continue
 
         # Only whole-token matches are indexed, which avoids substring
-        # false positives (e.g. "k" inside "kidney").
-        token_concepts = _TOKEN_INDEX.get(token)
-        if token_concepts:
-            concepts.update(token_concepts)
+        # false positives (e.g. "k" inside "kidney"). A leading Arabic
+        # definite article is also tried, so "الفسيولوجيا" reaches the
+        # indexed surface "فسيولوجيا".
+        for candidate in (token, _strip_article(token)):
+            token_concepts = _TOKEN_INDEX.get(candidate)
+            if token_concepts:
+                concepts.update(token_concepts)
 
     return concepts
+
+
+def implied_concepts(text: str) -> set:
+    """Public wrapper over the synonym/abbreviation concept lookup.
+
+    Lets the AI layer classify intent (medical vs platform) using the same
+    deterministic concept table the search uses, so the two never disagree.
+    """
+    return _lookup_concepts(text)
+
+
+def meaningful_terms(text: str) -> list:
+    """Public wrapper over the intent-carrying token extraction.
+
+    Returns the normalized tokens that actually carry topical meaning (stop
+    words and 1-char tokens removed), so the AI layer can tell whether a
+    navigation question names a specific subject or is a bare "what exists".
+    """
+    return _query_terms(normalize_text(text))
 
 
 def _query_terms(query_norm: str) -> list:
