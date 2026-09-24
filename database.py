@@ -1,13 +1,50 @@
 import aiosqlite
 import logging
+import os
 
 from datetime import datetime, date
 from typing import Tuple
 logger = logging.getLogger(__name__)
+
+# Default relative name keeps the Termux/local workflow unchanged.
 DB_NAME = "medbot_v2.sqlite3"
+DEFAULT_DB_NAME = "medbot_v2.sqlite3"
+# Explicit path override (legacy tests / callers may set this directly).
+DB_PATH = None
+DB_PATH_ENV_VAR = "MEDBOT_DB_PATH"
+
+
+def resolve_db_path() -> str:
+    """Return the effective SQLite database path.
+
+    Precedence, first match wins:
+      1. ``DB_PATH`` - explicit programmatic override (e.g. tests).
+      2. ``DB_NAME`` - when changed from its default (existing test contract).
+      3. ``MEDBOT_DB_PATH`` - deployment override, e.g.
+         ``/data/medbot_v2.sqlite3`` on a read-only filesystem.
+      4. the default relative ``medbot_v2.sqlite3``.
+    """
+    if DB_PATH:
+        return DB_PATH
+    if DB_NAME != DEFAULT_DB_NAME:
+        return DB_NAME
+    env_path = (os.environ.get(DB_PATH_ENV_VAR) or "").strip()
+    if env_path:
+        return os.path.expanduser(env_path)
+    return DB_NAME
+
+
+def ensure_db_dir(path: str = None) -> str:
+    """Create the DB parent directory if needed and return the path to open."""
+    target = path or resolve_db_path()
+    parent = os.path.dirname(os.path.abspath(target))
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent, exist_ok=True)
+    return target
+
 
 async def get_db():
-    db = await aiosqlite.connect(DB_NAME)
+    db = await aiosqlite.connect(ensure_db_dir())
     await db.execute("PRAGMA foreign_keys = ON;")
     # WAL keeps readers from blocking the writer, and the busy timeout lets
     # concurrent handler coroutines wait briefly instead of failing with

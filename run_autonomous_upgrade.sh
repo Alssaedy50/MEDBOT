@@ -4,6 +4,10 @@ set -u
 set -o pipefail
 
 PROJECT="$HOME/MEDBOT"
+# Effective SQLite location, matching database.resolve_db_path(): an explicit
+# MEDBOT_DB_PATH (e.g. /data/medbot_v2.sqlite3 on Deployka) wins, otherwise the
+# default relative file inside the project.
+DB_FILE="${MEDBOT_DB_PATH:-$PROJECT/medbot_v2.sqlite3}"
 LOG_DIR="$PROJECT/logs"
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="$LOG_DIR/autonomous-upgrade-$RUN_ID.log"
@@ -67,12 +71,12 @@ echo "INITIAL_COMPILE=PASS"
 echo
 echo "===== DATABASE SAFETY ====="
 
-if [ ! -f "$PROJECT/medbot_v2.sqlite3" ]; then
-    echo "ERROR: medbot_v2.sqlite3 missing."
+if [ ! -f "$DB_FILE" ]; then
+    echo "ERROR: medbot_v2.sqlite3 missing at $DB_FILE."
     exit 24
 fi
 
-DB_HASH_BEFORE="$(sha256sum "$PROJECT/medbot_v2.sqlite3" | awk '{print $1}')"
+DB_HASH_BEFORE="$(sha256sum "$DB_FILE" | awk '{print $1}')"
 echo "DB_HASH_BEFORE=$DB_HASH_BEFORE"
 
 echo
@@ -184,8 +188,8 @@ echo "POST_COMPILE_EXIT=$POST_COMPILE_STATUS"
 echo
 echo "===== DATABASE HASH AFTER RUN ====="
 
-if [ -f "$PROJECT/medbot_v2.sqlite3" ]; then
-    DB_HASH_AFTER="$(sha256sum "$PROJECT/medbot_v2.sqlite3" | awk '{print $1}')"
+if [ -f "$DB_FILE" ]; then
+    DB_HASH_AFTER="$(sha256sum "$DB_FILE" | awk '{print $1}')"
     echo "DB_HASH_AFTER=$DB_HASH_AFTER"
 fi
 

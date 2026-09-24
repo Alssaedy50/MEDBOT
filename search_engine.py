@@ -20,7 +20,20 @@ import unicodedata
 
 import aiosqlite
 
+import database
+
 DB_NAME = "medbot_v2.sqlite3"
+
+
+def _db_path() -> str:
+    """Effective DB path, identical to the one ``database.py`` opens.
+
+    Prefers an explicit ``search_engine.DB_NAME`` override (tests), otherwise
+    defers to ``database.resolve_db_path()`` so both modules cannot drift.
+    """
+    if DB_NAME != database.DEFAULT_DB_NAME:
+        return database.ensure_db_dir(DB_NAME)
+    return database.ensure_db_dir()
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +381,7 @@ async def search_library(
 
     limit = max(1, min(int(limit), 50))
 
-    db = await aiosqlite.connect(DB_NAME)
+    db = await aiosqlite.connect(_db_path())
 
     try:
         folders, contents = await _fetch_records(db)

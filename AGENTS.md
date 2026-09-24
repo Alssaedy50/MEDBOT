@@ -18,7 +18,14 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
 - The operator holds the real credentials/database on Termux; CI here has no
   keys and no database. Tests use temporary SQLite files.
 - Config env vars: `BOT_TOKEN`, `ADMIN_ID`, `GEMINI_API_KEY`, `GROQ_API_KEY`,
-  `OPENROUTER_API_KEY`.
+  `OPENROUTER_API_KEY`, `MEDBOT_DB_PATH`.
+- SQLite path is resolved by `database.resolve_db_path()` / `ensure_db_dir()`
+  (the only place that decides the file) with precedence: `DB_PATH` >
+  non-default `DB_NAME` > `MEDBOT_DB_PATH` env > default relative
+  `medbot_v2.sqlite3`. `search_engine` defers to the same resolver, so both
+  modules always open the identical file. Deployka sets
+  `MEDBOT_DB_PATH=/data/medbot_v2.sqlite3`; the parent dir is created on open.
+  Never add a second, independent DB-opening path.
 
 ## Architecture (single source of truth)
 - `main.py` — Telegram handlers, admin authorization, media dispatch.
