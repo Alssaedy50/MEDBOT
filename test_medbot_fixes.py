@@ -631,9 +631,116 @@ class DailyAllowanceDisplayTests(FixBase):
         await main.ai_handler(_MediaUpdate(self.student_id, msg), ctx)
 
         combined = "\n".join(msg.replies)
-        self.assertIn("الحد المسموح", combined)
+        self.assertIn("وصلت إلى الحد اليومي", combined)
+        # The student is told when it refills and why it stopped.
+        self.assertIn("سيتجدد العداد", combined)
+        self.assertIn("لا خطأ عندك", combined)
         # The exact limit number is not disclosed.
         self.assertNotIn(str(main.DAILY_LIMIT), combined)
+
+
+class DirectAccessActionTests(FixBase):
+    """A matched resource/section is reachable in one tap under the answer."""
+
+    async def test_folder_and_content_get_direct_buttons(self):
+        folder_id = await database.add_folder(0, "Anatomy", "general")
+        await database.add_content(folder_id, "Anatomy Lecture", "fid", "document")
+
+        results = await ai._search_medbot("Anatomy")
+        actions = ai.build_result_actions(results)
+        callbacks = {a["callback"] for a in actions}
+
+        self.assertIn(f"folder:{folder_id}", callbacks)
+        self.assertTrue(any(c.startswith("file:") for c in callbacks))
+
+    async def test_action_labels_are_disambiguated_by_id(self):
+        results = await ai._search_medbot("Section")
+        actions = ai.build_result_actions(results)
+        labels = [a["label"] for a in actions]
+        self.assertTrue(any(f"(#{self.section})" in label for label in labels))
+
+    async def test_actions_are_capped_and_id_only(self):
+        for index in range(8):
+            await database.add_content(
+                self.section, f"Anatomy Topic {index}", f"fid{index}", "document"
+            )
+
+        results = await ai._search_medbot("Anatomy")
+        actions = ai.build_result_actions(results)
+
+        self.assertLessEqual(len(actions), ai.MAX_RESULT_ACTIONS)
+        # Every callback points at a real registered id.
+        for action in actions:
+            kind, _, item_id = action["callback"].partition(":")
+            self.assertIn(kind, ("folder", "file"))
+            self.assertTrue(item_id.isdigit())
+
+    async def test_invented_results_yield_no_actions(self):
+        self.assertEqual(ai.build_result_actions([]), [])
+        self.assertEqual(
+            ai.build_result_actions([{"id": None, "result_type": "CONTENT"}]),
+            [],
+        )
+
+    async def test_answer_carries_direct_access_keyboard(self):
+        ctx = _FakeContext()
+        ctx.user_data["assistant_mode"] = "unified"
+        ctx.bot = _RecordingBot()
+
+        folder_id = await database.add_folder(0, "Anatomy", "general")
+        await database.add_content(folder_id, "Anatomy Lecture", "fid", "document")
+
+        msg = _TextMessage("Anatomy")
+        await main.ai_handler(_MediaUpdate(self.student_id, msg), ctx)
+
+        callbacks = {
+            b.callback_data
+            for row in msg.last_markup.inline_keyboard
+            for b in row
+        }
+        self.assertIn(f"folder:{folder_id}", callbacks)
+        # Home is always reachable from the answer.
+        self.assertIn("home", callbacks)
+
+
+class TrustedSourcesFooterTests(unittest.TestCase):
+    """Verified PubMed records are surfaced under the answer."""
+
+    def test_footer_lists_only_records_with_pmid_and_url(self):
+        footer = ai.build_sources_footer(
+            [
+                {
+                    "pmid": "111",
+                    "title": "Verified paper",
+                    "url": "https://pubmed.ncbi.nlm.nih.gov/111/",
+                },
+                {"pmid": None, "title": "No pmid", "url": ""},
+            ]
+        )
+        self.assertIn("PubMed", footer)
+        self.assertIn("PMID: 111", footer)
+        self.assertIn("https://pubmed.ncbi.nlm.nih.gov/111/", footer)
+        self.assertNotIn("No pmid", footer)
+
+    def test_no_sources_means_no_footer(self):
+        self.assertEqual(ai.build_sources_footer([]), "")
+        self.assertEqual(ai.build_sources_footer(None), "")
+
+    def test_footer_is_not_duplicated_when_model_cites_sources(self):
+        footer = ai.build_sources_footer(
+            [{"pmid": "222", "title": "T", "url": "https://x/222"}]
+        )
+        answer = "Conclusion based on PubMed PMID: 222."
+        self.assertEqual(ai._ensure_sources_footer(answer, footer), answer)
+
+    def test_footer_is_appended_when_model_omits_sources(self):
+        footer = ai.build_sources_footer(
+            [{"pmid": "333", "title": "T", "url": "https://x/333"}]
+        )
+        merged = ai._ensure_sources_footer("A grounded answer.", footer)
+        self.assertIn("A grounded answer.", merged)
+        self.assertIn("PMID: 333", merged)
+
 
 
 class BilingualMedicalAnswerTests(unittest.TestCase):
@@ -707,8 +814,14 @@ class ProviderDiscoveryParallelismTests(unittest.TestCase):
     def test_unified_pipeline_loads_data_concurrently(self):
         import inspect
 
-        source = inspect.getsource(ai.generate_medbot_unified_response)
+        source = inspect.getsource(ai.generate_medbot_unified_result)
         self.assertIn("asyncio.gather", source)
+
+    def test_text_wrapper_delegates_to_unified_result(self):
+        import inspect
+
+        source = inspect.getsource(ai.generate_medbot_unified_response)
+        self.assertIn("generate_medbot_unified_result", source)
 
 
 if __name__ == "__main__":

@@ -38,21 +38,33 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
 - `ai_discovery.py` — CLI health/verification tool over the shared layer.
 
 ## AI entry points
-- `generate_medbot_unified_response(prompt, user_id)` — the SINGLE assistant
+- `generate_medbot_unified_result(prompt, user_id)` — the SINGLE assistant
   exposed in the UI. It answers general and medical questions AND navigates
   the platform, comparing the whole registered library. Pipeline: full
   platform catalog (`build_platform_catalog`) + deterministic search +
-  verified PubMed sources -> provider -> answer. It may only mention items
-  present in the catalog; the catalog is bounded by `ai.CATALOG_MAX_CHARS` and
-  injected into the prompt. On no provider it falls back to deterministic
-  grounded results. It consumes one daily quota unit per call.
+  trusted global sources (NCBI PubMed) + provider candidates, all four loaded
+  concurrently -> failover provider -> answer + direct-access actions. It may
+  only mention items present in the catalog; the catalog is bounded by
+  `ai.CATALOG_MAX_CHARS`. On no provider it falls back to deterministic
+  grounded results. It consumes one daily quota unit per call. Returns
+  `{"text": str, "actions": [{"label", "callback"}]}`.
+- `generate_medbot_unified_response(prompt, user_id)` — thin text-only wrapper
+  over the above (kept for CLI/legacy callers).
+- Direct access: `ai.build_result_actions(results)` turns deterministic search
+  hits into `folder:<id>` / `file:<id>` buttons (max `ai.MAX_RESULT_ACTIONS`)
+  shown under the answer, so a matched resource/section opens in one tap. Ids
+  come only from real results; labels carry `(#id)` and are plain text.
+- Trusted sources: `ai._fetch_pubmed_sources` feeds NCBI PubMed records to the
+  model; `ai.build_sources_footer` renders a `🔬 مصادر موثوقة (NCBI PubMed)`
+  footer with real links, skipped by `ai._ensure_sources_footer` when the model
+  already cited PubMed/PMID. Side (non-medical) questions are answered briefly.
 - Medical-answer contract: `UNIFIED_ASSISTANT_PROMPT` requires a model academic
   answer in ENGLISH first, then a separate faithful Arabic summary section
   (`English (academic):` before `العربية — شرح مختصر:`). General
   (platform/navigation) questions are answered in Arabic without the English
   block.
 - Latency: the independent loads in the unified pipeline (platform catalog,
-  SQLite search, candidate pool) run concurrently via `asyncio.gather`;
+  SQLite search, candidate pool, PubMed) run concurrently via `asyncio.gather`;
   provider discovery and the probe batch are also concurrent; generation is
   capped by `ai.MAX_OUTPUT_TOKENS`; `warm_ai_pool()` runs once at startup
   (best-effort) so the first student reply does not pay for discovery.
@@ -68,19 +80,19 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
   callbacks still resolve so old messages never dead-end. `assistant_mode`
   holds `"unified"` while the student is inside the assistant; a typed
   message outside it only points the student at the entry button (no quota
-  consumed).
+  consumed). The assistant screen states its purpose in one line
+  (`main.ASSISTANT_PURPOSE`).
 
 ## Daily allowance UX
 - The remaining balance is never shown: it is gone from the home screen, the
-  account screen, `/quota`, and the assistant reply footer. `i18n`'s
-  `welcome_quota` key was removed.
-- The student is told ONLY when the allowance is used up: on the last allowed
-  request the reply ends with "هذا آخر طلب متاح لك اليوم. تم الوصول إلى الحد
-  المسموح به.", and the next request gets "تم الوصول إلى الحد المسموح به من
-  الطلبات اليومية."
-- The exact limit number is never disclosed in any of these messages.
-- `DAILY_LIMIT` and `database.check_and_increment_quota`/`get_remaining_quota`
-  are unchanged; only the presentation changed.
+  account screen, `/quota`, and the assistant reply footer.
+- `DAILY_LIMIT` (`main.py`) is 25 requests/day; the limit number is never
+  displayed anywhere.
+- When the allowance is used up (last allowed request and every request after),
+  the reply ends with `main._quota_reset_text()`: it says the stop is not an
+  error and states the reset window until midnight server time (e.g. "خلال 8
+  ساعة و31 دقيقة"). `database.check_and_increment_quota`/`get_remaining_quota`
+  take `max_limit` from `DAILY_LIMIT`.
 
 
 ## Admin security

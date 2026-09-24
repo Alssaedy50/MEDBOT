@@ -172,21 +172,22 @@ real functions are:
 - `_gemini_request`, `_openai_compatible_request`, `_request`
 - `_classify_error`, `_record_success`, `_record_failure`
 - `GroundingValidator`, `build_library_context`, `build_platform_catalog`
-- `generate_medbot_unified_response` (the single student-facing assistant)
+- `build_result_actions`, `build_sources_footer` (direct-access + citations)
+- `generate_medbot_unified_result` (the single student-facing assistant)
+- `generate_medbot_unified_response` (text-only wrapper, backward compatible)
 - `generate_medical_ai_response` (general medical AI path)
 - `generate_medbot_assistant_response` (legacy MEDBOT-grounded resource path)
 
 ### Unified assistant (student-facing)
-`generate_medbot_unified_response` is the one assistant option in the UI. It
+`generate_medbot_unified_result` is the one assistant option in the UI. It
 answers general and medical questions and simultaneously helps the student
 reach registered data. The pipeline is:
 
 ```
 prompt → full registered platform catalog (build_platform_catalog)
        → deterministic SQLite search (search_engine)
-       → verified PubMed sources
-       → AI provider (failover)
-       → answer
+       → verified global sources (NCBI PubMed) + AI provider (failover)
+       → grounded answer + direct-access buttons for the matched items
 ```
 
 - The model may read and compare the ENTIRE registered catalog (every section
@@ -200,6 +201,35 @@ prompt → full registered platform catalog (build_platform_catalog)
   returned instead of hallucinated content; with no results either, it says so
   plainly.
 - Each unified call consumes one unit of the daily AI quota.
+- `generate_medbot_unified_response` is kept as a thin text-only wrapper for
+  callers that do not need the buttons (backward compatible).
+
+### Direct access from the answer
+When the deterministic search matches registered items, the reply carries one
+button per match (up to `ai.MAX_RESULT_ACTIONS`) so the student opens the exact
+resource/section in one tap instead of walking the tree:
+
+- `ai.build_result_actions(results)` maps a match to `folder:<id>` or
+  `file:<id>` — the same callbacks the library browser already uses.
+- Only real ids from the search are used, so a button can never point at an
+  unregistered item.
+- Labels include `(#id)` to disambiguate same-named siblings; the buttons are
+  plain-text rows, so a `)` in a resource name cannot break the send.
+- The reply always keeps a `🏠 الرئيسية` row below them.
+
+### Trusted-source grounding
+Medical answers are anchored in verifiable global sources:
+
+- `ai._fetch_pubmed_sources(prompt)` retrieves NCBI PubMed records and
+  `medical_sources.build_source_context` feeds their titles/PMIDs/URLs to the
+  model, which is instructed to base its medical conclusion on them and to give
+  a clear, confirmed result.
+- `ai.build_sources_footer(sources)` renders a compact `🔬 مصادر موثوقة (NCBI
+  PubMed)` footer with the real links under the answer, unless the model
+  already cited PubMed/PMID itself (`ai._ensure_sources_footer`), so a citation
+  block is never duplicated and never invented.
+- Side (non-medical) questions are answered directly and briefly, without an
+  apology or a forced citation.
 
 ### Medical answer format
 `ai.UNIFIED_ASSISTANT_PROMPT` enforces a bilingual answer for medical
@@ -220,8 +250,8 @@ Arabic directly with the real path, without the English block.
 The reply path is bounded so a slow provider or a cold cache does not stack
 delays:
 
-- The three independent loads (platform catalog, SQLite search, candidate
-  pool) run concurrently with `asyncio.gather`.
+- The four independent loads (platform catalog, SQLite search, candidate
+  pool, PubMed) run concurrently with `asyncio.gather`.
 - Provider discovery for the three providers runs concurrently, as does the
   probe batch (previously serial: up to 3 discovery round-trips + up to 6
   probes).
@@ -229,24 +259,25 @@ delays:
   answer cannot dominate latency.
 - `ai.warm_ai_pool()` runs once at startup (best-effort, background) so the
   first student reply does not pay for provider discovery.
-- PubMed is only fetched when a provider exists to ground the answer.
 
 ### Daily allowance
 The remaining balance is never displayed. It is removed from the home screen,
-the account screen, `/quota`, and the assistant reply footer. The student is
-told only when the allowance is used up:
+the account screen, `/quota`, and the assistant reply footer. The limit is 25
+requests/day, and the student learns about it only when it is used up:
 
-- On the last allowed request the reply ends with
-  "هذا آخر طلب متاح لك اليوم. تم الوصول إلى الحد المسموح به."
-- The next request gets "تم الوصول إلى الحد المسموح به من الطلبات اليومية."
-- The exact limit number is never disclosed.
+- On the last allowed request the reply ends with `main._quota_reset_text()`,
+  which explains the pause is not an error and states the reset window
+  (midnight server time, e.g. "خلال 8 ساعة و31 دقيقة").
+- The next request gets the same notice and does not consume anything.
+- The exact limit number (25) is never disclosed.
 
-`DAILY_LIMIT` and the quota database functions are unchanged; only the
-presentation changed.
+`DAILY_LIMIT` (`main.py`) is the single knob; the quota database functions are
+unchanged apart from that value.
 
 The former two-option gateway (`assistant_search` / `assistant_medical`) is
 removed from the UI; those callbacks still resolve to the unified screen so
-older messages never dead-end.
+older messages never dead-end. The assistant screen itself states its purpose
+in one short line (`main.ASSISTANT_PURPOSE`).
 
 ### Grounding (legacy path, retained)
 `generate_medbot_assistant_response` enforces the original strict pipeline:
