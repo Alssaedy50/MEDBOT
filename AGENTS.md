@@ -53,12 +53,27 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
 - Roles live in `database.ROLES` (`owner`, `admin`, `reviewer`, `none`);
   active admin roles are `database.ADMIN_ROLES` (excludes `none`).
   Capabilities live in `database.PERMISSION_KEYS` (`can_folders`, `can_content`,
-  `can_contributions`, `can_messages`, `can_ai`, `can_admins`).
+  `can_contributions`, `can_messages`, `can_ai`, `can_admins`,
+  `can_notifications`, `can_settings`, `can_topics`, `can_visibility`).
 - Migrations are additive: `_migrate_v5` adds `admins.role`/`admins.permissions`;
   `_migrate_v6` creates the isolated `audit_log` table; `_migrate_v7` backfills
   NULL/empty roles to `admin`; `_migrate_v8` adds the nullable
   `description`/`keywords` columns used by intent-aware search on `folders` and
-  `content`. Never rewrite v1..v4.
+  `content`; `_migrate_v11` heals a database left with more than one `owner` row
+  (keeps the persisted owner, demotes the rest to `admin`). Never rewrite v1..v4.
+- Role scope is explicit: `ROLE_PERMISSION_PRESETS` maps each role to a baseline
+  capability set (owner = all, admin = all except `can_admins`, reviewer =
+  contributions + messages, none = nothing) and `ROLE_DESCRIPTIONS` is the
+  user-visible scope text. `database.apply_role_preset()` persists a role AND its
+  preset together; the admin UI uses it, so "reviewer"/"admin" always mean the
+  same thing. `can_admins` is owner-only by design.
+- Exactly one owner: `ROLE_ASSIGNABLE` excludes `owner`, so the role screen can
+  never mint a second owner (`change_role` refuses `owner` with a pointer to
+  transfer). Ownership moves only through `transfer_ownership`, which promotes
+  the target to owner and demotes the previous owner to `admin` (with the admin
+  preset) atomically. `set_admin_role(_, 'owner')` exists but is not on the UI
+  path; `ensure_configured_admin`/`db_demote_stale_owners` also demote stale
+  owners and strip owner-only perms from them.
 - Permission storage: an EMPTY `admins.permissions` column means "legacy row,
   full access". An explicitly revoked admin is stored as the `PERMISSIONS_NONE`
   (`none`) sentinel. Never persist an all-False map as an empty string.
@@ -66,20 +81,32 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
   non-admin always fails, unknown key fails, legacy/empty grants everything.
 - Owner protection: the single `owner` must never be demoted or revoked while
   it is the only owner. `set_admin_role`/`remove_sub_admin` enforce this and
-  `admin_management.change_role` reports it. A new owner must be minted first.
+  `admin_management.change_role` reports it.
 - Removing an admin sets `role='none'` (row + username kept) instead of
   deleting the row; `is_user_admin()` rejects `none`, and re-adding restores it.
 - `audit.log_action()` is best-effort and must never raise into the audited
   operation. The audit table is independent of messages/contributions/content.
-- Isolated modules: `audit.py` (viewer) and `admin_management.py` (role/permission
-  UI). Register their handlers BEFORE the catch-all `callback_router`, and route
-  their callbacks through their own handlers in tests.
+- Isolated modules: `audit.py` (viewer), `admin_management.py` (role/permission
+  UI) and `visibility.py` (feature show/hide). Register their handlers BEFORE the
+  catch-all `callback_router`, and route their callbacks through their own
+  handlers in tests.
 - `admin_management` uses `database.add_sub_admin_by_any`, which does
   `INSERT OR REPLACE`; never let it touch the owner (it would reset role/perms).
-- UI visibility rule: `main.home_keyboard()` is the public student keyboard and
-  never contains the admin entry. Use `await main.home_for(update)` everywhere a
-  home keyboard is attached; it appends the Admin Panel only for admins. The
-  panel itself lists each permitted surface exactly once.
+- UI visibility rule: `main.home_keyboard(lang, hidden)` is the public student
+  keyboard and never contains the admin entry. Use `await main.home_for(update)`
+  everywhere a home keyboard is attached; it appends the Admin Panel only for
+  admins. The panel itself lists each permitted surface exactly once.
+- Feature visibility: `database.FEATURES` maps one-to-one to the home-page
+  entries; `database.get_hidden_features()`/`set_hidden_features()` persist the
+  hidden set in the `settings` table (`SETTING_HIDDEN_FEATURES`, no schema
+  change). `main._home_rows()` is the declarative layout, `home_keyboard()`
+  drops hidden entries, and `main._feature_for_callback()` +
+  `_feature_blocked_for()` block a hidden feature's callbacks for non-admins.
+  Admins always bypass the gate (so they can restore a hidden feature), and the
+  owner always keeps the Admin Panel entry even when `admin_panel` is hidden.
+  `messaging` and the `assistant`/`contributions` text+media paths do the same
+  check because they register handlers ahead of `callback_router`. Gated by
+  `can_visibility` via `visibility.py`; "إظهار الكل" restores everything.
 - AI Registry viewer (`show_ai_registry`) is gated by `can_ai` and renders a
   bounded, provider-grouped summary (`_registry_summary`) so it can never exceed
   Telegram's 4096-char limit, however many models are discovered.
@@ -143,7 +170,7 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
 
 ## Testing
 - `python -m py_compile` all modules.
-- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update test_medbot_fixes`
+- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update test_medbot_fixes test_visibility`
 - `test_db_patch.py` needs a real `medbot_v2.sqlite3`; it is skipped locally
   when absent.
 - Tests must exercise real code paths against temporary SQLite; no mocks.

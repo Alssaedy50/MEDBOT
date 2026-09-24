@@ -493,6 +493,30 @@ class AdminManagementTests(RBACBase):
         entries = await database.get_audit_entries(action="admin_role")
         self.assertEqual(len(entries), 1)
 
+    async def test_changing_role_applies_its_permission_scope(self):
+        await database.ensure_configured_admin(self.owner_id)
+
+        await self._manage(self.owner_id, f"amg_role:{self.sub_id}:reviewer")
+        record = await database.get_admin_record(self.sub_id)
+        self.assertTrue(record["permissions"]["can_contributions"])
+        self.assertTrue(record["permissions"]["can_messages"])
+        self.assertFalse(record["permissions"]["can_folders"])
+        self.assertFalse(record["permissions"]["can_admins"])
+
+        await self._manage(self.owner_id, f"amg_role:{self.sub_id}:admin")
+        record = await database.get_admin_record(self.sub_id)
+        self.assertTrue(record["permissions"]["can_folders"])
+        self.assertTrue(record["permissions"]["can_content"])
+        # `can_admins` is owner-only, so an admin never receives it.
+        self.assertFalse(record["permissions"]["can_admins"])
+
+    async def test_role_reference_screen_lists_all_roles(self):
+        await database.ensure_configured_admin(self.owner_id)
+        query, _ = await self._manage(self.owner_id, "amg_roles")
+        text = query.last_text or ""
+        for role in ("owner", "admin", "reviewer"):
+            self.assertIn(database.ROLE_LABELS[role], text)
+
     async def test_owner_cannot_be_removed_via_ui(self):
         await database.ensure_configured_admin(self.owner_id)
         await self._manage(self.owner_id, f"amg_remove:{self.owner_id}")
@@ -625,14 +649,32 @@ class OwnerProtectionTests(RBACBase):
         self.assertTrue(await database.is_owner(self.owner_id))
 
     async def test_owner_can_be_demoted_only_when_another_owner_exists(self):
-        # The owner promotes the sub-admin to owner (only owner can mint owner).
-        await self._manage(self.owner_id, f"amg_role:{self.sub_id}:owner")
+        # A second owner can only be created by an explicit ownership transfer;
+        # the transfer demotes the previous owner to a plain admin.
+        query = await self._manage(self.owner_id, f"amg_transfer_confirm:{self.sub_id}")
         self.assertTrue(await database.is_owner(self.sub_id))
-
-        # Now demoting the original owner is allowed (a new owner exists).
-        self.assertTrue(await database.set_admin_role(self.owner_id, "admin"))
         self.assertFalse(await database.is_owner(self.owner_id))
-        self.assertTrue(await database.is_owner(self.sub_id))
+        self.assertEqual(
+            (await database.get_admin_record(self.owner_id))["role"], "admin"
+        )
+        self.assertIn("تم نقل الملكية", query.last_text)
+
+    async def test_role_ui_cannot_mint_a_second_owner(self):
+        # Promoting via the role screen is refused outright, so two owners can
+        # never coexist.
+        query = await self._manage(self.owner_id, f"amg_role:{self.sub_id}:owner")
+        self.assertFalse(await database.is_owner(self.sub_id))
+        self.assertTrue(await database.is_owner(self.owner_id))
+        self.assertIn("نقل الملكية", query.last_text)
+
+    async def test_transfer_only_when_actor_is_owner(self):
+        # A non-owner admin (even with full permissions) cannot transfer.
+        perms = {key: True for key in database.PERMISSION_KEYS}
+        await database.update_admin_permissions(self.sub_id, perms)
+        query = await self._manage(self.sub_id, f"amg_transfer_confirm:{self.owner_id}")
+        self.assertTrue(await database.is_owner(self.owner_id))
+        self.assertFalse(await database.is_owner(self.sub_id))
+        self.assertIn("نقل الملكية متاح للمالك", query.last_text)
 
     async def test_owner_cannot_remove_themselves(self):
         query = await self._manage(self.owner_id, f"amg_remove:{self.owner_id}")

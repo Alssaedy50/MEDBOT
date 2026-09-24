@@ -57,6 +57,7 @@ import i18n
 import platform_settings
 import topics
 import notifications
+import visibility
 import workflow
 from ai import (
     generate_medical_ai_response,
@@ -309,7 +310,30 @@ def btn(text, callback):
 # ============================================================
 
 
-def home_keyboard(lang: str = None):
+def _home_rows():
+    """Declarative home-page layout: (feature key, i18n label, callback)."""
+    return (
+        (("resources", "menu_resources", "library:0"),),
+        (
+            ("assistant", "menu_assistant", "assistant"),
+            ("contributions", "menu_contributions", "contribute"),
+        ),
+        (
+            ("my_contributions", "menu_my_contributions", "my_contributions"),
+            ("account", "menu_account", "account"),
+        ),
+        (
+            ("topics", "menu_topics", "topics"),
+            ("language", "menu_language", "language"),
+        ),
+        (
+            ("contact", "menu_contact", "contact"),
+            ("about", "menu_about", "about"),
+        ),
+    )
+
+
+def home_keyboard(lang: str = None, hidden=None):
     """Start keyboard for a regular (non-privileged) user.
 
     Shows only the student-facing options; the admin entry point is added by
@@ -317,50 +341,54 @@ def home_keyboard(lang: str = None):
     Labels are rendered in the caller's language (see `i18n`); the Topics and
     Resources entries are deliberately distinct: Resources is the full
     registered hierarchy, Topics is the curated high-level academic index.
+
+    `hidden` is the set of feature keys the operator has taken offline (see
+    `database.get_hidden_features`); those entries are omitted so an update or a
+    fault can hide a section instantly.
     """
     lang = lang or i18n.DEFAULT_LANGUAGE
-    return InlineKeyboardMarkup(
-        [
-            [
-                btn(i18n.t("menu_resources", lang), "library:0"),
-            ],
-            [
-                btn(i18n.t("menu_assistant", lang), "assistant"),
-                btn(i18n.t("menu_contributions", lang), "contribute"),
-            ],
-            [
-                btn(i18n.t("menu_my_contributions", lang), "my_contributions"),
-                btn(i18n.t("menu_account", lang), "account"),
-            ],
-            [
-                btn(i18n.t("menu_topics", lang), "topics"),
-                btn(i18n.t("menu_language", lang), "language"),
-            ],
-            [
-                btn(i18n.t("menu_contact", lang), "contact"),
-                btn(i18n.t("menu_about", lang), "about"),
-            ],
+    hidden = hidden or frozenset()
+
+    rows = []
+    for row in _home_rows():
+        buttons = [
+            btn(i18n.t(label, lang), callback)
+            for feature, label, callback in row
+            if feature not in hidden
         ]
-    )
+        if buttons:
+            rows.append(buttons)
+
+    if not rows:
+        rows.append([btn("🔄 تحديث", "home")])
+
+    return InlineKeyboardMarkup(rows)
 
 
-def admin_home_keyboard(lang: str = None):
+def admin_home_keyboard(lang: str = None, hidden=None, show_admin=True):
     """Start keyboard with the admin entry point appended for admins."""
     lang = lang or i18n.DEFAULT_LANGUAGE
-    rows = list(home_keyboard(lang).inline_keyboard)
-    rows.append([btn(i18n.t("menu_admin", lang), "admin")])
+    rows = list(home_keyboard(lang, hidden).inline_keyboard)
+    if show_admin:
+        rows.append([btn(i18n.t("menu_admin", lang), "admin")])
     return InlineKeyboardMarkup(rows)
 
 
 async def home_for(update):
     """Role-aware start keyboard for the caller of `update`.
 
-    Regular users get the public keyboard; admins additionally get the Admin
-    Panel, which itself enumerates only the surfaces they are permitted to use.
-    The keyboard is rendered in the caller's stored language.
+    Regular users get the public keyboard (minus any hidden features); admins
+    additionally get the Admin Panel, which itself enumerates only the surfaces
+    they are permitted to use. The keyboard is rendered in the caller's stored
+    language.
     """
     user = getattr(update, "effective_user", None)
     user_id = getattr(user, "id", None)
+
+    try:
+        hidden = await database.get_hidden_features()
+    except Exception:
+        hidden = set()
 
     is_admin = False
     if user_id is not None:
@@ -372,9 +400,17 @@ async def home_for(update):
     lang = await user_lang(user_id) if user_id is not None else i18n.DEFAULT_LANGUAGE
 
     if not is_admin:
-        return home_keyboard(lang)
+        return home_keyboard(lang, hidden)
 
-    return admin_home_keyboard(lang)
+    # Hiding the admin entry is a soft hide: the owner always keeps it so a
+    # mistake can never lock the platform's owner out of the panel.
+    try:
+        is_owner = await database.is_owner(user_id)
+    except Exception:
+        is_owner = False
+    show_admin = not ("admin_panel" in hidden and not is_owner)
+
+    return admin_home_keyboard(lang, hidden, show_admin=show_admin)
 
 
 async def show_home(update: Update):
@@ -787,7 +823,39 @@ async def search_content(query_text):
     return results
 
 
+async def _user_is_admin_safe(user_id) -> bool:
+    try:
+        return await database.is_user_admin(user_id)
+    except Exception:
+        return False
+
+
+async def _feature_offline_notice(update, feature) -> bool:
+    """Reply with an 'unavailable' notice when `feature` is hidden for this user.
+
+    Returns True when the notice was sent and the caller should stop. Admins
+    bypass the check so they can still use and restore a hidden feature.
+    """
+    try:
+        if await _user_is_admin_safe(update.effective_user.id):
+            return False
+        if not await database.is_feature_hidden(feature):
+            return False
+    except Exception:
+        return False
+
+    await update.message.reply_text(
+        "🛠 هذا القسم غير متاح مؤقتاً للصيانة أو التحديث.\n"
+        "جرّب مرة أخرى لاحقاً.",
+        reply_markup=await home_for(update),
+    )
+    return True
+
+
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _feature_offline_notice(update, "assistant"):
+        return
+
     context.user_data["search_mode"] = True
 
     await update.message.reply_text(
@@ -3316,6 +3384,8 @@ async def show_admin(query):
         rows.append([btn("🔔 الإشعارات", "admin_notifications")])
     if await _allowed("can_topics"):
         rows.append([btn("🧭 مواضيع البحث", "admin_topics")])
+    if await _allowed("can_visibility"):
+        rows.append([btn("🙈 إظهار/إخفاء الأقسام", "vis_list")])
     if await _allowed("can_settings"):
         rows.append([btn("⚙️ إعدادات المنصة", "admin_settings")])
 
@@ -4094,6 +4164,70 @@ async def show_runtime(query):
 # ============================================================
 
 
+async def _notify_feature_hidden(query):
+    """Tell the user a feature is temporarily unavailable, with a home button."""
+    await edit_safe(
+        query,
+        "🛠 هذا القسم غير متاح مؤقتاً للصيانة أو التحديث.\n\n"
+        "جرّب مرة أخرى لاحقاً.",
+        InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+    )
+
+
+def _feature_for_callback(data: str):
+    """Map a callback_data string to the feature key that owns it.
+
+    Only the student-facing entry points are mapped; admin-only callbacks are
+    never gated here (they are permission-gated by their own modules).
+    """
+    if data == "language" or data.startswith("lang_set:"):
+        return "language"
+    if data in ("assistant", "assistant_search", "assistant_medical", "search"):
+        return "assistant"
+    if (
+        data.startswith("library:")
+        or data.startswith("library_parent:")
+        or data.startswith("folder:")
+        or data.startswith("file:")
+    ):
+        return "resources"
+    if data == "account":
+        return "account"
+    if data == "about":
+        return "about"
+    if data == "my_contributions" or data.startswith("resubmit:"):
+        return "my_contributions"
+    if (
+        data == "contribute"
+        or data.startswith("contrib_browse:")
+        or data.startswith("contrib_folder:")
+    ):
+        return "contributions"
+    if data == "topics" or data.startswith("topic_open:"):
+        return "topics"
+    if data == "contact" or data.startswith("msg_"):
+        return "contact"
+    if data == "admin":
+        return "admin_panel"
+    return None
+
+
+async def _feature_blocked_for(query, feature) -> bool:
+    """True when `feature` is hidden and the caller is not an admin/owner.
+
+    Admins bypass the gate so they can verify what is hidden and restore it.
+    """
+    try:
+        if await database.is_user_admin(query.from_user.id):
+            return False
+    except Exception:
+        pass
+    try:
+        return await database.is_feature_hidden(feature)
+    except Exception:
+        return False
+
+
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
 
@@ -4116,6 +4250,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "noop":
+        return
+
+    # Operator-controlled visibility: a hidden feature is blocked here too, so
+    # a stale button (or a deep link) can never re-open something taken offline.
+    # Admins and owners bypass the gate so they can still inspect and restore it.
+    feature = _feature_for_callback(data)
+    if feature and await _feature_blocked_for(query, feature):
+        await _notify_feature_hidden(query)
         return
 
     if data == "language":
@@ -5249,6 +5391,11 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if handled:
             return
 
+    # A hidden Assistant feature must not be reachable by typing: the admin
+    # workflows above already had their chance, so this only affects students.
+    if await _feature_offline_notice(update, "assistant"):
+        return
+
     # MEDBOT resource-search mode has priority over general AI.
     if context.user_data.get("search_mode"):
         context.user_data["search_mode"] = False
@@ -5372,6 +5519,15 @@ async def media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if handled:
         return
 
+    # A hidden Contributions feature must not accept uploads either.
+    if (
+        context.user_data.get("contribution_folder")
+        or context.user_data.get("contribution_resubmit_id")
+    ):
+        if await _feature_offline_notice(update, "contributions"):
+            _clear_contribution_state(context)
+            return
+
     handled = await contribution_media_handler(update, context)
 
     if handled:
@@ -5485,6 +5641,7 @@ def main():
     platform_settings.register_platform_settings_handlers(app)
     topics.register_topics_handlers(app)
     notifications.register_notifications_handlers(app)
+    visibility.register_visibility_handlers(app)
 
     # Inline UI
     app.add_handler(CallbackQueryHandler(callback_router))

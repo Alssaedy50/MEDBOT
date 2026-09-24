@@ -74,6 +74,7 @@ def _admins_menu(admins) -> InlineKeyboardMarkup:
             [btn(f"{role_label} | {name[:18]} | {telegram_id}", f"amg_view:{telegram_id}")]
         )
     rows.append([btn("➕ إضافة مشرف", "amg_add")])
+    rows.append([btn("ℹ️ صلاحيات الأدوار", "amg_roles")])
     rows.append([btn("⬅️ Admin", "admin")])
     rows.append([btn("🏠 الرئيسية", "home")])
     return InlineKeyboardMarkup(rows)
@@ -101,6 +102,31 @@ async def show_admin_management(query, context=None):
     lines = ["👥 <b>إدارة المشرفين</b>", f"📦 العدد: {len(admins)}\n",
              "اختر مشرفاً لتعديل دوره وصلاحياته."]
     await _edit(query, "\n".join(lines), _admins_menu(admins))
+
+
+async def show_role_reference(query):
+    """Explain the scope of every role (owner / admin / reviewer)."""
+    if not await _is_authorized(query.from_user.id):
+        await _edit(query, "🔒 غير مصرح.", _home_keyboard())
+        return
+
+    lines = ["👑 <b>صلاحيات الأدوار</b>", ""]
+    for role in ("owner", "admin", "reviewer"):
+        label = database.ROLE_LABELS.get(role, role)
+        lines.append(f"<b>{esc(label)}</b>")
+        lines.append(esc(database.ROLE_DESCRIPTIONS.get(role, "")))
+        lines.append("")
+
+    await _edit(
+        query,
+        "\n".join(lines).rstrip(),
+        InlineKeyboardMarkup(
+            [
+                [btn("⬅️ إدارة المشرفين", "amg_list")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
 
 
 async def show_admin_detail(query, target_id):
@@ -147,14 +173,23 @@ async def show_admin_detail(query, target_id):
         rows.append(perm_buttons[i:i + 2])
 
     lines.append("\n👑 <b>الدور</b>")
-    for role in database.ROLES:
+    target_is_owner = record["role"] == "owner"
+    # `owner` is not assignable from the role list: it is only reachable through
+    # the explicit "نقل الملكية" action, so two owners can never exist.
+    for role in database.ROLE_ASSIGNABLE:
         label = database.ROLE_LABELS.get(role, role)
         mark = "✅" if record["role"] == role else "▫️"
         rows.append([btn(f"{mark} {label}", f"amg_role:{target_id}:{role}")])
 
+    if target_is_owner:
+        lines.append(f"✅ {esc(database.ROLE_LABELS['owner'])}")
+
+    lines.append("")
+    lines.append(esc(database.ROLE_DESCRIPTIONS.get(record["role"], "")))
+
     # Ownership transfer is a distinct, owner-only operation: it swaps two
     # roles atomically so the platform is never left without an owner.
-    if await database.is_owner(query.from_user.id) and record["role"] != "owner":
+    if await database.is_owner(query.from_user.id) and not target_is_owner:
         rows.append([btn("👑 نقل الملكية", f"amg_transfer:{target_id}")])
 
     rows.append([btn("🗑 إزالة المشرف", f"amg_remove:{target_id}")])
@@ -240,7 +275,7 @@ async def execute_transfer(query, target_id):
         query,
         "✅ <b>تم نقل الملكية بنجاح.</b>\n\n"
         f"👑 المالك الجديد: <code>{esc(target_id)}</code>\n"
-        "🛡 دورك الحالي: مشرف\n\n"
+        "🛡 دورك الحالي: مشرف (لمالك واحد فقط في المنصة).\n\n"
         "سيتم تطبيق دور المالك الجديد الكامل من هذه اللحظة.",
         InlineKeyboardMarkup(
             [
@@ -287,13 +322,19 @@ async def change_role(query, target_id, role):
         await _edit(query, "🔒 غير مصرح.", _home_keyboard())
         return
 
-    if role not in database.ROLES:
-        await _edit(query, "⚠️ دور غير مدعوم.", _home_keyboard())
+    # `owner` is transfer-only; promoting through the role list is what could
+    # create two owners, so it is refused here with a pointer to the right flow.
+    if role == "owner":
+        await _edit(
+            query,
+            "👑 لتعيين مالك جديد استخدم «نقل الملكية» من صفحة المشرف.\n"
+            "بهذه الطريقة يبقى مالك واحد فقط في المنصة.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة المشرفين", "amg_list")]]),
+        )
         return
 
-    # Only the configured owner may mint another owner.
-    if role == "owner" and not await database.is_owner(query.from_user.id):
-        await _edit(query, "🔒 تعيين المالك متاح للمالك فقط.", _home_keyboard())
+    if role not in database.ROLE_ASSIGNABLE:
+        await _edit(query, "⚠️ دور غير مدعوم.", _home_keyboard())
         return
 
     record = await database.get_admin_record(target_id)
@@ -306,19 +347,17 @@ async def change_role(query, target_id, role):
         return
 
     # The active owner must not be demoted; a new owner has to exist first.
-    if (
-        role != "owner"
-        and await database.is_owner(target_id)
-    ):
+    if await database.is_owner(target_id):
         await _edit(
             query,
             "🔒 لا يمكن تغيير دور المالك الحالي إلى مشرف.\n"
-            "عيّن حساباً آخر كمالك أولاً، ثم غيّر هذا الحساب.",
+            "انقل الملكية إلى حساب آخر أولاً.",
             InlineKeyboardMarkup([[btn("⬅️ إدارة المشرفين", "amg_list")]]),
         )
         return
 
-    ok = await database.set_admin_role(target_id, role)
+    # Choosing a role also applies its baseline permission scope.
+    ok = await database.apply_role_preset(target_id, role)
 
     if ok:
         await audit.log_action(
@@ -409,29 +448,34 @@ async def handle_add_admin_text(update, context):
 
     identifier = update.message.text.strip()
 
-    # `add_sub_admin_by_any` uses INSERT OR REPLACE, which would reset an
-    # existing row's role/permissions. Never let that touch the owner.
-    digits = "".join(ch for ch in identifier if ch.isdigit())
-    if digits and await database.is_owner(int(digits)):
-        await update.message.reply_text(
-            "🔒 هذا المعرف هو المالك الحالي ولا يمكن إضافته كمشرف.",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [btn("👥 إدارة المشرفين", "amg_list")],
-                    [btn("🏠 الرئيسية", "home")],
-                ]
-            ),
-        )
-        return True
-
     ok, message = await database.add_sub_admin_by_any(identifier)
 
     if ok:
         # A newly added admin starts least-privilege: an explicit all-False map
         # (never an empty column, which would mean legacy full access).
+        #
+        # `add_sub_admin_by_any` uses INSERT OR REPLACE, which resets role and
+        # permissions. Re-adding an existing (non-owner) admin would therefore
+        # wipe its role/perms, so the resolved row is repaired afterwards: the
+        # owner is never demoted, everyone else is re-asserted as `admin` with
+        # an explicit all-False map.
         try:
-            new_id = int("".join(ch for ch in identifier if ch.isdigit()) or 0)
-            if new_id > 0:
+            digits = "".join(ch for ch in identifier if ch.isdigit())
+            if digits:
+                new_id = int(digits)
+            else:
+                # A @username add stores the resolved numeric id on the row.
+                async with (await database.get_db()) as db:
+                    async with db.execute(
+                        "SELECT telegram_id FROM admins "
+                        "WHERE username = ? "
+                        "ORDER BY added_at DESC, telegram_id DESC LIMIT 1",
+                        (identifier.lstrip("@"),),
+                    ) as cur:
+                        row = await cur.fetchone()
+                new_id = row[0] if row else 0
+
+            if new_id > 0 and not await database.is_owner(new_id):
                 await database.set_admin_role(new_id, "admin")
                 await database.update_admin_permissions(
                     new_id, {key: False for key in database.PERMISSION_KEYS}
@@ -474,6 +518,10 @@ async def admin_management_callback_handler(update, context: ContextTypes.DEFAUL
 
     if data == "amg_add":
         await start_add_admin(query, context)
+        return
+
+    if data == "amg_roles":
+        await show_role_reference(query)
         return
 
     if data.startswith("amg_view:"):
@@ -547,6 +595,6 @@ def register_admin_management_handlers(app):
     app.add_handler(
         CallbackQueryHandler(
             admin_management_callback_handler,
-            pattern=r"^(amg_list|amg_add|amg_view:|amg_perm:|amg_role:|amg_remove:|amg_transfer)",
+            pattern=r"^(amg_list|amg_add|amg_roles|amg_view:|amg_perm:|amg_role:|amg_remove:|amg_transfer)",
         )
     )
