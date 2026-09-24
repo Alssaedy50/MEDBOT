@@ -59,11 +59,7 @@ import topics
 import notifications
 import visibility
 import workflow
-from ai import (
-    generate_medical_ai_response,
-    generate_medbot_assistant_response,
-    NOT_REGISTERED_MESSAGE,
-)
+from ai import generate_medbot_unified_response, warm_ai_pool
 from search_engine import search_library_summary
 
 load_dotenv()
@@ -422,11 +418,6 @@ async def show_home(update: Update):
         user.full_name,
     )
 
-    remaining = await database.get_remaining_quota(
-        user.id,
-        max_limit=DAILY_LIMIT,
-    )
-
     lang = await user_lang(user.id)
     platform = await _platform_name()
 
@@ -436,9 +427,6 @@ async def show_home(update: Update):
         f"🩺 *{platform}*\n\n"
         + i18n.t("welcome_greeting", lang, name=user.first_name) + "\n\n"
         + f"{welcome}\n\n"
-        + i18n.t(
-            "welcome_quota", lang, remaining=remaining, limit=DAILY_LIMIT
-        ) + "\n\n"
         + i18n.t("choose_service", lang)
     )
 
@@ -948,14 +936,6 @@ async def run_search(update: Update, query_text):
 async def show_account(query):
     user = query.from_user
 
-    try:
-        remaining = await database.get_remaining_quota(
-            user.id,
-            max_limit=DAILY_LIMIT,
-        )
-    except Exception:
-        remaining = "غير متاح"
-
     lang = await user_lang(user.id)
     language_label = database.LANGUAGE_LABELS.get(lang, lang)
 
@@ -963,9 +943,7 @@ async def show_account(query):
         f"{i18n.t('account_title', lang)}\n\n"
         f"👤 الاسم: {user.full_name}\n"
         f"🆔 Telegram ID: `{user.id}`\n\n"
-        f"🤖 رصيد AI اليومي: {remaining}/{DAILY_LIMIT}\n\n"
-        f"{i18n.t('account_language', lang)}: {language_label}\n\n"
-        "يتم تجديد الرصيد تلقائياً مع بداية يوم جديد."
+        f"{i18n.t('account_language', lang)}: {language_label}"
     )
 
     await edit_safe(
@@ -4182,7 +4160,13 @@ def _feature_for_callback(data: str):
     """
     if data == "language" or data.startswith("lang_set:"):
         return "language"
-    if data in ("assistant", "assistant_search", "assistant_medical", "search"):
+    if data in (
+        "assistant",
+        "assistant_start",
+        "assistant_search",
+        "assistant_medical",
+        "search",
+    ):
         return "assistant"
     if (
         data.startswith("library:")
@@ -4327,58 +4311,36 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "assistant":
         context.user_data["search_mode"] = False
-        context.user_data["assistant_mode"] = None
+        context.user_data["assistant_mode"] = "unified"
         await edit_safe(
             query,
-            "🤖 *MEDBOT Assistant*\n\n"
-            "اختر نوع المساعدة التي تريد استخدامها:\n\n"
-            "📚 *البحث داخل MEDBOT*\n"
-            "ابحث في الكتب والمحاضرات والملخصات وMCQs "
-            "والملفات المسجلة داخل المنصة فقط.\n\n"
-            "🩺 *المساعد الطبي العام*\n"
-            "اسأل عن أي موضوع طبي للدراسة والشرح والفهم.",
+            "🤖 *مساعد MEDBOT*\n\n"
+            "اسأل عن أي موضوع طبي أو عام، أو اكتب اسم مورد للوصول إليه "
+            "داخل المنصة.\n\n"
+            "أجمع لك البحث داخل موارد المنصة والإجابة عن السؤال في خطوة "
+            "واحدة، ويمكنني قراءة كل بيانات المنصة والمقارنة بينها.\n\n"
+            "✍️ اكتب سؤالك أو اسم المورد الآن.",
             InlineKeyboardMarkup(
                 [
-                    [btn("📚 البحث داخل MEDBOT", "assistant_search")],
-                    [btn("🩺 المساعد الطبي العام", "assistant_medical")],
-                    [btn("📊 Quota", "account")],
                     [btn("🏠 الرئيسية", "home")],
                 ]
             ),
         )
         return
 
-    if data == "assistant_search":
-        context.user_data["search_mode"] = True
-        context.user_data["assistant_mode"] = "resource"
-        await edit_safe(
-            query,
-            "📚 *البحث داخل MEDBOT*\n\n"
-            "اكتب اسم الكتاب أو المحاضرة أو الملف أو الموضوع "
-            "الذي تريد البحث عنه.\n\n"
-            "🔒 سيتم البحث فقط داخل الموارد المسجلة في MEDBOT.",
-            InlineKeyboardMarkup(
-                [
-                    [btn("🤖 العودة للمساعد", "assistant")],
-                    [btn("🏠 الرئيسية", "home")],
-                ]
-            ),
-        )
-        return
-
-    if data == "assistant_medical":
+    # Legacy gateway buttons (older messages still carry them): the two
+    # former modes are now a single unified assistant.
+    if data in ("assistant_search", "assistant_medical", "assistant_start"):
         context.user_data["search_mode"] = False
-        context.user_data["assistant_mode"] = "medical"
+        context.user_data["assistant_mode"] = "unified"
         await edit_safe(
             query,
-            "🩺 *المساعد الطبي العام*\n\n"
-            "اكتب سؤالك الطبي الآن.\n\n"
-            "يمكنك طلب شرح المفاهيم الطبية، المقارنات، "
-            "الآليات المرضية، الفسيولوجيا، التشريح وغيرها.",
+            "🤖 *مساعد MEDBOT*\n\n"
+            "اسأل عن أي موضوع طبي أو عام، أو اكتب اسم مورد للوصول إليه "
+            "داخل المنصة.\n\n"
+            "✍️ اكتب سؤالك أو اسم المورد الآن.",
             InlineKeyboardMarkup(
                 [
-                    [btn("📚 بحث داخل MEDBOT", "assistant_search")],
-                    [btn("📊 Quota", "account")],
                     [btn("🏠 الرئيسية", "home")],
                 ]
             ),
@@ -5207,9 +5169,17 @@ async def quota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         max_limit=DAILY_LIMIT,
     )
 
+    if remaining > 0:
+        message = "✅ يمكنك استخدام المساعد الآن."
+    else:
+        message = (
+            "⚠️ تم الوصول إلى الحد المسموح به من الطلبات اليومية.\n"
+            "يتجدد العداد تلقائياً خلال 24 ساعة."
+        )
+
     await send_safe_message(
         update,
-        f"📊 *رصيدك المتبقي لليوم:* {remaining} من {DAILY_LIMIT} طلباً.",
+        message,
         await home_for(update),
     )
 
@@ -5396,51 +5366,32 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _feature_offline_notice(update, "assistant"):
         return
 
-    # MEDBOT resource-search mode has priority over general AI.
+    # Legacy standalone search mode (the /search command) still resolves
+    # deterministically; the unified assistant supersedes the two former
+    # assistant modes.
     if context.user_data.get("search_mode"):
         context.user_data["search_mode"] = False
         context.user_data["assistant_mode"] = None
         await run_search(update, query)
         return
 
-    # Explicit /ask always means Medical AI.
+    # Explicit /ask always means the unified assistant.
     if query.startswith("/ask"):
         query = query.replace("/ask", "", 1).strip()
-        context.user_data["assistant_mode"] = "medical"
+        context.user_data["assistant_mode"] = "unified"
 
-    # If the user is inside the Assistant gateway, route according
-    # to the selected assistant mode instead of guessing the intent.
     assistant_mode = context.user_data.get("assistant_mode")
 
-    # MEDBOT resource assistant: deterministic search first, then grounded AI.
-    if assistant_mode == "resource":
-        context.user_data["assistant_mode"] = None
-
-        try:
-            answer = await generate_medbot_assistant_response(
-                query,
-                user_id=user.id,
-            )
-        except Exception:
-            logger.exception("MEDBOT grounded assistant failed")
-            answer = NOT_REGISTERED_MESSAGE
-
-        await send_safe_message(
-            update,
-            answer,
-            await home_for(update),
-        )
-        return
-
-    if assistant_mode is None:
+    # The student is not inside the assistant: do not silently guess intent,
+    # just point them at the single assistant entry point.
+    if assistant_mode != "unified":
         await update.message.reply_text(
-            "🤖 *MEDBOT Assistant*\n\n"
-            "اختر أولاً نوع المساعدة التي تريد استخدامها:",
+            "🤖 *مساعد MEDBOT*\n\n"
+            "اضغط الزر بالأسفل ثم اكتب سؤالك أو اسم المورد.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [btn("📚 البحث داخل MEDBOT", "assistant_search")],
-                    [btn("🩺 المساعد الطبي العام", "assistant_medical")],
+                    [btn("🤖 فتح مساعد MEDBOT", "assistant")],
                     [btn("🏠 الرئيسية", "home")],
                 ]
             ),
@@ -5454,15 +5405,6 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Only the General Medical AI mode consumes the daily AI quota.
-    if context.user_data.get("assistant_mode") != "medical":
-        await update.message.reply_text(
-            "⚠️ لم يتم تحديد وضع المساعد بشكل صحيح.\n\n"
-            "يرجى اختيار أحد المسارين من 🤖 MEDBOT Assistant.",
-            reply_markup=await home_for(update),
-        )
-        return
-
     allowed, remaining = await database.check_and_increment_quota(
         user.id,
         max_limit=DAILY_LIMIT,
@@ -5470,8 +5412,8 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not allowed:
         await update.message.reply_text(
-            "⚠️ استنفدت رصيدك اليومي المتاح (20 طلباً). "
-            "يتجدد الرصيد تلقائياً كل 24 ساعة.",
+            "⚠️ تم الوصول إلى الحد المسموح به من الطلبات اليومية.\n"
+            "يتجدد العداد تلقائياً خلال 24 ساعة.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=await home_for(update),
         )
@@ -5486,7 +5428,7 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     try:
-        ai_answer = await generate_medical_ai_response(query, user_id=user.id)
+        ai_answer = await generate_medbot_unified_response(query, user_id=user.id)
     except Exception as exc:
         logger.exception("AI request failed")
         ai_answer = (
@@ -5494,11 +5436,16 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "لم يتم إنشاء إجابة غير مؤكدة."
         )
 
-    final_text = (
-        f"{ai_answer}\n\n"
-        "—\n"
-        f"💡 *الرصيد المتبقي اليوم: {remaining} من {DAILY_LIMIT} طلب*"
-    )
+    final_text = ai_answer
+
+    # No balance counter is shown. The student is only told when the daily
+    # allowance is used up: on the last allowed request, and on the next one.
+    if remaining <= 0:
+        final_text = (
+            f"{ai_answer}\n\n"
+            "—\n"
+            "⚠️ *هذا آخر طلب متاح لك اليوم. تم الوصول إلى الحد المسموح به.*"
+        )
 
     await send_safe_message(
         update,
@@ -5603,6 +5550,10 @@ async def post_init(application: Application):
             "ADMIN_ID is not configured. "
             "No admin was promoted; set ADMIN_ID in the environment."
         )
+
+    # Warm the AI discovery/probe cache so the first assistant reply does not
+    # pay for provider discovery. Runs in the background and is best-effort.
+    asyncio.create_task(warm_ai_pool())
 
 
 def main():
