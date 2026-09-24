@@ -156,7 +156,7 @@ All sensitive operations require `is_admin(user_id)`:
 ### Module layout (single source of truth)
 - `ai.py` — the ONLY active AI implementation: provider discovery, adapters
   (Gemini / Groq / OpenRouter), error classification, failover, grounding
-  validation, and the MEDBOT-grounded assistant.
+  validation, and the unified MEDBOT assistant.
 - `ai_router.py` — thin compatibility facade that re-exports `ai.py`. It holds
   no provider logic; it exists only so older callers keep working.
 - `ai_discovery.py` — CLI health/verification tool using the shared layer.
@@ -171,12 +171,85 @@ real functions are:
 - `_get_candidates` (discovery → registry health → probe → VERIFIED pool)
 - `_gemini_request`, `_openai_compatible_request`, `_request`
 - `_classify_error`, `_record_success`, `_record_failure`
-- `GroundingValidator`, `build_library_context`
+- `GroundingValidator`, `build_library_context`, `build_platform_catalog`
+- `generate_medbot_unified_response` (the single student-facing assistant)
 - `generate_medical_ai_response` (general medical AI path)
-- `generate_medbot_assistant_response` (MEDBOT-grounded resource path)
+- `generate_medbot_assistant_response` (legacy MEDBOT-grounded resource path)
 
-### Grounding (implemented)
-`generate_medbot_assistant_response` enforces the required pipeline:
+### Unified assistant (student-facing)
+`generate_medbot_unified_response` is the one assistant option in the UI. It
+answers general and medical questions and simultaneously helps the student
+reach registered data. The pipeline is:
+
+```
+prompt → full registered platform catalog (build_platform_catalog)
+       → deterministic SQLite search (search_engine)
+       → verified PubMed sources
+       → AI provider (failover)
+       → answer
+```
+
+- The model may read and compare the ENTIRE registered catalog (every section
+  and resource with its real path), which is what lets it point at the exact
+  location of a resource and generate quick navigation answers.
+- It may only mention items present in that catalog; it never invents a
+  resource, path, or citation.
+- The catalog is bounded by `ai.CATALOG_MAX_CHARS` so a huge library cannot
+  overflow the provider context.
+- With no provider available, the deterministic grounded search results are
+  returned instead of hallucinated content; with no results either, it says so
+  plainly.
+- Each unified call consumes one unit of the daily AI quota.
+
+### Medical answer format
+`ai.UNIFIED_ASSISTANT_PROMPT` enforces a bilingual answer for medical
+questions:
+
+```
+🩺 <topic>
+**English (academic):**
+<model academic answer in English — definition, key points, clinical relevance>
+**العربية — شرح مختصر:**
+<short, faithful Arabic explanation — not a distorted literal translation>
+```
+
+General (non-medical, e.g. "where is this resource") questions are answered in
+Arabic directly with the real path, without the English block.
+
+### Latency
+The reply path is bounded so a slow provider or a cold cache does not stack
+delays:
+
+- The three independent loads (platform catalog, SQLite search, candidate
+  pool) run concurrently with `asyncio.gather`.
+- Provider discovery for the three providers runs concurrently, as does the
+  probe batch (previously serial: up to 3 discovery round-trips + up to 6
+  probes).
+- Generation output is capped by `ai.MAX_OUTPUT_TOKENS` (900) so a runaway
+  answer cannot dominate latency.
+- `ai.warm_ai_pool()` runs once at startup (best-effort, background) so the
+  first student reply does not pay for provider discovery.
+- PubMed is only fetched when a provider exists to ground the answer.
+
+### Daily allowance
+The remaining balance is never displayed. It is removed from the home screen,
+the account screen, `/quota`, and the assistant reply footer. The student is
+told only when the allowance is used up:
+
+- On the last allowed request the reply ends with
+  "هذا آخر طلب متاح لك اليوم. تم الوصول إلى الحد المسموح به."
+- The next request gets "تم الوصول إلى الحد المسموح به من الطلبات اليومية."
+- The exact limit number is never disclosed.
+
+`DAILY_LIMIT` and the quota database functions are unchanged; only the
+presentation changed.
+
+The former two-option gateway (`assistant_search` / `assistant_medical`) is
+removed from the UI; those callbacks still resolve to the unified screen so
+older messages never dead-end.
+
+### Grounding (legacy path, retained)
+`generate_medbot_assistant_response` enforces the original strict pipeline:
 
 ```
 prompt → deterministic SQLite search (search_engine) → grounding context

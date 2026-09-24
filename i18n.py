@@ -55,23 +55,17 @@ _TRANSLATIONS = {
         "ar": "🩺 *{platform}*\n\nمرحباً بك دكتور {name}.\n\n"
               "منصة أكاديمية طبية تساعدك على الوصول إلى الموارد المسجلة "
               "والبحث فيها واستخدام المساعد الذكي ضمن محتوى المنصة.\n\n"
-              "📊 *رصيد الذكاء الاصطناعي اليوم:* {remaining}/{limit}\n\n"
               "اختر الخدمة التي تريد استخدامها:",
         "en": "🩺 *{platform}*\n\nWelcome, Dr. {name}.\n\n"
               "A medical academic platform for reaching and searching the "
               "registered resources and using the assistant within the "
               "platform content.\n\n"
-              "📊 *Daily AI balance:* {remaining}/{limit}\n\n"
               "Choose a service:",
     },
     "choose_service": {"ar": "اختر الخدمة التي تريد استخدامها:", "en": "Choose a service:"},
     "welcome_greeting": {
         "ar": "مرحباً بك دكتور {name}.",
         "en": "Welcome, Dr. {name}.",
-    },
-    "welcome_quota": {
-        "ar": "📊 *رصيد الذكاء الاصطناعي اليوم:* {remaining}/{limit}",
-        "en": "📊 *Daily AI balance:* {remaining}/{limit}",
     },
 
     # ---- Account / language -------------------------------------------

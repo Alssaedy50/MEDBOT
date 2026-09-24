@@ -91,6 +91,86 @@ class GroundingTests(unittest.TestCase):
         self.assertTrue(validator.allows("Anatomy / Upper Limb Muscles"))
 
 
+class UnifiedAssistantTests(unittest.TestCase):
+    """The single assistant answers questions AND navigates the platform.
+
+    These tests run with no API keys, so the unified pipeline always takes its
+    deterministic, grounded fallback path — which is exactly the path that
+    must never invent a resource.
+    """
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="medbot-unified-")
+        self.db_path = os.path.join(self.tmp_dir, "test.sqlite3")
+
+        self._old_db_name = database.DB_NAME
+        self._old_search_db_name = search_engine.DB_NAME
+
+        database.DB_NAME = self.db_path
+        search_engine.DB_NAME = self.db_path
+
+        asyncio.run(database.init_db())
+
+        self.folder_id = asyncio.run(
+            database.add_folder(None, "Anatomy", "general")
+        )
+        self.content_id = asyncio.run(
+            database.add_content(
+                self.folder_id,
+                "Upper Limb Muscles",
+                "file-abc",
+                "document",
+            )
+        )
+
+    def tearDown(self):
+        database.DB_NAME = self._old_db_name
+        search_engine.DB_NAME = self._old_search_db_name
+
+        import shutil
+
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_empty_prompt_is_rejected(self):
+        answer = asyncio.run(ai.generate_medbot_unified_response("   "))
+        self.assertIn("سؤال واضح", answer)
+
+    def test_no_provider_returns_grounded_results_for_known_resource(self):
+        answer = asyncio.run(ai.generate_medbot_unified_response("Anatomy"))
+        self.assertIn("Anatomy", answer)
+        self.assertIn("MEDBOT", answer)
+        # The unfound resource must never be invented.
+        self.assertNotIn("Pharmacology", answer)
+
+    def test_no_provider_and_no_match_does_not_invent(self):
+        answer = asyncio.run(
+            ai.generate_medbot_unified_response("zzz-does-not-exist-zzz")
+        )
+        self.assertNotIn("zzz-does-not-exist-zzz", answer)
+        self.assertIn("MEDBOT", answer)
+
+    def test_catalog_renders_registered_folder_and_content(self):
+        folders, contents, paths = asyncio.run(
+            database.get_searchable_records()
+        )
+        catalog = ai.build_platform_catalog(folders, contents, paths)
+        self.assertIn("Anatomy", catalog)
+        self.assertIn("Upper Limb Muscles", catalog)
+        self.assertIn("الرئيسية", catalog)
+
+    def test_catalog_empty_library(self):
+        catalog = ai.build_platform_catalog([], [], {})
+        self.assertIn("لا تحتوي", catalog)
+
+    def test_catalog_is_bounded(self):
+        folders = [
+            (i, None, f"Section {i}", "general")
+            for i in range(1, 5000)
+        ]
+        catalog = ai.build_platform_catalog(folders, [], {})
+        self.assertLessEqual(len(catalog), ai.CATALOG_MAX_CHARS + 200)
+
+
 class AdminBootstrapSecurityTests(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp(prefix="medbot-admin-")

@@ -33,15 +33,55 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
 - `search_engine.py` — deterministic Arabic/English search (`search_library`,
   `search_library_summary`).
 - `ai.py` — the ONLY AI implementation: discovery, adapters, failover,
-  grounding, and both assistant entry points.
+  grounding, and the assistant entry points.
 - `ai_router.py` — compatibility facade re-exporting `ai.py`. No logic here.
 - `ai_discovery.py` — CLI health/verification tool over the shared layer.
 
 ## AI entry points
-- `generate_medical_ai_response(prompt, user_id)` — general medical AI.
-- `generate_medbot_assistant_response(prompt, user_id)` — MEDBOT-grounded
-  resource assistant. Search first; if nothing is found it returns exactly
-  `الموارد المطلوبة غير مسجلة حالياً في MEDBOT.` without calling a model.
+- `generate_medbot_unified_response(prompt, user_id)` — the SINGLE assistant
+  exposed in the UI. It answers general and medical questions AND navigates
+  the platform, comparing the whole registered library. Pipeline: full
+  platform catalog (`build_platform_catalog`) + deterministic search +
+  verified PubMed sources -> provider -> answer. It may only mention items
+  present in the catalog; the catalog is bounded by `ai.CATALOG_MAX_CHARS` and
+  injected into the prompt. On no provider it falls back to deterministic
+  grounded results. It consumes one daily quota unit per call.
+- Medical-answer contract: `UNIFIED_ASSISTANT_PROMPT` requires a model academic
+  answer in ENGLISH first, then a separate faithful Arabic summary section
+  (`English (academic):` before `العربية — شرح مختصر:`). General
+  (platform/navigation) questions are answered in Arabic without the English
+  block.
+- Latency: the independent loads in the unified pipeline (platform catalog,
+  SQLite search, candidate pool) run concurrently via `asyncio.gather`;
+  provider discovery and the probe batch are also concurrent; generation is
+  capped by `ai.MAX_OUTPUT_TOKENS`; `warm_ai_pool()` runs once at startup
+  (best-effort) so the first student reply does not pay for discovery.
+- `generate_medical_ai_response(prompt, user_id)` — general medical AI
+  (retained; `/ask`-era path, no longer wired to the student UI).
+- `generate_medbot_assistant_response(prompt, user_id)` — legacy
+  MEDBOT-grounded resource assistant. Search first; if nothing is found it
+  returns exactly `الموارد المطلوبة غير مسجلة حالياً في MEDBOT.` without
+  calling a model. (Retained for compatibility; the UI now uses the unified
+  assistant.)
+- The student UI has ONE assistant option (`assistant` callback). The former
+  `assistant_search`/`assistant_medical` two-option gateway is gone; those
+  callbacks still resolve so old messages never dead-end. `assistant_mode`
+  holds `"unified"` while the student is inside the assistant; a typed
+  message outside it only points the student at the entry button (no quota
+  consumed).
+
+## Daily allowance UX
+- The remaining balance is never shown: it is gone from the home screen, the
+  account screen, `/quota`, and the assistant reply footer. `i18n`'s
+  `welcome_quota` key was removed.
+- The student is told ONLY when the allowance is used up: on the last allowed
+  request the reply ends with "هذا آخر طلب متاح لك اليوم. تم الوصول إلى الحد
+  المسموح به.", and the next request gets "تم الوصول إلى الحد المسموح به من
+  الطلبات اليومية."
+- The exact limit number is never disclosed in any of these messages.
+- `DAILY_LIMIT` and `database.check_and_increment_quota`/`get_remaining_quota`
+  are unchanged; only the presentation changed.
+
 
 ## Admin security
 - `ADMIN_ID` is the only admin source. `configured_admin_id()` returns 0 for

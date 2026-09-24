@@ -73,6 +73,46 @@ MEDBOT_ASSISTANT_PROMPT = """أنت مساعد منصة MEDBOT، وهي منصة
 6. إذا سأل الطالب عن طريقة استخدام MEDBOT، اشرح الاستخدام باختصار دون اختلاق موارد.
 """
 
+UNIFIED_ASSISTANT_PROMPT = """أنت مساعد منصة MEDBOT، وهي منصة تعليمية طبية على Telegram.
+
+دورك واحد ومزدوج في الوقت نفسه:
+- الإجابة عن أسئلة الطالب العامة، بما فيها الأسئلة الطبية، بشرح دقيق ومختصر.
+- مساعدته في الوصول إلى البيانات المسجّلة في المنصة (الأقسام والموارد).
+
+تُزوَّد بمصدرين للمعلومة في سياق الرسالة:
+1. بيانات المنصة الكاملة (كل الأقسام والموارد مع مساراتها الفعلية).
+2. نتائج البحث المباشرة عن طلب المستخدم، ومصادر طبية موثّقة عند توفرها.
+
+أسلوب الإجابة عن الأسئلة الطبية (إلزامي):
+- اكتب أولاً إجابة أكاديمية نموذجية *باللغة الإنجليزية*، بأسلوب مرجعي دقيق
+  (تعريف، ثم النقاط الأساسية، ثم الأهمية السريرية عند الحاجة)، في فقرة إلى
+  ثلاث فقرات قصيرة.
+- ثم أضف قسماً منفصلاً يشرح المعنى *بالعربية* بإيجاز مفيد، شرحاً أميناً غير
+  مشوّه للمعنى، دون ترجمة حرفية طويلة.
+- استخدم هذا الترتيب حرفياً:
+
+  🩺 <الموضوع>
+  **English (academic):**
+  <الإجابة الأكاديمية بالإنجليزية>
+  **العربية — شرح مختصر:**
+  <الشرح العربي الموجز>
+
+- إن كان السؤال عاماً غير طبي (مثل سؤال عن مورد داخل المنصة)، أجب بالعربية
+  مباشرة مع ذكر المسار الفعلي، دون فرض القسم الإنجليزي.
+
+قواعد إلزامية:
+1. عند ذكر أي مورد أو قسم أو مسار، اعتمد حرفياً على بيانات المنصة المزوّدة؛
+   ممنوع اختراع مورد أو قسم أو مسار أو رابط غير مذكور في السياق.
+2. إن لم يوجد المورد المطلوب في بيانات المنصة، قل بوضوح إنه غير مسجّل حالياً
+   داخل MEDBOT، ثم أجب عن الجزء المعرفي من السؤال إن وُجد.
+3. اجعل الإجابة قصيرة منظّمة: أهم النقاط فقط، دون حشو.
+4. لا تخترع معلومة أو مرجعاً أو PMID؛ استخدم المصادر المزوّدة فقط.
+5. إذا لم تكن متأكداً من معلومة، قل إنك غير متأكد بدلاً من التخمين.
+6. اجعل الإجابة تعليمية، ولا تقدّم تشخيصاً شخصياً أو وصفة علاجية شخصية.
+7. لا تكرّر قائمة المنصة كاملة داخل الإجابة؛ اذكر فقط ما يخص سؤال الطالب.
+8. اذكر المراجع (PMID) فقط إن وُجدت فعلاً في المصادر المزوّدة.
+"""
+
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GROQ_KEY = os.getenv("GROQ_API_KEY", "").strip()
 OR_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -103,6 +143,11 @@ KNOWN_GOOD_MODELS = {
 _DISCOVERY_CACHE = {}
 _DISCOVERY_LAST_RUN = {}
 DISCOVERY_TTL_SECONDS = 900
+
+# Hard cap on generated tokens. Bilingual answers are short by design, so the
+# cap bounds worst-case generation latency (a runaway long answer is the other
+# big latency contributor) without truncating a normal reply.
+MAX_OUTPUT_TOKENS = 900
 
 # The verified active pool is expensive to build: provider discovery plus up
 # to six health probes, all network round-trips. Rebuilding it on every user
@@ -687,10 +732,28 @@ async def _refresh_discovered_models(candidates):
         len(providers),
     )
 
-    for item in selected:
-        await _probe_model(item)
+    # Probes are independent HTTP round-trips; run them concurrently so the
+    # refresh costs one probe round-trip instead of the sum of up to six.
+    if selected:
+        await asyncio.gather(
+            *(_probe_model(item) for item in selected),
+            return_exceptions=True,
+        )
 
     return candidates
+
+
+async def warm_ai_pool() -> None:
+    """Warm the discovery/probe cache so the first student reply is fast.
+
+    Called once at startup. It is best-effort: a failure here never affects
+    serving, and the normal on-demand path still runs if it fails.
+    """
+    try:
+        await _get_candidates()
+    except Exception:
+        logger.exception("AI pool warm-up failed")
+
 
 async def _get_candidates():
     """Discover, register, verify, and build the active AI pool.
@@ -741,11 +804,24 @@ async def _build_candidates_uncached():
     # --------------------------------------------------------
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as discovery_client:
-            discovered = await _discover_gemini_models(discovery_client)
-            discovered += await _discover_groq_models(discovery_client)
-            discovered += await _discover_openrouter_models(
-                discovery_client
+            # The three providers are independent; running them concurrently
+            # keeps a slow/unreachable provider from serializing the others
+            # (previously up to 3x the slowest discovery round-trip).
+            gemini, groq, openrouter = await asyncio.gather(
+                _discover_gemini_models(discovery_client),
+                _discover_groq_models(discovery_client),
+                _discover_openrouter_models(discovery_client),
+                return_exceptions=True,
             )
+
+        discovered = []
+        for provider_result in (gemini, groq, openrouter):
+            if isinstance(provider_result, list):
+                discovered += provider_result
+            else:
+                logger.warning(
+                    "Provider discovery raised: %s", provider_result
+                )
 
         for item in discovered:
             if _is_model_suitable_for_medbot(item):
@@ -876,6 +952,7 @@ async def _gemini_request(client, item, prompt, system_prompt=SYSTEM_PROMPT):
             ],
             "generationConfig": {
                 "temperature": 0.2,
+                "maxOutputTokens": MAX_OUTPUT_TOKENS,
             },
         },
     )
@@ -938,6 +1015,7 @@ async def _openai_compatible_request(client, item, prompt, system_prompt=SYSTEM_
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
+            "max_tokens": MAX_OUTPUT_TOKENS,
         },
     )
 
@@ -1123,12 +1201,81 @@ def _result_line(item: dict) -> str:
     return f"- [{kind}] {title} | المسار: {path}"
 
 
+# Cap on the platform catalog injected into a single prompt. The unified
+# assistant may read the whole library, but an unbounded dump could exceed
+# the provider's context window, so it is truncated on a line boundary.
+CATALOG_MAX_CHARS = 8000
+
+_NODE_LABELS = {
+    "book": "📚 كتاب",
+    "books": "📚 كتب",
+    "video": "🎥 فيديو",
+    "audio": "🎧 صوتي",
+    "mcq": "📝 MCQ",
+    "summary": "📑 ملخص",
+    "summaries": "📑 ملخصات",
+    "image": "🖼 صورة",
+    "photo": "🖼 صورة",
+    "document": "📄 مستند",
+    "doc": "📄 مستند",
+    "general": "📁 قسم",
+}
+
+_FILE_LABELS = {
+    "photo": "🖼 صورة",
+    "image": "🖼 صورة",
+    "video": "🎥 فيديو",
+    "audio": "🎧 صوتي",
+    "mcq": "📝 MCQ",
+    "quiz": "📝 MCQ",
+    "pdf": "📕 PDF",
+    "document": "📄 مستند",
+}
+
+
 def build_library_context(results: list) -> str:
     """Render deterministic search results into a compact grounding context."""
     if not results:
         return "لا توجد نتائج مطابقة في قاعدة بيانات MEDBOT."
 
     return "\n".join(_result_line(item) for item in results)
+
+
+def build_platform_catalog(folders, contents, paths) -> str:
+    """Render the full registered MEDBOT tree into a compact text catalog.
+
+    The unified assistant is allowed to read and compare the whole platform
+    (every section and resource with its real path) so it can answer
+    navigation questions and point at the exact place of a resource. Only
+    registered data is rendered — nothing is invented — and the result is
+    bounded by ``CATALOG_MAX_CHARS`` so an enormous library can never blow
+    the prompt size.
+    """
+    lines = []
+
+    for row in folders:
+        folder_id, name, node_type = row[0], row[2], row[3]
+        path = paths.get(folder_id) or "الرئيسية 🏠"
+        kind = _NODE_LABELS.get(str(node_type or "").lower(), "📁 قسم")
+        suffix = " (يستقبل مساهمات)" if len(row) > 4 and row[4] else ""
+        lines.append(f"- [{kind}] {name} | المسار: {path}{suffix}")
+
+    for row in contents:
+        folder_id, title, file_type = row[1], row[2], row[3]
+        path = paths.get(folder_id) or "الرئيسية 🏠"
+        kind = _FILE_LABELS.get(str(file_type or "").lower(), "📄 مورد")
+        lines.append(f"- [{kind}] {title} | داخل: {path}")
+
+    if not lines:
+        return "قاعدة البيانات لا تحتوي أي أقسام أو موارد مسجلة بعد."
+
+    catalog = "\n".join(lines)
+
+    if len(catalog) > CATALOG_MAX_CHARS:
+        catalog = catalog[:CATALOG_MAX_CHARS].rsplit("\n", 1)[0]
+        catalog += "\n… (تم اختصار دليل المنصة لطوله)"
+
+    return catalog
 
 
 class GroundingValidator:
@@ -1268,6 +1415,188 @@ async def generate_medbot_assistant_response(
         f"{context}\n\n"
         "⚠️ تعذر الوصول إلى خدمة الذكاء الاصطناعي؛ النتائج أعلاه مأخوذة "
         "مباشرة من قاعدة بيانات MEDBOT."
+    )
+
+
+async def _fetch_pubmed_sources(prompt: str) -> list:
+    """Fetch verified PubMed sources without ever raising into the caller."""
+    try:
+        return await search_pubmed(prompt, limit=2)
+    except Exception:
+        logger.exception("PubMed retrieval failed in unified assistant")
+        return []
+
+
+async def _platform_catalog_text() -> str:
+    """Load the full registered platform tree as a compact text catalog."""
+    try:
+        folders, contents, paths = await database.get_searchable_records()
+    except Exception:
+        logger.exception("Could not load MEDBOT catalog for the AI assistant")
+        return ""
+
+    return build_platform_catalog(folders, contents, paths)
+
+
+async def generate_medbot_unified_response(
+    prompt: str,
+    user_id: int = None,
+) -> str:
+    """The single MEDBOT assistant: answers questions AND navigates the platform.
+
+    Pipeline:
+        prompt
+        -> full registered platform catalog (read/compare the whole library)
+        -> deterministic SQLite search for the request
+        -> verified PubMed sources
+        -> AI provider (failover)
+        -> grounded answer
+
+    The model is allowed to read and compare the entire registered catalog, so
+    it can point at the exact location of a resource, but it may only mention
+    items present in that catalog — nothing is invented.
+    """
+    prompt = (prompt or "").strip()
+
+    if not prompt:
+        return "⚠️ يرجى كتابة سؤال واضح."
+
+    # These three are independent, so they run concurrently: the answer waits
+    # for the slowest instead of the sum of all three. The candidate pool
+    # (discovery + probes) and the platform catalog were the main serial
+    # latency contributors on a cold cache.
+    catalog, results, candidates = await asyncio.gather(
+        _platform_catalog_text(),
+        _search_medbot(prompt),
+        _get_candidates(),
+        return_exceptions=True,
+    )
+
+    if isinstance(catalog, BaseException):
+        logger.warning("Catalog load failed: %s", catalog)
+        catalog = ""
+    if isinstance(results, BaseException):
+        logger.warning("Library search failed: %s", results)
+        results = []
+    if isinstance(candidates, BaseException):
+        logger.warning("Candidate pool failed: %s", candidates)
+        candidates = []
+
+    library_context = build_library_context(results)
+
+    # No provider: fall back to the deterministic, grounded library results.
+    if not candidates:
+        if results:
+            return (
+                "📚 *نتائج البحث داخل MEDBOT*\n\n"
+                f"{library_context}\n\n"
+                "⚠️ خدمة الذكاء الاصطناعي غير متاحة حالياً."
+            )
+        return (
+            "⚠️ لا توجد خدمة ذكاء اصطناعي متاحة حالياً، ولم أجد مورداً "
+            "مطابقاً في MEDBOT."
+        )
+
+    sources = await _fetch_pubmed_sources(prompt)
+
+    source_context = build_source_context(sources) if sources else "لا توجد مصادر خارجية."
+
+    grounded_prompt = (
+        "بيانات منصة MEDBOT الكاملة (الأقسام والموارد المسجّلة، وهي المرجع "
+        "الوحيد لأي مورد أو مسار):\n"
+        f"{catalog}\n\n"
+        "نتائج البحث المباشرة عن طلب الطالب:\n"
+        f"{library_context}\n\n"
+        "مصادر طبية موثّقة (NCBI PubMed):\n"
+        f"{source_context}\n\n"
+        f"طلب الطالب:\n{prompt}\n\n"
+        "أجب عن سؤال الطالب (طبي أو عام) بشرح قصير، وإن تعلّق بسؤال عن مورد "
+        "داخل المنصة فاذكر اسمه ومساره الفعلي من البيانات أعلاه فقط."
+    )
+
+    validator = GroundingValidator()
+
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        for item in candidates:
+            provider = item["provider"]
+
+            try:
+                started = time.perf_counter()
+
+                answer = await _request(
+                    client,
+                    item,
+                    grounded_prompt,
+                    UNIFIED_ASSISTANT_PROMPT,
+                )
+
+                if not validator.allows(answer):
+                    raise RuntimeError("Validator rejected empty answer")
+
+                latency_ms = round(
+                    (time.perf_counter() - started) * 1000,
+                    1,
+                )
+
+                registry_id = item.get("id")
+                if registry_id:
+                    try:
+                        await database.ai_usage_record(
+                            registry_id=registry_id,
+                            user_id=user_id,
+                            latency_ms=latency_ms,
+                            success=True,
+                        )
+                    except Exception:
+                        logger.exception("Failed to record AI usage success")
+
+                await _record_success(item, latency_ms)
+
+                logger.info(
+                    "Unified assistant success provider=%s model=%s latency_ms=%s",
+                    provider,
+                    item["model"],
+                    latency_ms,
+                )
+
+                return answer
+
+            except Exception as exc:
+                logger.warning(
+                    "Unified assistant provider failed provider=%s model=%s error=%s",
+                    provider,
+                    item["model"],
+                    exc,
+                )
+
+                await _record_failure(item, exc)
+
+                registry_id = item.get("id")
+                if registry_id:
+                    try:
+                        _, _, error_category = _classify_error(exc)
+                        await database.ai_usage_record(
+                            registry_id=registry_id,
+                            user_id=user_id,
+                            success=False,
+                            error_category=error_category,
+                        )
+                    except Exception:
+                        logger.exception("Failed to record AI usage failure")
+
+    # Every provider failed: return grounded deterministic results when we have
+    # them, otherwise tell the student the service is down.
+    if results:
+        return (
+            "📚 *نتائج البحث داخل MEDBOT*\n\n"
+            f"{library_context}\n\n"
+            "⚠️ تعذر الوصول إلى خدمة الذكاء الاصطناعي؛ النتائج أعلاه مأخوذة "
+            "مباشرة من قاعدة بيانات MEDBOT."
+        )
+
+    return (
+        "⚠️ تعذر الوصول إلى خدمة الذكاء الاصطناعي حالياً.\n"
+        "يرجى المحاولة بعد قليل."
     )
 
 

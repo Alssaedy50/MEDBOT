@@ -13,10 +13,12 @@ handlers (no mocks of database or business logic):
 preview test drives a fake bot so delivery can be observed without network.
 """
 
+import asyncio
 import os
 import tempfile
 import unittest
 
+import ai
 import database
 import i18n
 import main
@@ -493,6 +495,220 @@ class CallbackDeliveryTests(FixBase):
         await main.error_handler(update, _Ctx())
         self.assertTrue(query.calls)
         self.assertTrue(query.calls[0][1].get("show_alert"))
+
+
+# ---------------------------------------------------------------
+# 7. Unified assistant (single option)
+# ---------------------------------------------------------------
+
+
+class UnifiedAssistantRoutingTests(FixBase):
+    """The two former assistant modes are now one option."""
+
+    async def test_assistant_button_opens_single_unified_screen(self):
+        query = _FakeQuery(self.student_id, "assistant")
+        ctx = _FakeContext()
+        await main.callback_router(_FakeUpdate(query), ctx)
+
+        self.assertIn("مساعد MEDBOT", query.last_text or "")
+        callbacks = {
+            b.callback_data
+            for row in query.last_markup.inline_keyboard
+            for b in row
+        }
+        # The old two-option gateway is gone.
+        self.assertNotIn("assistant_search", callbacks)
+        self.assertNotIn("assistant_medical", callbacks)
+        self.assertEqual(ctx.user_data.get("assistant_mode"), "unified")
+
+    async def test_legacy_mode_buttons_never_dead_end(self):
+        for legacy in ("assistant_search", "assistant_medical"):
+            query = _FakeQuery(self.student_id, legacy)
+            ctx = _FakeContext()
+            await main.callback_router(_FakeUpdate(query), ctx)
+            self.assertIn("مساعد MEDBOT", query.last_text or "")
+            self.assertEqual(ctx.user_data.get("assistant_mode"), "unified")
+
+    async def test_typed_question_outside_assistant_points_to_entry(self):
+        ctx = _FakeContext()
+        msg = _TextMessage("ما هو القلب؟")
+        await main.ai_handler(_MediaUpdate(self.student_id, msg), ctx)
+
+        self.assertTrue(msg.replies)
+        self.assertIn("مساعد MEDBOT", msg.replies[-1])
+        # No quota was consumed because no AI call ran.
+        remaining = await database.get_remaining_quota(
+            self.student_id, max_limit=main.DAILY_LIMIT
+        )
+        self.assertEqual(remaining, main.DAILY_LIMIT)
+
+    async def test_unified_answer_consumes_one_quota_unit(self):
+        ctx = _FakeContext()
+        ctx.user_data["assistant_mode"] = "unified"
+        ctx.bot = _RecordingBot()
+
+        await database.add_content(self.section, "Lecture", "fid", "document")
+
+        msg = _TextMessage("Anatomy")
+        await main.ai_handler(_MediaUpdate(self.student_id, msg), ctx)
+
+        remaining = await database.get_remaining_quota(
+            self.student_id, max_limit=main.DAILY_LIMIT
+        )
+        self.assertEqual(remaining, main.DAILY_LIMIT - 1)
+
+    async def test_unified_answer_never_invents_unregistered_resource(self):
+        ctx = _FakeContext()
+        ctx.user_data["assistant_mode"] = "unified"
+        ctx.bot = _RecordingBot()
+
+        msg = _TextMessage("zzz-unregistered-resource-zzz")
+        await main.ai_handler(_MediaUpdate(self.student_id, msg), ctx)
+
+        # No provider in CI: the deterministic fallback must not invent a hit.
+        self.assertTrue(msg.replies)
+        combined = "\n".join(msg.replies)
+        self.assertNotIn("zzz-unregistered-resource-zzz", combined)
+
+
+# ---------------------------------------------------------------
+# 8. Daily allowance is silent until it is exhausted
+# ---------------------------------------------------------------
+
+
+class DailyAllowanceDisplayTests(FixBase):
+    """The student never sees a balance counter, only the exhaustion notice."""
+
+    async def test_home_screen_hides_quota_counter(self):
+        message = _TextMessage("/start")
+        update = _MediaUpdate(self.student_id, message)
+        update.callback_query = None
+        update.effective_user.first_name = "Student"
+        await main.show_home(update)
+
+        combined = "\n".join(message.replies)
+        self.assertNotIn("رصيد", combined)
+        self.assertNotIn(str(main.DAILY_LIMIT), combined)
+
+    async def test_account_screen_hides_quota_counter(self):
+        query = _FakeQuery(self.student_id, "account")
+        await main.show_account(query)
+
+        self.assertNotIn("رصيد", query.last_text or "")
+
+    async def test_quota_command_reveals_no_remaining_number(self):
+        update = _MediaUpdate(self.student_id, _TextMessage("/quota"))
+        await main.quota_command(update, _FakeContext())
+
+        combined = "\n".join(update.message.replies)
+        self.assertNotIn(str(main.DAILY_LIMIT), combined)
+        self.assertNotIn("رصيدك المتبقي", combined)
+
+    async def test_answer_footer_has_no_balance_counter(self):
+        ctx = _FakeContext()
+        ctx.user_data["assistant_mode"] = "unified"
+        ctx.bot = _RecordingBot()
+
+        await database.add_content(self.section, "Lecture", "fid", "document")
+
+        msg = _TextMessage("Anatomy")
+        await main.ai_handler(_MediaUpdate(self.student_id, msg), ctx)
+
+        combined = "\n".join(msg.replies)
+        self.assertNotIn("الرصيد المتبقي", combined)
+
+    async def test_exhausted_allowance_reports_limit_reached(self):
+        ctx = _FakeContext()
+        ctx.user_data["assistant_mode"] = "unified"
+        ctx.bot = _RecordingBot()
+
+        for _ in range(main.DAILY_LIMIT):
+            await database.check_and_increment_quota(
+                self.student_id, max_limit=main.DAILY_LIMIT
+            )
+
+        msg = _TextMessage("Anatomy")
+        await main.ai_handler(_MediaUpdate(self.student_id, msg), ctx)
+
+        combined = "\n".join(msg.replies)
+        self.assertIn("الحد المسموح", combined)
+        # The exact limit number is not disclosed.
+        self.assertNotIn(str(main.DAILY_LIMIT), combined)
+
+
+class BilingualMedicalAnswerTests(unittest.TestCase):
+    """The medical-answer contract: English academic answer + Arabic summary."""
+
+    def test_prompt_requires_english_academic_then_arabic_summary(self):
+        prompt = ai.UNIFIED_ASSISTANT_PROMPT
+        self.assertIn("English (academic)", prompt)
+        self.assertIn("العربية", prompt)
+        # Faithful, not distorted, Arabic explanation.
+        self.assertIn("مشوّه للمعنى", prompt)
+        self.assertIn("شرحاً أميناً", prompt)
+        # The English block must come before the Arabic block.
+        self.assertLess(
+            prompt.index("English (academic)"),
+            prompt.index("**العربية"),
+        )
+
+    def test_output_token_cap_is_bounded(self):
+        self.assertIsInstance(ai.MAX_OUTPUT_TOKENS, int)
+        self.assertGreater(ai.MAX_OUTPUT_TOKENS, 0)
+        self.assertLessEqual(ai.MAX_OUTPUT_TOKENS, 2000)
+
+    def test_pubmed_fetch_never_raises(self):
+        async def run():
+            original = ai.search_pubmed
+
+            async def boom(query, limit=3):
+                raise RuntimeError("network down")
+
+            ai.search_pubmed = boom
+            try:
+                return await ai._fetch_pubmed_sources("cardiac cycle")
+            finally:
+                ai.search_pubmed = original
+
+        self.assertEqual(asyncio.run(run()), [])
+
+
+class ProviderDiscoveryParallelismTests(unittest.TestCase):
+    """Discovery and probes must not run serially."""
+
+    def test_discovery_modules_run_concurrently(self):
+        import inspect
+
+        source = inspect.getsource(ai._build_candidates_uncached)
+        self.assertIn("asyncio.gather", source)
+
+    def test_probe_batch_runs_concurrently(self):
+        import inspect
+
+        source = inspect.getsource(ai._refresh_discovered_models)
+        self.assertIn("asyncio.gather", source)
+
+    def test_pool_warmup_is_best_effort(self):
+        async def run():
+            original = ai._get_candidates
+
+            async def boom():
+                raise RuntimeError("discovery down")
+
+            ai._get_candidates = boom
+            try:
+                # Must swallow the failure, not propagate it.
+                return await ai.warm_ai_pool()
+            finally:
+                ai._get_candidates = original
+
+        self.assertIsNone(asyncio.run(run()))
+
+    def test_unified_pipeline_loads_data_concurrently(self):
+        import inspect
+
+        source = inspect.getsource(ai.generate_medbot_unified_response)
+        self.assertIn("asyncio.gather", source)
 
 
 if __name__ == "__main__":
