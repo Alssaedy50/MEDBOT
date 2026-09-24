@@ -23,6 +23,7 @@ from telegram.ext import (
 
 import audit
 import database
+import workflow
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,7 @@ async def start_edit(query, context, key):
     except Exception:
         current = ""
 
+    workflow.begin(context, "settings_edit")
     context.user_data["settings_edit_key"] = key
     label = database.PLATFORM_SETTING_LABELS.get(key, key)
 
@@ -140,6 +142,9 @@ async def handle_settings_text(update, context) -> bool:
         return False
 
     if not update.message or not update.message.text:
+        return False
+
+    if not workflow.owns(context, "settings_edit"):
         return False
 
     context.user_data.pop("settings_edit_key", None)

@@ -2510,6 +2510,41 @@ async def get_all_admins():
     await db.close()
     return rows
 
+
+async def get_admins_with_permission(permission: str):
+    """Active admins holding `permission`, as (telegram_id, username, added_at).
+
+    Uses the same resolution as `user_has_permission`: the owner always passes,
+    a legacy empty-permission row keeps full access, and a 'none' role never
+    qualifies. This is what routes admin-facing notifications to admins who
+    can actually act on them, rather than to every active admin.
+    """
+    if permission not in PERMISSION_KEYS:
+        return []
+
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT telegram_id, username, added_at, role, permissions "
+            "FROM admins "
+            "WHERE role IS NULL OR role != 'none' "
+            "ORDER BY added_at ASC"
+        ) as cur:
+            rows = await cur.fetchall()
+    finally:
+        await db.close()
+
+    allowed = []
+    for row in rows:
+        role = row[3] or "admin"
+        if role == "owner":
+            allowed.append((row[0], row[1], row[2]))
+            continue
+        if permissions_from_string(row[4]).get(permission):
+            allowed.append((row[0], row[1], row[2]))
+    return allowed
+
+
 async def is_user_admin(telegram_id: int) -> bool:
     """True when the user is an active admin.
 

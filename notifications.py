@@ -22,6 +22,7 @@ from telegram.ext import (
 
 import audit
 import database
+import workflow
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,7 @@ async def start_notification(query, context):
         await _edit(query, "🔒 غير مصرح.", _home_keyboard())
         return
 
+    workflow.begin(context, "notification_body")
     context.user_data["notifications_body"] = True
 
     await _edit(
@@ -169,6 +171,9 @@ async def handle_notification_text(update, context) -> bool:
         return False
 
     if not update.message or not update.message.text:
+        return False
+
+    if not workflow.owns(context, "notification_body"):
         return False
 
     context.user_data.pop("notifications_body", None)

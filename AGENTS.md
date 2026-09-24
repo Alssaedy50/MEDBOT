@@ -118,10 +118,25 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
   `edit_safe` sends a NEW message instead of editing when the target is
   registered content, so a navigation tap can never erase a delivered answer.
   Temporary menus are the only messages edited in place (`CONTENT_MENU_KEY`).
+- `workflow.py` is the single-owner text-flow registry. Every flow that awaits
+  typed input calls `workflow.begin(context, name)` on entry and its text
+  consumer guards with `workflow.owns(context, name)`. Starting a flow cancels
+  the other flows' keys and claims `workflow.ACTIVE_KEY`, so two overlapping
+  prompts can never both consume the same message. When no flow is marked
+  active (direct/legacy calls) `owns` returns True, preserving the old
+  contract. `workflow.clear_all` runs on the `home` reset.
+- Contribution preview: `main.preview_contribution` (route `preview:<id>`) is
+  read-only — it sends the exact submitted file to the reviewing admin via
+  `_send_registered_media` and never mutates the contribution row. Gated by
+  `can_contributions`; the received media message is registered as content.
+- Role-RBAC notification routing: `database.get_admins_with_permission(perm)`
+  resolves admins the same way `user_has_permission` does (owner always,
+  legacy empty-perms full, `none` never) and is what admin notifications use,
+  so a supervisor without the relevant capability is not pinged.
 
 ## Testing
 - `python -m py_compile` all modules.
-- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update`
+- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update test_medbot_fixes`
 - `test_db_patch.py` needs a real `medbot_v2.sqlite3`; it is skipped locally
   when absent.
 - Tests must exercise real code paths against temporary SQLite; no mocks.
