@@ -53,6 +53,7 @@ from telegram.ext import (
 import database
 import messaging
 import audit
+import archive
 import admin_management
 import i18n
 import platform_settings
@@ -2643,6 +2644,14 @@ async def _register_admin_upload(query, context, preview):
     await _audit(query, "content_upload", "content", content_id,
                  details=f"title={title}, folder={folder_id}")
 
+    # Best-effort mirror to the Emergency Resource Archive. This must never
+    # fail, delay or block the MEDBOT resource that was just registered; any
+    # publication problem is recorded as pending/failed for a later resync.
+    try:
+        await archive.publish_resource(context.bot, content_id, with_header=True)
+    except Exception:
+        logger.exception("Archive mirror failed for content id=%s", content_id)
+
     await edit_safe(
         query,
         "✅ <b>تم تسجيل المورد بنجاح.</b>\n\n"
@@ -3347,6 +3356,8 @@ async def show_admin(query):
         rows.append([btn("🧭 مواضيع البحث", "admin_topics")])
     if await _allowed("can_visibility"):
         rows.append([btn("🙈 إظهار/إخفاء الأقسام", "vis_list")])
+    if await _allowed("can_archive"):
+        rows.append([btn("🗄 أرشيف الطوارئ", "admin_archive")])
     if await _allowed("can_settings"):
         rows.append([btn("⚙️ إعدادات المنصة", "admin_settings")])
 
@@ -3984,6 +3995,19 @@ async def process_approval(query, contribution_id, approve):
                     "ونشرها في المكتبة."
                 ),
             )
+
+            # Mirror the newly approved resource to the Emergency Archive.
+            # Best-effort: a publication problem never fails the approval.
+            if len(result) >= 6:
+                try:
+                    await archive.publish_resource(
+                        query.get_bot(), result[5], with_header=True
+                    )
+                except Exception:
+                    logger.exception(
+                        "Archive mirror failed for approved content id=%s",
+                        result[5],
+                    )
 
     except Exception as exc:
         logger.exception("Contribution approval/rejection failed")
@@ -5637,6 +5661,7 @@ def main():
     topics.register_topics_handlers(app)
     notifications.register_notifications_handlers(app)
     visibility.register_visibility_handlers(app)
+    archive.register_archive_handlers(app)
 
     # Inline UI
     app.add_handler(CallbackQueryHandler(callback_router))

@@ -212,6 +212,7 @@ async def init_db():
         await _migrate_v9(db)
         await _migrate_v10(db)
         await _migrate_v11(db)
+        await _migrate_v12(db)
 
         # ------------------------------------------------------------
         # Performance / integrity indexes
@@ -467,6 +468,7 @@ PERMISSION_KEYS = (
     "can_settings",
     "can_topics",
     "can_visibility",
+    "can_archive",
 )
 
 # Stored in `admins.permissions` to mean "explicitly granted nothing". An empty
@@ -484,6 +486,7 @@ PERMISSION_LABELS = {
     "can_settings": "⚙️ إعدادات المنصة",
     "can_topics": "🧭 مواضيع البحث",
     "can_visibility": "🙈 إظهار/إخفاء الأقسام",
+    "can_archive": "🗄 أرشيف الطوارئ",
 }
 
 # Short labels for the compact permission toggles in admin_management.
@@ -498,6 +501,7 @@ PERMISSION_SHORT_LABELS = {
     "can_settings": "الإعدادات",
     "can_topics": "المواضيع",
     "can_visibility": "الإظهار",
+    "can_archive": "الأرشيف",
 }
 
 ROLE_LABELS = {
@@ -865,6 +869,51 @@ async def _migrate_v11(db):
         )
     except Exception:
         pass
+
+
+async def _migrate_v12(db):
+    """Emergency Resource Archive mirror table.
+
+    Records, per group of identical MEDBOT resources, the publication state of
+    the corresponding post in the standalone Telegram archive channel. MEDBOT's
+    registry stays the single source of truth: this table only tracks a
+    best-effort mirror and the ids needed to keep it idempotent (never post the
+    same resource twice) and resyncable after a failure.
+
+    The dedupe key is ``content_fingerprint`` (folder path + title + file_type +
+    file_id): a resource restored/re-added with a different row id still maps to
+    one archive post. ``content_ids`` holds the comma-separated MEDBOT content
+    ids that share the fingerprint. Safe to re-run; never rewrites content.
+    """
+    try:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS archive_sync (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                object_type TEXT NOT NULL DEFAULT 'content',
+                content_fingerprint TEXT NOT NULL,
+                folder_id INTEGER,
+                content_ids TEXT,
+                channel_id TEXT,
+                channel_message_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER DEFAULT 0,
+                error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                published_at TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_archive_fingerprint
+            ON archive_sync(content_fingerprint)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_archive_status
+            ON archive_sync(status)
+        """)
+        logger.info("Migration v12: ensured archive_sync table")
+    except Exception:
+        logger.exception("Migration v12 failed")
 
 # Message categories and lifecycle states.
 MESSAGE_CATEGORIES = ("message", "summary", "suggestion", "report")
@@ -1759,7 +1808,9 @@ async def approve_contribution(contrib_id: int, reviewer_id: int = None):
             WHERE id = ? AND status IN ('pending', 'needs_revision')
         """, (reviewer_id, contrib_id))
         await db.commit()
-        return (fid, title, file_id, f_type, uid)
+        # The mirrored resource's content id is appended so the archive sync
+        # can target the promoted row directly.
+        return (fid, title, file_id, f_type, uid, cid)
     except Exception:
         await db.rollback()
         raise
@@ -2110,6 +2161,263 @@ async def set_platform_setting(key: str, value: str) -> bool:
     except Exception:
         logger.exception("set_platform_setting failed for %s", key)
         return False
+
+
+# ------------------------------------------------------------
+# Emergency Resource Archive mirror (disaster recovery)
+# ------------------------------------------------------------
+# MEDBOT's registry is the source of truth. `archive_sync` only records what
+# was mirrored into the standalone Telegram archive channel, so publication is
+# idempotent, observable and resyncable. The helpers below never touch `content`
+# or `folders`.
+ARCHIVE_STATUSES = ("pending", "published", "failed", "skipped")
+
+
+async def get_archive_sync(fingerprint: str):
+    """Sync row for one fingerprint, or None.
+
+    Row layout: (id, object_type, content_fingerprint, folder_id, content_ids,
+    channel_id, channel_message_id, status, attempts, error, created_at,
+    updated_at, published_at).
+    """
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT id, object_type, content_fingerprint, folder_id, "
+            "content_ids, channel_id, channel_message_id, status, attempts, "
+            "error, created_at, updated_at, published_at "
+            "FROM archive_sync WHERE content_fingerprint = ?",
+            (fingerprint,),
+        ) as cur:
+            return await cur.fetchone()
+    finally:
+        await db.close()
+
+
+async def upsert_archive_pending(
+    fingerprint: str,
+    folder_id=None,
+    content_id=None,
+    object_type: str = "content",
+):
+    """Register a mirror candidate without clobbering an existing publication.
+
+    A resource that was already published (or is mid-retry) keeps its row, so
+    re-registering the same resource can never enqueue a second post. The new
+    content id is appended to ``content_ids`` so a promoted contribution's
+    action target stays resolvable. Returns the row id.
+    """
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT id, content_ids FROM archive_sync "
+            "WHERE content_fingerprint = ?",
+            (fingerprint,),
+        ) as cur:
+            row = await cur.fetchone()
+
+        if row:
+            row_id = row[0]
+            ids = [p for p in str(row[1] or "").split(",") if p.strip()]
+            if content_id is not None and str(content_id) not in ids:
+                ids.append(str(content_id))
+                await db.execute(
+                    "UPDATE archive_sync SET content_ids = ?, updated_at = "
+                    "CURRENT_TIMESTAMP WHERE id = ?",
+                    (",".join(ids), row_id),
+                )
+                await db.commit()
+            return row_id
+
+        cursor = await db.execute(
+            "INSERT INTO archive_sync "
+            "(object_type, content_fingerprint, folder_id, content_ids, status) "
+            "VALUES (?, ?, ?, ?, 'pending')",
+            (
+                object_type,
+                fingerprint,
+                folder_id,
+                "" if content_id is None else str(content_id),
+            ),
+        )
+        await db.commit()
+        return cursor.lastrowid
+    finally:
+        await db.close()
+
+
+async def mark_archive_published(
+    fingerprint: str, channel_id, channel_message_id
+):
+    """Record a successful mirror. Idempotent: only the first publish wins.
+
+    Returns True when this call performed the transition from a non-published
+    state; False when the row was already published (a duplicate/retry).
+    """
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT id, status FROM archive_sync WHERE content_fingerprint = ?",
+            (fingerprint,),
+        ) as cur:
+            row = await cur.fetchone()
+
+        if not row:
+            await db.execute(
+                "INSERT INTO archive_sync "
+                "(object_type, content_fingerprint, channel_id, "
+                "channel_message_id, status, attempts, published_at, "
+                "updated_at) VALUES "
+                "('content', ?, ?, ?, 'published', 1, CURRENT_TIMESTAMP, "
+                "CURRENT_TIMESTAMP)",
+                (fingerprint, str(channel_id), channel_message_id),
+            )
+            await db.commit()
+            return True
+
+        if row[1] == "published" and row[0]:
+            await db.execute(
+                "UPDATE archive_sync SET channel_message_id = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (channel_message_id, row[0]),
+            )
+            await db.commit()
+            return False
+
+        await db.execute(
+            "UPDATE archive_sync SET status = 'published', channel_id = ?, "
+            "channel_message_id = ?, error = NULL, attempts = attempts + 1, "
+            "published_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = ?",
+            (str(channel_id), channel_message_id, row[0]),
+        )
+        await db.commit()
+        return True
+    finally:
+        await db.close()
+
+
+async def mark_archive_failed(fingerprint: str, error: str):
+    """Record a failed mirror attempt without disturbing the resource."""
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE archive_sync SET status = 'failed', attempts = attempts + 1, "
+            "error = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE content_fingerprint = ?",
+            (str(error)[:500], fingerprint),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def get_archive_sync_rows(status: str = None, limit: int = 200):
+    """List mirror rows, optionally filtered by status (newest first)."""
+    db = await get_db()
+    try:
+        base = (
+            "SELECT id, object_type, content_fingerprint, folder_id, "
+            "content_ids, channel_id, channel_message_id, status, attempts, "
+            "error, created_at, updated_at, published_at FROM archive_sync"
+        )
+        if status:
+            async with db.execute(
+                base + " WHERE status = ? ORDER BY id DESC LIMIT ?",
+                (status, int(limit)),
+            ) as cur:
+                return await cur.fetchall()
+        async with db.execute(
+            base + " ORDER BY id DESC LIMIT ?", (int(limit),)
+        ) as cur:
+            return await cur.fetchall()
+    finally:
+        await db.close()
+
+
+async def get_archive_sync_counts() -> dict:
+    """Counts per status, for the admin dashboard."""
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT status, COUNT(*) FROM archive_sync GROUP BY status"
+        ) as cur:
+            rows = await cur.fetchall()
+        counts = {status: 0 for status in ARCHIVE_STATUSES}
+        for status, count in rows:
+            counts[str(status)] = int(count)
+        counts["total"] = sum(
+            value for key, value in counts.items() if key != "total"
+        )
+        return counts
+    finally:
+        await db.close()
+
+
+async def get_resource_snapshot(content_id: int):
+    """One resource with its real registered path, for the archive mirror.
+
+    Returns (content_id, folder_id, title, file_id, file_type, path) or None.
+    ``path`` is the exact breadcrumb used across the platform, so the archive
+    post follows MEDBOT's real hierarchy; it is never synthesised. This makes
+    no network calls and no writes — it is a read-only registry lookup.
+    """
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT id, folder_id, title, file_id, file_type "
+            "FROM content WHERE id = ?",
+            (content_id,),
+        ) as cur:
+            row = await cur.fetchone()
+
+        if not row:
+            return None
+
+        paths = await build_breadcrumb_paths(db, [row[1]])
+        return (
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            paths.get(row[1], "الرئيسية 🏠"),
+        )
+    finally:
+        await db.close()
+
+
+async def get_all_resource_snapshots():
+    """Every registered resource with its registered path, ordered by path.
+
+    Used by the admin resync, which re-mirrors resources registered before the
+    archive existed. Ordered by folder id then content id so a bulk sync emits
+    posts in a stable, hierarchy-following order.
+    """
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT id, folder_id, title, file_id, file_type FROM content "
+            "ORDER BY folder_id ASC, id ASC"
+        ) as cur:
+            rows = await cur.fetchall()
+
+        folder_ids = {row[1] for row in rows}
+        paths = await build_breadcrumb_paths(db, folder_ids)
+
+        return [
+            (
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                paths.get(row[1], "الرئيسية 🏠"),
+            )
+            for row in rows
+        ]
+    finally:
+        await db.close()
 
 
 # ------------------------------------------------------------

@@ -22,7 +22,8 @@ platform resource search and AI chat).
 - The operator holds the real credentials/database on Termux; CI here has no
   keys and no database. Tests use temporary SQLite files.
 - Config env vars: `BOT_TOKEN`, `ADMIN_ID`, `GEMINI_API_KEY`, `GROQ_API_KEY`,
-  `OPENROUTER_API_KEY`, `MEDBOT_DB_PATH`.
+  `OPENROUTER_API_KEY`, `MEDBOT_DB_PATH`, `MEDBOT_ARCHIVE_CHANNEL` (the
+  archive channel: numeric id or `@username`; unset disables the archive).
 - SQLite path is resolved by `database.resolve_db_path()` / `ensure_db_dir()`
   (the only place that decides the file) with precedence: `DB_PATH` >
   non-default `DB_NAME` > `MEDBOT_DB_PATH` env > default relative
@@ -40,6 +41,9 @@ platform resource search and AI chat).
   grounding, and the assistant entry points.
 - `ai_router.py` — compatibility facade re-exporting `ai.py`. No logic here.
 - `ai_discovery.py` — CLI health/verification tool over the shared layer.
+- `archive.py` — the ONLY Emergency Resource Archive implementation
+  (mirrors registered resources to a standalone Telegram channel;
+  env-configured).
 
 ## AI architecture — TWO separate modes
 The assistant is deliberately split into two INDEPENDENT workflows. They are
@@ -157,13 +161,15 @@ Both consume one daily quota unit per call and return
   active admin roles are `database.ADMIN_ROLES` (excludes `none`).
   Capabilities live in `database.PERMISSION_KEYS` (`can_folders`, `can_content`,
   `can_contributions`, `can_messages`, `can_ai`, `can_admins`,
-  `can_notifications`, `can_settings`, `can_topics`, `can_visibility`).
+  `can_notifications`, `can_settings`, `can_topics`, `can_visibility`,
+  `can_archive`).
 - Migrations are additive: `_migrate_v5` adds `admins.role`/`admins.permissions`;
   `_migrate_v6` creates the isolated `audit_log` table; `_migrate_v7` backfills
   NULL/empty roles to `admin`; `_migrate_v8` adds the nullable
   `description`/`keywords` columns used by intent-aware search on `folders` and
   `content`; `_migrate_v11` heals a database left with more than one `owner` row
-  (keeps the persisted owner, demotes the rest to `admin`). Never rewrite v1..v4.
+  (keeps the persisted owner, demotes the rest to `admin`); `_migrate_v12`
+  creates the isolated `archive_sync` mirror table. Never rewrite v1..v4.
 - Role scope is explicit: `ROLE_PERMISSION_PRESETS` maps each role to a baseline
   capability set (owner = all, admin = all except `can_admins`, reviewer =
   contributions + messages, none = nothing) and `ROLE_DESCRIPTIONS` is the
@@ -242,9 +248,10 @@ Both consume one daily quota unit per call and return
   links — folders/resources are untouched.
 - `notifications.py` broadcasts to `database.get_all_user_ids()`; per-recipient
   failures are non-fatal and every send is recorded via `record_notification`.
-- New permission keys: `can_notifications`, `can_settings`, `can_topics`
-  (added to `PERMISSION_KEYS`/labels). The admin panel shows each surface only
-  when the caller holds it; `show_admin` also appends a Runtime row.
+- New permission keys: `can_notifications`, `can_settings`, `can_topics`,
+  `can_archive` (added to `PERMISSION_KEYS`/labels). The admin panel shows
+  each surface only when the caller holds it; `show_admin` also appends a
+  Runtime row.
 - Ownership transfer: `database.transfer_ownership(current, new)` is atomic and
   guarantees exactly one owner. It persists `SETTING_OWNER_ID`.
   `ensure_configured_admin` respects a transferred owner on a same-ADMIN_ID
@@ -271,9 +278,45 @@ Both consume one daily quota unit per call and return
   legacy empty-perms full, `none` never) and is what admin notifications use,
   so a supervisor without the relevant capability is not pinged.
 
+## Emergency Resource Archive (disaster recovery)
+- `archive.py` is the ONLY archive implementation: it mirrors registered
+  resources into a standalone Telegram channel that keeps them reachable when
+  MEDBOT is down. MEDBOT's registry remains the source of truth; the channel is
+  an access layer, never read back.
+- The channel is configured ONLY through the environment
+  (`MEDBOT_ARCHIVE_CHANNEL`, alias `ARCHIVE_CHANNEL_ID`), accepting a numeric id
+  or `@username`. Nothing is hardcoded and no id is assumed; when unset the
+  feature is inert (`archive.is_configured()` is False). The bot must be a
+  channel administrator; the module posts with normal bot rights only.
+- Flow: `MEDBOT resource created -> archive.publish_resource -> channel`. Hooks:
+  `main._register_admin_upload` (admin upload) and `main.process_approval`
+  (approved contribution) call `archive.publish_resource(bot, content_id,
+  with_header=True)` AFTER `database.add_content`; the call is best-effort and
+  never fails, delays or rolls back the MEDBOT write.
+- `database.get_resource_snapshot`/`get_all_resource_snapshots` supply the
+  resource plus its REAL registered path (the platform breadcrumb). The archive
+  never synthesises a path or section; a post only ever names registered items.
+- Idempotency: `archive_sync` (migration v12) is keyed by
+  `content_fingerprint` = hash(title + file_type + file_id), so a restart, a
+  retry or a resource re-added as a new row can never produce a second post.
+  `database.mark_archive_published` transitions to `published` at most once and
+  a per-fingerprint `asyncio.Lock` serialises concurrent publishes. Row fields:
+  folder_id, content_ids, channel_id, channel_message_id, status, attempts,
+  error, timestamps.
+- Failure policy: a Telegram error records `failed` (+ error, attempts) and is
+  retried later; it never propagates. Deleting/disabling a resource in MEDBOT
+  never deletes its archived copy (the `archive_sync` row survives).
+- Admin surface: `can_archive` (owner/admin presets yes, reviewer no) via
+  `archive.py` (own handlers, callback prefix `archive_*`/`admin_archive`).
+  Actions: resync existing resources (skips already-published, so no
+  duplicates), retry failed rows, and a status view with per-status counts.
+  Handlers register BEFORE the catch-all `callback_router`.
+- Posts include the resource's title + path + type, so a student can find them
+  by hand searching the channel (subject, `عملي`, lecture title, ...).
+
 ## Testing
 - `python -m py_compile` all modules.
-- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update test_medbot_fixes test_visibility test_ai_policy test_ai_modes`
+- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update test_medbot_fixes test_visibility test_ai_policy test_ai_modes test_archive_sync`
 - `test_ai_policy.py` pins the AI behavior policy: intent classification,
   resource-hallucination refusal, and that only the medical path fetches
   PubMed. It never calls a real provider.
@@ -283,6 +326,13 @@ Both consume one daily quota unit per call and return
   the bilingual medical contract, skips the registry for general questions,
   and never exposes platform structure. It replaces only provider functions
   (no business logic mocked).
+- `test_archive_sync.py` pins the Emergency Archive: auto-publish on
+  creation, no duplicate after a restart/retry, publication failure never
+  failing the resource, retry-once, resync of pre-existing resources, real
+  path/order, no invented sections, environment-only channel config,
+  deletion isolation, and `can_archive` gating. It stubs only the Telegram
+  bot (the archive's external boundary); the database and all business
+  logic are real.
 - `test_db_patch.py` needs a real `medbot_v2.sqlite3`; it is skipped locally
   when absent.
 - Tests must exercise real code paths against temporary SQLite; no mocks.
