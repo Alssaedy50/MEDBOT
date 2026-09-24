@@ -57,6 +57,7 @@ import i18n
 import platform_settings
 import topics
 import notifications
+import workflow
 from ai import (
     generate_medical_ai_response,
     generate_medbot_assistant_response,
@@ -280,41 +281,46 @@ def btn(text, callback):
 # ============================================================
 
 
-def home_keyboard():
+def home_keyboard(lang: str = None):
     """Start keyboard for a regular (non-privileged) user.
 
     Shows only the student-facing options; the admin entry point is added by
     `home_for` for admins, so a normal user never sees privileged buttons.
+    Labels are rendered in the caller's language (see `i18n`); the Topics and
+    Resources entries are deliberately distinct: Resources is the full
+    registered hierarchy, Topics is the curated high-level academic index.
     """
+    lang = lang or i18n.DEFAULT_LANGUAGE
     return InlineKeyboardMarkup(
         [
             [
-                btn("📚 MEDBOT Resources", "library:0"),
+                btn(i18n.t("menu_resources", lang), "library:0"),
             ],
             [
-                btn("🤖 MEDBOT Assistant", "assistant"),
-                btn("📤 Student Contributions", "contribute"),
+                btn(i18n.t("menu_assistant", lang), "assistant"),
+                btn(i18n.t("menu_contributions", lang), "contribute"),
             ],
             [
-                btn("📄 مساهماتي", "my_contributions"),
-                btn("📊 My Account", "account"),
+                btn(i18n.t("menu_my_contributions", lang), "my_contributions"),
+                btn(i18n.t("menu_account", lang), "account"),
             ],
             [
-                btn("🧭 المواضيع", "topics"),
-                btn("🌐 اللغة", "language"),
+                btn(i18n.t("menu_topics", lang), "topics"),
+                btn(i18n.t("menu_language", lang), "language"),
             ],
             [
-                btn("📬 تواصل مع المنصة", "contact"),
-                btn("ℹ️ عن المنصة", "about"),
+                btn(i18n.t("menu_contact", lang), "contact"),
+                btn(i18n.t("menu_about", lang), "about"),
             ],
         ]
     )
 
 
-def admin_home_keyboard():
+def admin_home_keyboard(lang: str = None):
     """Start keyboard with the admin entry point appended for admins."""
-    rows = list(home_keyboard().inline_keyboard)
-    rows.append([btn("🛠 Admin Panel", "admin")])
+    lang = lang or i18n.DEFAULT_LANGUAGE
+    rows = list(home_keyboard(lang).inline_keyboard)
+    rows.append([btn(i18n.t("menu_admin", lang), "admin")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -323,6 +329,7 @@ async def home_for(update):
 
     Regular users get the public keyboard; admins additionally get the Admin
     Panel, which itself enumerates only the surfaces they are permitted to use.
+    The keyboard is rendered in the caller's stored language.
     """
     user = getattr(update, "effective_user", None)
     user_id = getattr(user, "id", None)
@@ -334,10 +341,12 @@ async def home_for(update):
         except Exception:
             is_admin = False
 
-    if not is_admin:
-        return home_keyboard()
+    lang = await user_lang(user_id) if user_id is not None else i18n.DEFAULT_LANGUAGE
 
-    return admin_home_keyboard()
+    if not is_admin:
+        return home_keyboard(lang)
+
+    return admin_home_keyboard(lang)
 
 
 async def show_home(update: Update):
@@ -361,9 +370,11 @@ async def show_home(update: Update):
 
     text = (
         f"🩺 *{platform}*\n\n"
-        f"مرحباً بك دكتور {user.first_name}.\n\n"
-        f"{welcome}\n\n"
-        f"📊 *رصيد الذكاء الاصطناعي اليوم:* {remaining}/{DAILY_LIMIT}\n\n"
+        + i18n.t("welcome_greeting", lang, name=user.first_name) + "\n\n"
+        + f"{welcome}\n\n"
+        + i18n.t(
+            "welcome_quota", lang, remaining=remaining, limit=DAILY_LIMIT
+        ) + "\n\n"
         + i18n.t("choose_service", lang)
     )
 
@@ -427,7 +438,8 @@ def content_icon(file_type):
     return "📄"
 
 
-def folder_keyboard(folders, parent_id=0, back_target=None):
+def folder_keyboard(folders, parent_id=0, back_target=None, lang=None):
+    lang = lang or i18n.DEFAULT_LANGUAGE
     rows = []
 
     for folder in folders:
@@ -449,9 +461,9 @@ def folder_keyboard(folders, parent_id=0, back_target=None):
 
     if parent_id != 0:
         target = parent_id if back_target is None else back_target
-        rows.append([btn("⬅️ رجوع", f"library:{target}")])
+        rows.append([btn(i18n.t("back", lang), f"library:{target}")])
 
-    rows.append([btn("🏠 الرئيسية", "home")])
+    rows.append([btn(i18n.t("home", lang), "home")])
 
     return InlineKeyboardMarkup(rows)
 
@@ -468,6 +480,8 @@ async def show_library(query, parent_id=0):
         )
         return
 
+    lang = await user_lang(query.from_user.id)
+
     # The back button must target the real parent of the folder being viewed,
     # not the folder itself.
     back_target = 0
@@ -481,28 +495,28 @@ async def show_library(query, parent_id=0):
 
     if parent_id == 0:
         title = (
-            "📚 *MEDBOT Resources*\n\n"
-            "اختر السنة أو القسم الذي تريد الدخول إليه:"
+            i18n.t("library_title", lang) + "\n\n"
+            + i18n.t("library_pick_year", lang)
         )
     else:
         try:
             breadcrumb = await database.get_breadcrumbs(parent_id)
         except Exception:
-            breadcrumb = "📚 MEDBOT Resources"
+            breadcrumb = i18n.t("library_title", lang)
 
         title = (
-            "📚 *MEDBOT Resources*\n\n"
+            i18n.t("library_title", lang) + "\n\n"
             f"📍 {breadcrumb}\n\n"
-            "اختر القسم:"
+            + i18n.t("library_pick_section", lang)
         )
 
     if not folders:
-        title += "\n\nℹ️ لا توجد أقسام مسجلة في هذا المستوى حالياً."
+        title += "\n\n" + i18n.t("library_empty", lang)
 
     await edit_safe(
         query,
         title,
-        folder_keyboard(folders, parent_id, back_target),
+        folder_keyboard(folders, parent_id, back_target, lang),
     )
 
 
@@ -573,22 +587,24 @@ async def show_folder(query, folder_id):
 
     folder_name = folder[2] if folder else "القسم"
 
+    lang = await user_lang(query.from_user.id)
+
     if not rows:
         body = (
             f"📂 *{str(folder_name)[:80]}*\n\n"
             f"📍 {breadcrumb}\n\n"
-            "ℹ️ لا توجد أقسام أو موارد مسجلة هنا حالياً."
+            + i18n.t("library_area_empty", lang)
         )
     else:
         body = (
             f"📂 *{str(folder_name)[:80]}*\n\n"
             f"📍 {breadcrumb}\n\n"
-            "اختر القسم أو المورد:"
+            + i18n.t("folder_pick", lang)
         )
 
     # Correct parent-aware navigation.
-    rows.append([btn("⬅️ رجوع", f"library:{parent_id or 0}")])
-    rows.append([btn("🏠 الرئيسية", "home")])
+    rows.append([btn(i18n.t("back", lang), f"library:{parent_id or 0}")])
+    rows.append([btn(i18n.t("home", lang), "home")])
 
     await edit_safe(
         query,
@@ -1268,7 +1284,7 @@ async def notify_admins_new_contribution(bot, contribution_id: int, title: str, 
     prevent the contribution from being recorded.
     """
     try:
-        admins = await database.get_all_admins()
+        admins = await database.get_admins_with_permission("can_contributions")
     except Exception:
         logger.exception("Could not load admins for contribution notification")
         return 0
@@ -1707,6 +1723,7 @@ async def start_admin_folder_create(query, context):
     context.user_data["admin_folder_parent"] = 0
     context.user_data.pop("admin_folder_name", None)
     context.user_data.pop("admin_folder_type", None)
+    workflow.begin(context, "admin_folder_create")
 
     await edit_safe(
         query,
@@ -1729,6 +1746,9 @@ async def request_admin_folder_rename(update, context):
         return False
 
     if not context.user_data.get("admin_folder_rename"):
+        return False
+
+    if not workflow.owns(context, "admin_folder_rename"):
         return False
 
     try:
@@ -1848,6 +1868,9 @@ async def request_admin_folder_name(update, context):
     if not context.user_data.get("admin_folder_create"):
         return False
 
+    if not workflow.owns(context, "admin_folder_create"):
+        return False
+
     try:
         is_admin = await database.is_user_admin(update.effective_user.id)
     except Exception:
@@ -1920,6 +1943,7 @@ async def select_admin_folder_parent(query, context, parent_id):
     context.user_data["admin_folder_parent"] = int(parent_id)
     context.user_data.pop("admin_folder_name", None)
     context.user_data.pop("admin_folder_type", None)
+    workflow.begin(context, "admin_folder_create")
 
     await edit_safe(
         query,
@@ -2260,6 +2284,7 @@ async def start_admin_upload(query, context, folder_id):
 
     context.user_data["admin_upload"] = True
     context.user_data["admin_upload_folder"] = int(folder_id)
+    workflow.begin(context, "admin_upload")
 
     await edit_safe(
         query,
@@ -2306,6 +2331,19 @@ def _clear_admin_state(context, keep=None):
         if keep and key in keep:
             continue
         context.user_data.pop(key, None)
+
+    # Release the workflow marker when the cancelled flow was an admin one, so
+    # a text consumer from another module no longer sees a stale owner.
+    if context.user_data.get(workflow.ACTIVE_KEY) in (
+        "admin_upload",
+        "admin_file_rename",
+        "admin_folder_create",
+        "admin_folder_rename",
+        "admin_folder_move",
+        "admin_file_move",
+        "admin_folder_retype",
+    ):
+        context.user_data.pop(workflow.ACTIVE_KEY, None)
 
 
 async def admin_upload_media_handler(update, context):
@@ -2736,6 +2774,7 @@ async def admin_folder_move_menu(query, context):
         return
 
     context.user_data["admin_folder_move"] = True
+    workflow.begin(context, "admin_folder_move")
 
     await _render_move_targets(query, context, folder_id, folder, parent_id=0)
 
@@ -3068,6 +3107,13 @@ async def handle_pending_title_input(update, context):
     rename_waiting = context.user_data.get("admin_file_rename_waiting")
 
     if not custom and not (rename_mode and rename_waiting):
+        return False
+
+    # Only the workflow the user actually armed may consume this text; a
+    # leftover flag from a semi-finished flow would otherwise steal it.
+    if custom and not workflow.owns(context, "admin_upload"):
+        return False
+    if not custom and not workflow.owns(context, "admin_file_rename"):
         return False
 
     try:
@@ -3405,11 +3451,14 @@ async def review_contribution(query, context, contribution_id):
         f"🕒 التاريخ: {created_at}\n"
     )
 
+    lang = await user_lang(query.from_user.id)
+
     await edit_safe(
         query,
         text,
         InlineKeyboardMarkup(
             [
+                [btn(i18n.t("contrib_preview", lang), f"preview:{contribution_id}")],
                 [
                     btn("✅ Approve", f"approve:{contribution_id}"),
                     btn("❌ Reject", f"reject:{contribution_id}"),
@@ -3420,6 +3469,138 @@ async def review_contribution(query, context, contribution_id):
             ]
         ),
     )
+
+
+async def preview_contribution(query, context, contribution_id):
+    """Send the submitted file to the reviewing admin without changing status.
+
+    Read-only: the contribution row is never mutated, so an admin can inspect
+    the exact file a student submitted before deciding. Sending the real media
+    to the admin's own chat also avoids Telegram's `file_id` scope problems
+    (a file_id is only usable by the bot that owns it, but a copy sent to the
+    admin's chat is directly playable).
+    """
+    try:
+        is_admin = await database.is_user_admin(query.from_user.id)
+    except Exception:
+        is_admin = False
+
+    if not is_admin:
+        await edit_safe(
+            query,
+            i18n.t("unauthorized"),
+            InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+        )
+        return
+
+    if not await _require_permission(query, "can_contributions"):
+        return
+
+    try:
+        record = await database.get_contribution(contribution_id)
+    except Exception:
+        logger.exception("Preview: get_contribution failed")
+        record = None
+
+    if not record:
+        await edit_safe(
+            query,
+            i18n.t("contrib_not_found"),
+            InlineKeyboardMarkup(
+                [
+                    [btn("📥 Pending", "admin_pending")],
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
+        )
+        return
+
+    (_cid, user_id, user_name, folder_id, title, file_id, file_type,
+     status, created_at) = record[:9]
+
+    try:
+        breadcrumb = await database.get_breadcrumbs(folder_id)
+    except Exception:
+        breadcrumb = None
+
+    lang = await user_lang(query.from_user.id)
+
+    header = (
+        f"🔍 <b>{i18n.t('contrib_preview', lang)} #{contribution_id}</b>\n\n"
+        f"{i18n.t('contrib_student', lang)}: "
+        f"{escape(str(user_name or '—'))} (<code>{user_id}</code>)\n"
+        f"{i18n.t('contrib_title_label', lang)}: "
+        f"<b>{escape(str(title or '—'))}</b>\n"
+        f"{i18n.t('contrib_type_label', lang)}: "
+        f"<code>{escape(str(file_type or '—'))}</code>\n"
+    )
+    if breadcrumb:
+        header += (
+            f"{i18n.t('contrib_destination', lang)}: "
+            f"{escape(str(breadcrumb))}\n"
+        )
+    header += (
+        f"{i18n.t('contrib_status_label', lang)}: "
+        f"<code>{escape(str(status or '—'))}</code>\n"
+    )
+
+    chat_id = query.message.chat_id
+    back_btn = btn(
+        i18n.t("contrib_back_to_review", lang), f"review:{contribution_id}"
+    )
+
+    if not file_id:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=header + "\n" + i18n.t("contrib_no_file", lang),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[back_btn]]),
+            )
+        except Exception:
+            logger.warning("Preview: could not send preview header")
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=header,
+            parse_mode=ParseMode.HTML,
+        )
+        await _send_registered_media(
+            context, chat_id, file_id, file_type, title or f"#{contribution_id}"
+        )
+        note = await context.bot.send_message(
+            chat_id=chat_id,
+            text=i18n.t("contrib_preview_note", lang),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        btn(
+                            i18n.t("approve_action", lang),
+                            f"approve:{contribution_id}",
+                        ),
+                        btn(
+                            i18n.t("reject_action", lang),
+                            f"reject:{contribution_id}",
+                        ),
+                    ],
+                    [back_btn],
+                    [btn(i18n.t("home", lang), "home")],
+                ]
+            ),
+        )
+        _register_content_message(
+            getattr(query.from_user, "id", None),
+            getattr(note, "message_id", None),
+        )
+    except Exception:
+        logger.exception("Preview delivery failed for #%s", contribution_id)
+        await edit_safe(
+            query,
+            header + "\n" + i18n.t("contrib_preview_failed", lang),
+            InlineKeyboardMarkup([[back_btn]]),
+        )
 
 
 REVIEW_NOTE_MAX_LENGTH = 400
@@ -3463,6 +3644,11 @@ async def process_review_text(update, context):
     pending_id = context.user_data.get("review_note_id")
 
     if not pending_kind or not pending_id:
+        return False
+
+    # Another workflow may have claimed the pending input in the meantime.
+    if not workflow.owns(context, "review_note"):
+        _clear_review_state(context)
         return False
 
     try:
@@ -3608,6 +3794,8 @@ async def _notify_contributor(bot, contributor_id, text):
 def _clear_review_state(context):
     context.user_data.pop("review_note_kind", None)
     context.user_data.pop("review_note_id", None)
+    if context.user_data.get(workflow.ACTIVE_KEY) == "review_note":
+        context.user_data.pop(workflow.ACTIVE_KEY, None)
 
 
 async def request_review_note(query, context, contribution_id, kind):
@@ -3644,6 +3832,7 @@ async def request_review_note(query, context, contribution_id, kind):
         return
 
     if context is not None:
+        workflow.begin(context, "review_note")
         context.user_data["review_note_kind"] = kind
         context.user_data["review_note_id"] = contribution_id
 
@@ -3894,6 +4083,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _clear_review_state(context)
         _clear_contribution_state(context)
         messaging._clear_contact_state(context)
+        workflow.clear_all(context)
         await show_home(update)
         return
 
@@ -4133,6 +4323,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["admin_file_rename"] = True
         context.user_data["admin_file_rename_id"] = content_id
         context.user_data["admin_file_rename_waiting"] = True
+        workflow.begin(context, "admin_file_rename")
 
         await edit_safe(
             query,
@@ -4303,6 +4494,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data["admin_file_move"] = True
         context.user_data["admin_file_move_id"] = content_id
+        workflow.begin(context, "admin_file_move")
         await admin_file_move_menu(query, context)
         return
 
@@ -4394,6 +4586,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data["admin_folder_move"] = True
         context.user_data["admin_folder_move_id"] = folder_id
+        workflow.begin(context, "admin_folder_move")
         await _render_move_targets(query, context, folder_id, folder, parent_id)
         return
 
@@ -4472,6 +4665,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         context.user_data["admin_folder_retype_id"] = folder_id
+        workflow.begin(context, "admin_folder_retype")
 
         await edit_safe(
             query,
@@ -4611,6 +4805,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data["admin_folder_rename"] = True
         context.user_data["admin_folder_rename_id"] = folder_id
+        workflow.begin(context, "admin_folder_rename")
 
         await edit_safe(
             query,
@@ -4767,6 +4962,18 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await review_contribution(query, context, contribution_id)
         except Exception:
             pass
+        return
+
+    if data.startswith("preview:"):
+        try:
+            contribution_id = int(data.split(":", 1)[1])
+            await preview_contribution(query, context, contribution_id)
+        except (TypeError, ValueError):
+            await edit_safe(
+                query,
+                i18n.t("invalid_id"),
+                InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+            )
         return
 
     if data.startswith("approve:"):

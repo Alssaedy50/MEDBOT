@@ -65,6 +65,14 @@ _TRANSLATIONS = {
               "Choose a service:",
     },
     "choose_service": {"ar": "اختر الخدمة التي تريد استخدامها:", "en": "Choose a service:"},
+    "welcome_greeting": {
+        "ar": "مرحباً بك دكتور {name}.",
+        "en": "Welcome, Dr. {name}.",
+    },
+    "welcome_quota": {
+        "ar": "📊 *رصيد الذكاء الاصطناعي اليوم:* {remaining}/{limit}",
+        "en": "📊 *Daily AI balance:* {remaining}/{limit}",
+    },
 
     # ---- Account / language -------------------------------------------
     "account_title": {"ar": "📊 *حسابي*", "en": "📊 *My Account*"},
@@ -95,10 +103,71 @@ _TRANSLATIONS = {
         "ar": "ℹ️ لا توجد أقسام مرتبطة بهذا الموضوع بعد.",
         "en": "ℹ️ No sections linked to this topic yet.",
     },
+    "topic_choose_section": {
+        "ar": "اختر القسم الذي تريد فتحه:",
+        "en": "Choose a section to open:",
+    },
+    "topic_unavailable": {
+        "ar": "⚠️ الموضوع غير متاح.",
+        "en": "⚠️ This topic is unavailable.",
+    },
+    "topics_open_resources": {
+        "ar": "🔎 فتح المصادر",
+        "en": "🔎 Open resources",
+    },
     "search_empty": {
         "ar": "المورد المطلوب غير مسجل حالياً في MEDBOT.",
         "en": "The requested resource is not currently registered in MEDBOT.",
     },
+    "library_title": {"ar": "📚 *موارد المنصة*", "en": "📚 *Resources*"},
+    "library_pick_year": {
+        "ar": "اختر السنة أو القسم الذي تريد الدخول إليه:",
+        "en": "Choose the year or section to open:",
+    },
+    "library_pick_section": {"ar": "اختر القسم:", "en": "Choose a section:"},
+    "library_empty": {
+        "ar": "ℹ️ لا توجد أقسام مسجلة في هذا المستوى حالياً.",
+        "en": "ℹ️ No sections registered at this level yet.",
+    },
+    "library_area_empty": {
+        "ar": "ℹ️ لا توجد أقسام أو موارد مسجلة هنا حالياً.",
+        "en": "ℹ️ No sections or resources registered here yet.",
+    },
+    "folder_pick": {
+        "ar": "اختر القسم أو المورد:",
+        "en": "Choose a section or resource:",
+    },
+    "invalid_id": {"ar": "⚠️ معرف غير صالح.", "en": "⚠️ Invalid identifier."},
+
+    "contrib_preview": {
+        "ar": "🔍 معاينة المساهمة",
+        "en": "🔍 Preview contribution",
+    },
+    "contrib_not_found": {
+        "ar": "المساهمة غير موجودة أو تمت معالجتها بالفعل.",
+        "en": "The contribution does not exist or has already been processed.",
+    },
+    "contrib_student": {"ar": "👤 الطالب", "en": "👤 Student"},
+    "contrib_title_label": {"ar": "📄 العنوان", "en": "📄 Title"},
+    "contrib_type_label": {"ar": "📎 النوع", "en": "📎 Type"},
+    "contrib_destination": {"ar": "🧭 الوجهة", "en": "🧭 Destination"},
+    "contrib_status_label": {"ar": "🏷 الحالة", "en": "🏷 Status"},
+    "contrib_no_file": {
+        "ar": "⚠️ لا يوجد ملف مرفق بهذه المساهمة.",
+        "en": "⚠️ No file is attached to this contribution.",
+    },
+    "contrib_preview_note": {
+        "ar": "⬆️ هذه هي المساهمة كما وصلت. لم تتغيّر حالتها.",
+        "en": "⬆️ This is the submission as received. Its status is unchanged.",
+    },
+    "contrib_preview_failed": {
+        "ar": "⚠️ تعذر إرسال الملف من Telegram حالياً.",
+        "en": "⚠️ The file could not be sent through Telegram right now.",
+    },
+    "contrib_back_to_review": {"ar": "⬅️ المساهمة", "en": "⬅️ Contribution"},
+    "pending_short": {"ar": "📥 المعلقة", "en": "📥 Pending"},
+    "approve_action": {"ar": "✅ قبول", "en": "✅ Approve"},
+    "reject_action": {"ar": "❌ رفض", "en": "❌ Reject"},
 
     # ---- Administration ----------------------------------------------
     "admin_panel_title": {"ar": "🛠 *إدارة المنصة*", "en": "🛠 *Administration*"},

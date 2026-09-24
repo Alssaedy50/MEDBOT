@@ -26,6 +26,7 @@ from telegram.ext import (
 
 import database
 import audit
+import workflow
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,11 @@ def _contact_keyboard():
 def _clear_contact_state(context):
     context.user_data.pop("contact_category", None)
     context.user_data.pop("contact_reply_id", None)
+    if context.user_data.get(workflow.ACTIVE_KEY) in (
+        "contact_message",
+        "admin_reply",
+    ):
+        context.user_data.pop(workflow.ACTIVE_KEY, None)
 
 
 async def _edit(query, text, markup=None):
@@ -126,6 +132,7 @@ async def select_category(query, context, category):
         return
 
     context.user_data["contact_category"] = category
+    workflow.begin(context, "contact_message")
     label = database.MESSAGE_CATEGORY_LABELS.get(category, category)
 
     await _edit(
@@ -143,9 +150,14 @@ async def select_category(query, context, category):
 
 
 async def notify_admins_new_message(bot, message_id, category, body, sender):
-    """Notify every admin. Per-recipient failures are non-fatal."""
+    """Notify only the admins who can act on the message (RBAC: can_messages).
+
+    Routing to every active admin would ping a supervisor who has no reply
+    access; the reply surfaces are gated by `can_messages`, so the sender must
+    match. Per-recipient failures are non-fatal.
+    """
     try:
-        admins = await database.get_all_admins()
+        admins = await database.get_admins_with_permission("can_messages")
     except Exception:
         logger.exception("messaging: could not load admins")
         return 0
@@ -195,6 +207,9 @@ async def handle_contact_text(update, context):
         _clear_contact_state(context)
         await _reply(update, "❌ تم إلغاء إرسال الرسالة.", HOME_KEYBOARD)
         return True
+
+    if not workflow.owns(context, "contact_message"):
+        return False
 
     try:
         message_id = await database.create_message(
@@ -462,6 +477,7 @@ async def request_admin_reply(query, context, message_id):
         )
         return
 
+    workflow.begin(context, "admin_reply")
     context.user_data["contact_reply_id"] = int(message_id)
 
     await _edit(
@@ -488,7 +504,10 @@ async def handle_admin_reply_text(update, context):
     if not update.message or not update.message.text:
         return False
 
-    if not await _is_admin(update.effective_user.id):
+    if not workflow.owns(context, "admin_reply"):
+        return False
+
+    if not await _can_messages(update.effective_user.id):
         _clear_contact_state(context)
         await _reply(update, "🔒 غير مصرح.", HOME_KEYBOARD)
         return True

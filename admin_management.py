@@ -23,6 +23,7 @@ from telegram.ext import (
 
 import audit
 import database
+import workflow
 
 logger = logging.getLogger(__name__)
 
@@ -377,6 +378,7 @@ async def start_add_admin(query, context):
         await _edit(query, "🔒 غير مصرح.", _home_keyboard())
         return
 
+    workflow.begin(context, "admin_add")
     context.user_data["admin_mgmt_waiting_add"] = True
 
     await _edit(
@@ -394,6 +396,9 @@ async def handle_add_admin_text(update, context):
         return False
 
     if not update.message or not update.message.text:
+        return False
+
+    if not workflow.owns(context, "admin_add"):
         return False
 
     context.user_data.pop("admin_mgmt_waiting_add", None)

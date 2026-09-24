@@ -26,6 +26,7 @@ from telegram.ext import (
 import audit
 import database
 import i18n
+import workflow
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +77,16 @@ async def _edit(query, text, markup=None):
 # ---------------------------------------------------------------
 
 
-async def _topics_menu(prefix="topic_open") -> InlineKeyboardMarkup:
-    rows = [[btn("🔎 فتح الموارد", "library:0")]]
+async def _lang(user_id) -> str:
+    try:
+        return await database.get_user_language(user_id)
+    except Exception:
+        return i18n.DEFAULT_LANGUAGE
+
+
+async def _topics_menu(prefix="topic_open", lang=None) -> InlineKeyboardMarkup:
+    lang = lang or i18n.DEFAULT_LANGUAGE
+    rows = [[btn(i18n.t("topics_open_resources", lang), "library:0")]]
     for topic in await database.get_topics(active_only=True):
         try:
             count = await database.topic_resource_count(topic["id"])
@@ -90,30 +99,42 @@ async def _topics_menu(prefix="topic_open") -> InlineKeyboardMarkup:
                 f"{prefix}:{topic['id']}",
             )]
         )
-    rows.append([btn("🏠 الرئيسية", "home")])
+    rows.append([btn(i18n.t("home", lang), "home")])
     return InlineKeyboardMarkup(rows)
 
 
 async def show_topics(query):
-    """Public topic list for quick access to registered resources."""
+    """Public topic list for quick access to registered resources.
+
+    Deliberately distinct from the Resources/library browser: a topic is a
+    curated high-level academic index, while the library shows the full
+    registered hierarchy. The first row links to the library so both remain
+    reachable from one screen.
+    """
     try:
         topics = await database.get_topics(active_only=True)
     except Exception:
         logger.exception("topics: list failed")
         topics = []
 
-    markup = await _topics_menu()
+    lang = await _lang(query.from_user.id)
+    markup = await _topics_menu(lang=lang)
 
     if not topics:
-        await _edit(query, "🧭 <b>مواضيع البحث</b>\n\n" + esc(i18n.t("topics_empty")), markup)
+        await _edit(
+            query,
+            i18n.t("topics_title", lang) + "\n\n" + i18n.t("topics_empty", lang),
+            markup,
+        )
         return
 
-    await _edit(query, "🧭 <b>مواضيع البحث</b>\n\n"
-                       "اختر موضوعاً للوصول السريع إلى الموارد المسجلة:", markup)
+    await _edit(query, i18n.t("topics_title", lang), markup)
 
 
 async def open_topic(query, topic_id):
     """Show the sections linked to a topic, then normal folder navigation."""
+    lang = await _lang(query.from_user.id)
+
     try:
         topic = await database.get_topic(topic_id)
     except Exception:
@@ -122,8 +143,13 @@ async def open_topic(query, topic_id):
     if not topic or not topic["active"]:
         await _edit(
             query,
-            "⚠️ الموضوع غير متاح.",
-            InlineKeyboardMarkup([[btn("🧭 المواضيع", "topics")], [btn("🏠 الرئيسية", "home")]]),
+            i18n.t("topic_unavailable", lang),
+            InlineKeyboardMarkup(
+                [
+                    [btn(i18n.t("menu_topics", lang), "topics")],
+                    [btn(i18n.t("home", lang), "home")],
+                ]
+            ),
         )
         return
 
@@ -143,15 +169,15 @@ async def open_topic(query, topic_id):
         )
 
     if not rows:
-        rows.append([btn("ℹ️ لا توجد أقسام", "noop")])
+        rows.append([btn(i18n.t("topic_no_sections", lang), "noop")])
 
-    rows.append([btn("🧭 المواضيع", "topics")])
-    rows.append([btn("🏠 الرئيسية", "home")])
+    rows.append([btn(i18n.t("menu_topics", lang), "topics")])
+    rows.append([btn(i18n.t("home", lang), "home")])
 
     body = (
         f"🧭 <b>{esc(topic['name'])}</b>\n\n"
         + (esc(topic["description"]) + "\n\n" if topic.get("description") else "")
-        + "اختر القسم الذي تريد فتحه:"
+        + i18n.t("topic_choose_section", lang)
     )
 
     await _edit(query, body, InlineKeyboardMarkup(rows))
@@ -264,6 +290,7 @@ async def start_create_topic(query, context):
         await _edit(query, "🔒 غير مصرح.", _home_keyboard())
         return
 
+    workflow.begin(context, "topics_create")
     context.user_data["topics_create"] = True
 
     await _edit(
@@ -286,6 +313,13 @@ async def handle_topics_text(update, context) -> bool:
         return False
 
     if not update.message or not update.message.text:
+        return False
+
+    # Another workflow may have claimed this input; only the active flow may
+    # consume it (see workflow.py).
+    if creating and not workflow.owns(context, "topics_create"):
+        return False
+    if linking and not workflow.owns(context, "topics_link"):
         return False
 
     if not await _is_manager(update.effective_user.id):
@@ -383,6 +417,7 @@ async def handle_topics_text(update, context) -> bool:
 
 async def _link_picker(query, context, topic_id):
     """Offer the current folder tree so the admin can pick a folder to link."""
+    workflow.begin(context, "topics_link")
     context.user_data["topics_link_id"] = topic_id
     context.user_data.pop("topics_create", None)
     await _link_picker_level(query, context, topic_id, 0)
