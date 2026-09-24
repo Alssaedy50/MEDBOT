@@ -14,7 +14,10 @@ search, student contributions, admin panel, MEDBOT-grounded AI assistant).
 - Do not kill unrelated processes. Stop only MEDBOT before schema changes.
 
 ## Environment
-- Runs on Termux with a `venv`. `run_bot.sh` is the watchdog launcher.
+- Runs on Termux with a `venv`. `run_bot.sh` is the watchdog launcher; it
+  resolves its own directory and, before starting, runs a best-effort
+  `git pull --ff-only origin main` (only when the tracked tree is clean) so a
+  reboot runs the latest merged code. `start_daemon.sh` does the same.
 - The operator holds the real credentials/database on Termux; CI here has no
   keys and no database. Tests use temporary SQLite files.
 - Config env vars: `BOT_TOKEN`, `ADMIN_ID`, `GEMINI_API_KEY`, `GROQ_API_KEY`,
