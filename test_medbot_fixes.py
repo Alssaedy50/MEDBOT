@@ -389,5 +389,111 @@ class FullLocalizationTests(FixBase):
         self.assertEqual(await database.get_user_language(self.student_id), "en")
 
 
+# ---------------------------------------------------------------
+# 6. Callback delivery + visible failures
+# ---------------------------------------------------------------
+
+
+class CallbackDeliveryTests(FixBase):
+    """Regression coverage for the deployed 'inline buttons do nothing' bug.
+
+    The production symptom was: /start renders, but every button press is a
+    no-op. Telegram keeps the last `allowed_updates` it was sent and reuses it
+    when the parameter is omitted, so a stale restricted filter silently
+    dropped `callback_query` updates while `message` updates kept flowing.
+    """
+
+    async def test_polling_requests_callback_updates(self):
+        allowed = main.polling_allowed_updates()
+        # `callback_query` must be part of the explicit subscription.
+        self.assertIn("callback_query", allowed)
+        # Every update type PTB knows about must be requested, so no other
+        # stale filter can hide a future surface.
+        from telegram import Update
+
+        self.assertEqual(set(allowed), set(Update.ALL_TYPES))
+
+    async def test_unmapped_callback_is_surfaced_not_silent(self):
+        query = _FakeQuery(self.student_id, "totally_unknown_namespace:9")
+        await main.callback_router(_FakeUpdate(query), _FakeContext())
+        self.assertTrue(query.answered)
+        # The user gets an explicit, visible response rather than a dead tap.
+        self.assertIn("غير مدعوم", query.last_text or "")
+        callbacks = [
+            b.callback_data
+            for row in query.last_markup.inline_keyboard
+            for b in row
+        ]
+        self.assertIn("home", callbacks)
+
+    async def test_edit_safe_falls_back_when_edit_fails(self):
+        class _OldMessage:
+            message_id = 4242
+            chat_id = 1
+
+            def __init__(self):
+                self.replies = []
+
+            async def reply_text(self, text, **kwargs):
+                self.replies.append(text)
+
+        class _OldQuery:
+            def __init__(self):
+                self.message = _OldMessage()
+
+            async def edit_message_text(self, text, **kwargs):
+                raise RuntimeError("Message is too old to be edited")
+
+        query = _OldQuery()
+        await main.edit_safe(query, "hello", None)
+        # The tap must produce a NEW visible message instead of a dead screen.
+        self.assertEqual(query.message.replies, ["hello"])
+
+    async def test_edit_safe_not_modified_is_noop(self):
+        class _SameMessage:
+            message_id = 4243
+            chat_id = 1
+
+            def __init__(self):
+                self.replies = []
+
+            async def reply_text(self, text, **kwargs):
+                self.replies.append(text)
+
+        class _SameQuery:
+            def __init__(self):
+                self.message = _SameMessage()
+
+            async def edit_message_text(self, text, **kwargs):
+                raise RuntimeError("Message is not modified")
+
+        query = _SameQuery()
+        await main.edit_safe(query, "hello", None)
+        # Re-tapping an identical button must not spam a duplicate message.
+        self.assertEqual(query.message.replies, [])
+
+    async def test_error_handler_answers_callback_with_alert(self):
+        class _ErrQuery:
+            def __init__(self):
+                self.calls = []
+
+            async def answer(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        class _ErrUpdate:
+            callback_query = None
+
+        class _Ctx:
+            error = RuntimeError("boom")
+            bot = _RecordingBot()
+
+        query = _ErrQuery()
+        update = _ErrUpdate()
+        update.callback_query = query
+        await main.error_handler(update, _Ctx())
+        self.assertTrue(query.calls)
+        self.assertTrue(query.calls[0][1].get("show_alert"))
+
+
 if __name__ == "__main__":
     unittest.main()

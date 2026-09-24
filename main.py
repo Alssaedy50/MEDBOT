@@ -71,6 +71,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DAILY_LIMIT = 20
 
 
+def polling_allowed_updates():
+    """Update types MEDBOT subscribes to on every long-poll.
+
+    Telegram remembers the last `allowed_updates` it was given and reuses it
+    when the parameter is omitted ("If not specified, the previous setting
+    will be used"). A restricted set persisted by an earlier run or webhook
+    therefore keeps filtering out `callback_query` forever. Returning the full
+    set here is what makes `/start` messages and inline-button presses arrive
+    together.
+    """
+    return Update.ALL_TYPES
+
+
 def configured_admin_id() -> int:
     """Return the configured owner/admin Telegram ID, or 0 if unset.
 
@@ -255,10 +268,10 @@ async def edit_safe(query, text, reply_markup=None, parse_mode=ParseMode.MARKDOW
             await message.reply_text(
                 text, parse_mode=None, reply_markup=reply_markup
             )
-            return
         except Exception as exc:
             logger.warning("Failed to send navigation message: %s", exc)
-            return
+        # Delivered content is never edited in place, whatever happens above.
+        return
 
     for mode in (parse_mode, None):
         try:
@@ -269,7 +282,22 @@ async def edit_safe(query, text, reply_markup=None, parse_mode=ParseMode.MARKDOW
             )
             return
         except Exception as exc:
+            # Re-tapping the same button is not a failure: Telegram rejects an
+            # edit that would not change the message. Treat it as handled.
+            if "not modified" in str(exc).lower():
+                return
             logger.warning("Failed to edit callback message: %s", exc)
+
+    # Editing failed for a real reason (e.g. the message is too old to edit).
+    # Fall back to a brand-new message so the tap is never a silent no-op.
+    if message is not None:
+        try:
+            await message.reply_text(
+                text, parse_mode=None, reply_markup=reply_markup
+            )
+            return
+        except Exception as exc:
+            logger.warning("Failed to send fallback message: %s", exc)
 
 
 def btn(text, callback):
@@ -4072,7 +4100,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.answer()
     except Exception:
-        pass
+        logger.warning("Failed to answer callback query", exc_info=True)
 
     data = query.data or ""
 
@@ -4981,7 +5009,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             contribution_id = int(data.split(":", 1)[1])
             await process_approval(query, contribution_id, True)
         except Exception:
-            pass
+            logger.exception("approve callback failed: %s", data)
         return
 
     if data.startswith("reject:"):
@@ -4989,7 +5017,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             contribution_id = int(data.split(":", 1)[1])
             await request_review_note(query, context, contribution_id, "reject")
         except Exception:
-            pass
+            logger.exception("reject callback failed: %s", data)
         return
 
     if data.startswith("revise:"):
@@ -4997,7 +5025,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             contribution_id = int(data.split(":", 1)[1])
             await request_review_note(query, context, contribution_id, "revise")
         except Exception:
-            pass
+            logger.exception("revise callback failed: %s", data)
         return
 
     if data == "admin_ai":
@@ -5007,6 +5035,15 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "admin_runtime":
         await show_runtime(query)
         return
+
+    # No handler claimed this callback. Surface it instead of ending in
+    # silence, so an unmapped button is visible to the user and in the logs.
+    logger.warning("Unhandled callback_data: %r", data)
+    await edit_safe(
+        query,
+        "⚠️ هذا الزر غير مدعوم حالياً.",
+        InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+    )
 
 
 # ============================================================
@@ -5355,7 +5392,28 @@ async def media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.warning("MEDBOT network/runtime warning: %s", context.error)
+    """Surface every handler failure in the Runtime Logs.
+
+    Logged with a traceback (not just the message) so a swallowed callback
+    exception is diagnosable from the deployment logs. For callback updates it
+    also tells the user something went wrong instead of leaving the tap
+    silently unanswered.
+    """
+    logger.error(
+        "MEDBOT handler error while processing %s",
+        type(update).__name__,
+        exc_info=context.error,
+    )
+
+    query = getattr(update, "callback_query", None)
+    if query is not None:
+        try:
+            await query.answer(
+                "⚠️ حدث خطأ غير متوقع. حاول مرة أخرى.",
+                show_alert=True,
+            )
+        except Exception:
+            logger.warning("Failed to answer callback after error", exc_info=True)
 
 
 async def post_init(application: Application):
@@ -5467,7 +5525,16 @@ def main():
     print("TELEGRAM_POLLING=STARTING")
     print("============================================================")
 
-    app.run_polling(drop_pending_updates=True)
+    # Explicitly request every update type. Telegram persists the last
+    # `allowed_updates` it was given ("If not specified, the previous setting
+    # will be used"), so a stale restricted filter from an earlier run or
+    # webhook silently drops `callback_query` updates: /start works, but
+    # button presses never reach the bot. Naming the full set on every boot
+    # makes that stuck state impossible.
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=polling_allowed_updates(),
+    )
 
 
 if __name__ == "__main__":
