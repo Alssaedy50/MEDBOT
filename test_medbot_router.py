@@ -310,9 +310,11 @@ class _TextMessage:
     def __init__(self, text):
         self.text = text
         self.replies = []
+        self.last_markup = None
 
     async def reply_text(self, text, parse_mode=None, reply_markup=None):
         self.replies.append(text)
+        self.last_markup = reply_markup
 
 
 class _MediaUpdate:

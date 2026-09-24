@@ -106,11 +106,14 @@ UNIFIED_ASSISTANT_PROMPT = """أنت مساعد منصة MEDBOT، وهي منص�
 2. إن لم يوجد المورد المطلوب في بيانات المنصة، قل بوضوح إنه غير مسجّل حالياً
    داخل MEDBOT، ثم أجب عن الجزء المعرفي من السؤال إن وُجد.
 3. اجعل الإجابة قصيرة منظّمة: أهم النقاط فقط، دون حشو.
-4. لا تخترع معلومة أو مرجعاً أو PMID؛ استخدم المصادر المزوّدة فقط.
-5. إذا لم تكن متأكداً من معلومة، قل إنك غير متأكد بدلاً من التخمين.
+4. اعتمد في الأسئلة الطبية على المصادر الموثوقة المزوّدة (NCBI PubMed) وأعطِ
+   نتيجة واضحة ومؤكدة مبنية عليها؛ لا تخترع معلومة أو مرجعاً أو PMID، ولا
+   تنسب معلومة إلى مصدر لم يُزوَّد لك.
+5. إذا لم تكن متأكدة من معلومة، قل إنك غير متأكد بدلاً من التخمين.
 6. اجعل الإجابة تعليمية، ولا تقدّم تشخيصاً شخصياً أو وصفة علاجية شخصية.
 7. لا تكرّر قائمة المنصة كاملة داخل الإجابة؛ اذكر فقط ما يخص سؤال الطالب.
-8. اذكر المراجع (PMID) فقط إن وُجدت فعلاً في المصادر المزوّدة.
+8. إن سأل الطالب سؤالاً جانبياً غير طبي، أجب عنه مباشرة وباختصار دون اعتذار.
+9. اذكر المراجع (PMID) فقط إن وُجدت فعلاً في المصادر المزوّدة.
 """
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -1241,6 +1244,108 @@ def build_library_context(results: list) -> str:
     return "\n".join(_result_line(item) for item in results)
 
 
+# Max number of direct-access buttons offered under one answer.
+MAX_RESULT_ACTIONS = 5
+
+
+def _action_label(item: dict) -> str:
+    """Row label that disambiguates same-named matches by their real id."""
+    result_type = item.get("result_type")
+    title = item.get("title") or item.get("name") or "بدون عنوان"
+    item_id = item.get("id")
+    if result_type in ("FOLDER", "EMPTY_FOLDER"):
+        return f"📂 {title} (#{item_id})"
+    return f"📄 {title} (#{item_id})"
+
+
+def build_result_actions(results: list) -> list:
+    """Build direct-access buttons for the matched folders/resources.
+
+    Each action opens the exact registered item (``folder:<id>`` /
+    ``file:<id>``) so the student reaches it in one tap instead of walking the
+    whole tree. Ids come straight from the deterministic search, so a button
+    can never point at something that is not registered.
+    """
+    actions = []
+    seen = set()
+
+    for item in results or []:
+        item_id = item.get("id")
+        result_type = item.get("result_type")
+
+        if item_id is None:
+            continue
+
+        if result_type in ("FOLDER", "EMPTY_FOLDER"):
+            callback = f"folder:{item_id}"
+        elif result_type == "CONTENT":
+            callback = f"file:{item_id}"
+        else:
+            continue
+
+        if callback in seen:
+            continue
+        seen.add(callback)
+
+        actions.append({"label": _action_label(item), "callback": callback})
+
+        if len(actions) >= MAX_RESULT_ACTIONS:
+            break
+
+    return actions
+
+
+def _escape_md_link_text(value: str) -> str:
+    return (value or "").replace("[", "(").replace("]", ")").strip()
+
+
+def build_sources_footer(sources: list) -> str:
+    """Render a compact 'trusted sources' footer with verifiable links.
+
+    Only real PubMed records (with a PMID and a URL) are rendered, so the
+    footer is the model's factual anchor and never an invented citation.
+    """
+    usable = [
+        source
+        for source in (sources or [])
+        if source.get("url") and source.get("pmid")
+    ]
+
+    if not usable:
+        return ""
+
+    lines = ["", "—", "🔬 *مصادر موثوقة (NCBI PubMed):*"]
+
+    for source in usable[:3]:
+        title = _escape_md_link_text(source.get("title") or "PubMed record")
+        if len(title) > 90:
+            title = title[:90].rstrip() + "…"
+        lines.append(
+            f"• [{title}]({source['url']}) · PMID: {source['pmid']}"
+        )
+
+    return "\n".join(lines)
+
+
+def _ensure_sources_footer(answer: str, footer: str) -> str:
+    """Append the sources footer unless the model already listed the sources.
+
+    Keeps the answer verifiable without duplicating a citation block the model
+    produced itself.
+    """
+    answer = (answer or "").rstrip()
+
+    if not footer:
+        return answer
+
+    lowered = answer.lower()
+
+    if "pubmed" in lowered or "pmid" in lowered:
+        return answer
+
+    return f"{answer}{footer}"
+
+
 def build_platform_catalog(folders, contents, paths) -> str:
     """Render the full registered MEDBOT tree into a compact text catalog.
 
@@ -1438,37 +1543,41 @@ async def _platform_catalog_text() -> str:
     return build_platform_catalog(folders, contents, paths)
 
 
-async def generate_medbot_unified_response(
+async def generate_medbot_unified_result(
     prompt: str,
     user_id: int = None,
-) -> str:
+) -> dict:
     """The single MEDBOT assistant: answers questions AND navigates the platform.
 
     Pipeline:
         prompt
         -> full registered platform catalog (read/compare the whole library)
         -> deterministic SQLite search for the request
-        -> verified PubMed sources
-        -> AI provider (failover)
-        -> grounded answer
+        -> trusted global sources (NCBI PubMed) + AI provider (failover), concurrently
+        -> grounded answer + direct-access buttons for the matched items
 
-    The model is allowed to read and compare the entire registered catalog, so
-    it can point at the exact location of a resource, but it may only mention
-    items present in that catalog — nothing is invented.
+    Returns ``{"text": str, "actions": [{"label", "callback"}, ...]}``. The
+    actions are built only from real registered ids, so a tap opens the exact
+    resource/section without the student walking the tree.
+
+    The model may read and compare the entire registered catalog, so it can
+    point at the exact location of a resource, but it may only mention items
+    present in that catalog — nothing is invented.
     """
     prompt = (prompt or "").strip()
 
     if not prompt:
-        return "⚠️ يرجى كتابة سؤال واضح."
+        return {"text": "⚠️ يرجى كتابة سؤال واضح.", "actions": []}
 
-    # These three are independent, so they run concurrently: the answer waits
-    # for the slowest instead of the sum of all three. The candidate pool
-    # (discovery + probes) and the platform catalog were the main serial
+    # All four are independent, so they run concurrently: the answer waits for
+    # the slowest instead of the sum. The candidate pool (discovery + probes),
+    # the platform catalog and the PubMed round-trip were the main serial
     # latency contributors on a cold cache.
-    catalog, results, candidates = await asyncio.gather(
+    catalog, results, candidates, sources = await asyncio.gather(
         _platform_catalog_text(),
         _search_medbot(prompt),
         _get_candidates(),
+        _fetch_pubmed_sources(prompt),
         return_exceptions=True,
     )
 
@@ -1481,23 +1590,34 @@ async def generate_medbot_unified_response(
     if isinstance(candidates, BaseException):
         logger.warning("Candidate pool failed: %s", candidates)
         candidates = []
+    if isinstance(sources, BaseException):
+        logger.warning("PubMed retrieval failed: %s", sources)
+        sources = []
 
     library_context = build_library_context(results)
+    actions = build_result_actions(results)
+    sources_footer = build_sources_footer(sources)
 
     # No provider: fall back to the deterministic, grounded library results.
     if not candidates:
         if results:
-            return (
-                "📚 *نتائج البحث داخل MEDBOT*\n\n"
-                f"{library_context}\n\n"
-                "⚠️ خدمة الذكاء الاصطناعي غير متاحة حالياً."
-            )
-        return (
-            "⚠️ لا توجد خدمة ذكاء اصطناعي متاحة حالياً، ولم أجد مورداً "
-            "مطابقاً في MEDBOT."
-        )
-
-    sources = await _fetch_pubmed_sources(prompt)
+            return {
+                "text": (
+                    "📚 *نتائج البحث داخل MEDBOT*\n\n"
+                    f"{library_context}\n\n"
+                    "⚠️ خدمة الذكاء الاصطناعي غير متاحة حالياً."
+                    f"{sources_footer}"
+                ),
+                "actions": actions,
+            }
+        return {
+            "text": (
+                "⚠️ لا توجد خدمة ذكاء اصطناعي متاحة حالياً، ولم أجد مورداً "
+                "مطابقاً في MEDBOT."
+                f"{sources_footer}"
+            ),
+            "actions": actions,
+        }
 
     source_context = build_source_context(sources) if sources else "لا توجد مصادر خارجية."
 
@@ -1559,7 +1679,10 @@ async def generate_medbot_unified_response(
                     latency_ms,
                 )
 
-                return answer
+                return {
+                    "text": _ensure_sources_footer(answer, sources_footer),
+                    "actions": actions,
+                }
 
             except Exception as exc:
                 logger.warning(
@@ -1587,17 +1710,39 @@ async def generate_medbot_unified_response(
     # Every provider failed: return grounded deterministic results when we have
     # them, otherwise tell the student the service is down.
     if results:
-        return (
-            "📚 *نتائج البحث داخل MEDBOT*\n\n"
-            f"{library_context}\n\n"
-            "⚠️ تعذر الوصول إلى خدمة الذكاء الاصطناعي؛ النتائج أعلاه مأخوذة "
-            "مباشرة من قاعدة بيانات MEDBOT."
-        )
+        return {
+            "text": (
+                "📚 *نتائج البحث داخل MEDBOT*\n\n"
+                f"{library_context}\n\n"
+                "⚠️ تعذر الوصول إلى خدمة الذكاء الاصطناعي؛ النتائج أعلاه مأخوذة "
+                "مباشرة من قاعدة بيانات MEDBOT."
+                f"{sources_footer}"
+            ),
+            "actions": actions,
+        }
 
-    return (
-        "⚠️ تعذر الوصول إلى خدمة الذكاء الاصطناعي حالياً.\n"
-        "يرجى المحاولة بعد قليل."
-    )
+    return {
+        "text": (
+            "⚠️ تعذر الوصول إلى خدمة الذكاء الاصطناعي حالياً.\n"
+            "يرجى المحاولة بعد قليل."
+            f"{sources_footer}"
+        ),
+        "actions": actions,
+    }
+
+
+async def generate_medbot_unified_response(
+    prompt: str,
+    user_id: int = None,
+) -> str:
+    """Backward-compatible text-only wrapper around the unified assistant.
+
+    Callers that only need the answer text (CLI checks, older code) use this;
+    the Telegram layer uses ``generate_medbot_unified_result`` to also get the
+    direct-access action buttons.
+    """
+    result = await generate_medbot_unified_result(prompt, user_id=user_id)
+    return result.get("text", "")
 
 
 async def generate_medical_ai_response(prompt: str, user_id: int = None) -> str:

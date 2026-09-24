@@ -30,6 +30,7 @@ _medbot_socket.getaddrinfo = _medbot_ipv4_getaddrinfo
 import os
 import asyncio
 import logging
+from datetime import datetime, timedelta
 from html import escape
 from dotenv import load_dotenv
 
@@ -59,13 +60,53 @@ import topics
 import notifications
 import visibility
 import workflow
-from ai import generate_medbot_unified_response, warm_ai_pool
+from ai import (
+    generate_medbot_unified_result,
+    generate_medbot_unified_response,
+    warm_ai_pool,
+)
 from search_engine import search_library_summary
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DAILY_LIMIT = 20
+DAILY_LIMIT = 25
+
+# The assistant answers general and medical questions. In CI there are no keys,
+# so the deterministic grounded path is what the tests exercise.
+ASSISTANT_PURPOSE = (
+    "يجيب عن أسئلتك الطبية والعامة من مصادر موثوقة، ويوصلك مباشرة إلى "
+    "الموارد والأقسام داخل MEDBOT."
+)
+
+
+def _quota_reset_text() -> str:
+    """Short, honest note about when the daily allowance refills.
+
+    The day counter rolls over at midnight, so the wait is until the next local
+    day begins — no numbers about the limit itself are ever shown.
+    """
+    now = datetime.now()
+    tomorrow = (now + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    total_minutes = max(1, int((tomorrow - now).total_seconds() // 60))
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+
+    if hours and minutes:
+        wait = f"خلال {hours} ساعة و{minutes} دقيقة"
+    elif hours:
+        wait = f"خلال {hours} ساعة"
+    else:
+        wait = f"خلال {minutes} دقيقة"
+
+    return (
+        "⏳ *توقف مؤقت لا خطأ عندك.*\n"
+        "وصلت إلى الحد اليومي لاستخدام المساعد. "
+        f"سيتجدد العداد تلقائياً {wait} (منتصف الليل بتوقيت الخادم)، "
+        "ثم يمكنك المتابعة كالمعتاد."
+    )
 
 
 def polling_allowed_updates():
@@ -4315,11 +4356,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_safe(
             query,
             "🤖 *مساعد MEDBOT*\n\n"
-            "اسأل عن أي موضوع طبي أو عام، أو اكتب اسم مورد للوصول إليه "
-            "داخل المنصة.\n\n"
-            "أجمع لك البحث داخل موارد المنصة والإجابة عن السؤال في خطوة "
-            "واحدة، ويمكنني قراءة كل بيانات المنصة والمقارنة بينها.\n\n"
-            "✍️ اكتب سؤالك أو اسم المورد الآن.",
+            f"{ASSISTANT_PURPOSE}\n\n"
+            "اكتب سؤالك (طبي أو عام) أو اسم مورد، وسأجيب من مصادر موثوقة "
+            "وأضع لك زراً للوصول المباشر إلى ما وجدته.\n\n"
+            "✍️ اكتب سؤالك الآن.",
             InlineKeyboardMarkup(
                 [
                     [btn("🏠 الرئيسية", "home")],
@@ -5172,10 +5212,7 @@ async def quota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if remaining > 0:
         message = "✅ يمكنك استخدام المساعد الآن."
     else:
-        message = (
-            "⚠️ تم الوصول إلى الحد المسموح به من الطلبات اليومية.\n"
-            "يتجدد العداد تلقائياً خلال 24 ساعة."
-        )
+        message = _quota_reset_text()
 
     await send_safe_message(
         update,
@@ -5283,10 +5320,27 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _assistant_action_rows(actions):
+    """One-button-per-row direct-access keyboard for matched resources.
+
+    Labels are plain text (no markdown) so a ')' inside a resource name can
+    never break the send; the callback opens the exact item.
+    """
+    rows = []
+
+    for action in actions or []:
+        callback = action.get("callback")
+        label = (action.get("label") or "").strip()
+        if not callback or not label:
+            continue
+        rows.append([InlineKeyboardButton(label, callback_data=callback)])
+
+    return rows
+
+
 async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-
     user = update.effective_user
 
     await database.register_user(
@@ -5412,8 +5466,7 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not allowed:
         await update.message.reply_text(
-            "⚠️ تم الوصول إلى الحد المسموح به من الطلبات اليومية.\n"
-            "يتجدد العداد تلقائياً خلال 24 ساعة.",
+            _quota_reset_text(),
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=await home_for(update),
         )
@@ -5428,30 +5481,33 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     try:
-        ai_answer = await generate_medbot_unified_response(query, user_id=user.id)
-    except Exception as exc:
+        ai_result = await generate_medbot_unified_result(query, user_id=user.id)
+    except Exception:
         logger.exception("AI request failed")
-        ai_answer = (
-            "⚠️ تعذر الوصول إلى خدمة الذكاء الاصطناعي حالياً.\n\n"
-            "لم يتم إنشاء إجابة غير مؤكدة."
-        )
+        ai_result = {
+            "text": (
+                "⚠️ تعذر الوصول إلى خدمة الذكاء الاصطناعي حالياً.\n\n"
+                "لم يتم إنشاء إجابة غير مؤكدة."
+            ),
+            "actions": [],
+        }
 
-    final_text = ai_answer
+    if not isinstance(ai_result, dict):
+        ai_result = {"text": str(ai_result), "actions": []}
+
+    ai_answer = ai_result.get("text", "")
+    action_rows = _assistant_action_rows(ai_result.get("actions"))
 
     # No balance counter is shown. The student is only told when the daily
     # allowance is used up: on the last allowed request, and on the next one.
     if remaining <= 0:
-        final_text = (
-            f"{ai_answer}\n\n"
-            "—\n"
-            "⚠️ *هذا آخر طلب متاح لك اليوم. تم الوصول إلى الحد المسموح به.*"
-        )
+        ai_answer = f"{ai_answer}\n\n—\n{_quota_reset_text()}"
 
-    await send_safe_message(
-        update,
-        final_text,
-        await home_for(update),
+    reply_markup = InlineKeyboardMarkup(
+        action_rows + [[btn("🏠 الرئيسية", "home")]]
     )
+
+    await send_safe_message(update, ai_answer, reply_markup)
 
 
 # ============================================================
