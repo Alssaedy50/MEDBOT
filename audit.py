@@ -56,6 +56,7 @@ AUDIT_ACTIONS = (
     "topic_delete",
     "notification_send",
     "language_set",
+    "feature_visibility",
 )
 
 ACTION_LABELS = {
@@ -89,6 +90,7 @@ ACTION_LABELS = {
     "topic_delete": "🗑 حذف موضوع",
     "notification_send": "🔔 إرسال إشعار",
     "language_set": "🌐 تغيير اللغة",
+    "feature_visibility": "🙈 إظهار/إخفاء قسم",
 }
 
 

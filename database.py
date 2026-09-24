@@ -211,6 +211,7 @@ async def init_db():
         await _migrate_v8(db)
         await _migrate_v9(db)
         await _migrate_v10(db)
+        await _migrate_v11(db)
 
         # ------------------------------------------------------------
         # Performance / integrity indexes
@@ -465,6 +466,7 @@ PERMISSION_KEYS = (
     "can_notifications",
     "can_settings",
     "can_topics",
+    "can_visibility",
 )
 
 # Stored in `admins.permissions` to mean "explicitly granted nothing". An empty
@@ -481,6 +483,7 @@ PERMISSION_LABELS = {
     "can_notifications": "🔔 الإشعارات",
     "can_settings": "⚙️ إعدادات المنصة",
     "can_topics": "🧭 مواضيع البحث",
+    "can_visibility": "🙈 إظهار/إخفاء الأقسام",
 }
 
 # Short labels for the compact permission toggles in admin_management.
@@ -494,6 +497,7 @@ PERMISSION_SHORT_LABELS = {
     "can_notifications": "الإشعارات",
     "can_settings": "الإعدادات",
     "can_topics": "المواضيع",
+    "can_visibility": "الإظهار",
 }
 
 ROLE_LABELS = {
@@ -502,6 +506,83 @@ ROLE_LABELS = {
     "reviewer": "🔎 مراجع",
     "none": "⛔ مُلغى",
 }
+
+# Roles an actor may assign from the admin-management UI. The `owner` role is
+# deliberately excluded: it is reached only through the explicit, audited
+# `transfer_ownership` operation, which guarantees exactly one owner.
+ROLE_ASSIGNABLE = ("admin", "reviewer", "none")
+
+# Each role implies a baseline capability set, so a role means the same thing
+# everywhere instead of relying on whichever toggles happened to be left on.
+# `can_admins` is owner-only by design; `reviewer` is a read/review role.
+ROLE_PERMISSION_PRESETS = {
+    "owner": {key: True for key in PERMISSION_KEYS},
+    "admin": {
+        key: (key != "can_admins") for key in PERMISSION_KEYS
+    },
+    "reviewer": {
+        key: key in ("can_contributions", "can_messages")
+        for key in PERMISSION_KEYS
+    },
+    "none": {key: False for key in PERMISSION_KEYS},
+}
+
+ROLE_DESCRIPTIONS = {
+    "owner": (
+        "👑 المالك — حساب واحد فقط في المنصة.\n"
+        "• كل الصلاحيات بلا استثناء، بما فيها إدارة المشرفين ونقل الملكية.\n"
+        "• لا يمكن إلغاؤه أو تخفيضه دون تعيين مالك جديد أولاً."
+    ),
+    "admin": (
+        "🛡 مشرف — مدير منصة مفوّض.\n"
+        "• إدارة الأقسام والمحتوى، مراجعة المساهمات، رسائل الطلاب،\n"
+        "  الذكاء الاصطناعي، الإشعارات، الإعدادات، المواضيع، وإظهار/إخفاء الأقسام.\n"
+        "• لا يملك إدارة المشرفين ولا نقل الملكية."
+    ),
+    "reviewer": (
+        "🔎 مراجع — دور للمراجعة فقط.\n"
+        "• مراجعة المساهمات والرد على رسائل الطلاب.\n"
+        "• لا يملك أي تعديل على الأقسام أو المحتوى أو الإعدادات."
+    ),
+    "none": (
+        "⛔ مُلغى — تم سحب وصول المشرف مع الاحتفاظ بالبيانات.\n"
+        "• لا يملك أي صلاحية إدارية."
+    ),
+}
+
+# ------------------------------------------------------------
+# Public navigation features (hide/show from the home page)
+# ------------------------------------------------------------
+# Keys map one-to-one to the student-facing home-page entries. Hiding a
+# feature removes its button for regular users AND blocks its callbacks, so a
+# feature can be taken offline during a fault or an update without a redeploy.
+FEATURES = (
+    "resources",
+    "assistant",
+    "contributions",
+    "my_contributions",
+    "account",
+    "topics",
+    "language",
+    "contact",
+    "about",
+    "admin_panel",
+)
+
+FEATURE_LABELS = {
+    "resources": "📚 موارد المنصة",
+    "assistant": "🤖 المساعد",
+    "contributions": "📤 مساهمات الطلاب",
+    "my_contributions": "📄 مساهماتي",
+    "account": "📊 حسابي",
+    "topics": "🧭 المواضيع",
+    "language": "🌐 اللغة",
+    "contact": "📬 تواصل مع المنصة",
+    "about": "ℹ️ عن المنصة",
+    "admin_panel": "🛠 إدارة المنصة (دخول المشرفين)",
+}
+
+SETTING_HIDDEN_FEATURES = "hidden_features"
 
 # ------------------------------------------------------------
 # Platform settings (admin-editable identity / interface content)
@@ -732,6 +813,55 @@ async def _migrate_v10(db):
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_notifications_created "
             "ON notifications(created_at)"
+        )
+    except Exception:
+        pass
+
+
+async def _migrate_v11(db):
+    """Heal databases left with more than one `owner` row.
+
+    An earlier build allowed promoting any admin to `owner` through the role
+    screen, which could leave two owners at once. Exactly one owner is a hard
+    invariant: keep the persisted owner (or the earliest owner when none is
+    recorded), demote every other owner to `admin`, and give it the admin
+    baseline so it no longer carries owner-only capabilities. Safe to re-run.
+    """
+    try:
+        async with db.execute(
+            "SELECT telegram_id FROM admins WHERE role = 'owner' "
+            "ORDER BY added_at ASC, telegram_id ASC"
+        ) as cur:
+            owners = [row[0] for row in await cur.fetchall()]
+    except Exception:
+        return
+
+    if len(owners) <= 1:
+        return
+
+    try:
+        async with db.execute(
+            "SELECT value FROM settings WHERE key = ?", (SETTING_OWNER_ID,)
+        ) as cur:
+            row = await cur.fetchone()
+        persisted = int(str(row[0]).strip()) if row and str(row[0]).strip() else 0
+    except Exception:
+        persisted = 0
+
+    keeper = persisted if persisted in owners else owners[0]
+    admin_perms = permissions_to_string(dict(ROLE_PERMISSION_PRESETS["admin"]))
+
+    try:
+        await db.execute(
+            "UPDATE admins SET role = 'admin', permissions = ? "
+            "WHERE role = 'owner' AND telegram_id != ?",
+            (admin_perms, keeper),
+        )
+        await db.commit()
+        logger.info(
+            "Migration v11: kept owner %s, demoted %s stale owner(s)",
+            keeper,
+            len(owners) - 1,
         )
     except Exception:
         pass
@@ -1920,6 +2050,45 @@ async def get_platform_setting(key: str, default: str = None) -> str:
     return value
 
 
+# ------------------------------------------------------------
+# Navigation feature visibility
+# ------------------------------------------------------------
+async def get_hidden_features() -> set:
+    """Features currently hidden from users, as a set of `FEATURES` keys.
+
+    Stored as a comma-separated list in the existing `settings` table so no
+    schema change is needed; an unset key means "everything visible", which is
+    the safe default for existing installs.
+    """
+    try:
+        raw = await get_setting(SETTING_HIDDEN_FEATURES)
+    except Exception:
+        return set()
+    if not raw:
+        return set()
+    return {
+        part.strip()
+        for part in str(raw).split(",")
+        if part.strip() in FEATURES
+    }
+
+
+async def set_hidden_features(features) -> bool:
+    """Persist the hidden-feature set (unknown keys are ignored)."""
+    try:
+        cleaned = [key for key in FEATURES if key in set(features)]
+        await set_setting(SETTING_HIDDEN_FEATURES, ",".join(cleaned))
+        return True
+    except Exception:
+        return False
+
+
+async def is_feature_hidden(feature: str) -> bool:
+    if feature not in FEATURES:
+        return False
+    return feature in await get_hidden_features()
+
+
 async def get_platform_settings() -> dict:
     """All platform settings resolved to their effective values."""
     return {
@@ -2677,7 +2846,8 @@ async def transfer_ownership(current_owner_id, new_owner_id) -> tuple[bool, str]
       * only the active owner may transfer;
       * the target must be an existing, active (non-revoked) admin;
       * the target cannot already be the owner;
-      * the previous owner is demoted to `admin` (never left owner-less).
+      * the previous owner is demoted to `admin` (never left owner-less) and
+        receives the admin role's baseline permissions.
 
     Persists the new owner id so a restart cannot silently revert it.
     Returns (ok, message).
@@ -2709,16 +2879,24 @@ async def transfer_ownership(current_owner_id, new_owner_id) -> tuple[bool, str]
         if target[0] == "owner":
             return False, "هذا الحساب هو المالك بالفعل."
 
+        owner_perms = permissions_to_string(
+            dict(ROLE_PERMISSION_PRESETS["owner"])
+        )
+        prev_owner_perms = permissions_to_string(
+            dict(ROLE_PERMISSION_PRESETS["admin"])
+        )
+
         await db.execute("BEGIN IMMEDIATE")
         try:
             await db.execute(
-                "UPDATE admins SET role = 'owner', permissions = '' "
+                "UPDATE admins SET role = 'owner', permissions = ? "
                 "WHERE telegram_id = ?",
-                (int(new_owner_id),),
+                (owner_perms, int(new_owner_id)),
             )
             await db.execute(
-                "UPDATE admins SET role = 'admin' WHERE telegram_id = ?",
-                (int(current_owner_id),),
+                "UPDATE admins SET role = 'admin', permissions = ? "
+                "WHERE telegram_id = ?",
+                (prev_owner_perms, int(current_owner_id)),
             )
             # Exactly one owner must remain.
             await db.execute(
@@ -2745,13 +2923,18 @@ async def transfer_ownership(current_owner_id, new_owner_id) -> tuple[bool, str]
 
 
 async def db_demote_stale_owners(owner_id: int) -> None:
-    """Demote every admin holding 'owner' except `owner_id` to 'admin'."""
+    """Demote every admin holding 'owner' except `owner_id` to 'admin'.
+
+    The demoted row also receives the admin baseline permissions, so a former
+    owner actually becomes a regular admin (rather than keeping owner-only
+    capabilities such as `can_admins`).
+    """
     db = await get_db()
     try:
         await db.execute(
-            "UPDATE admins SET role = 'admin' "
+            "UPDATE admins SET role = 'admin', permissions = ? "
             "WHERE role = 'owner' AND telegram_id != ?",
-            (owner_id,),
+            (permissions_to_string(dict(ROLE_PERMISSION_PRESETS["admin"])), owner_id),
         )
         await db.commit()
     finally:
@@ -2814,6 +2997,10 @@ async def set_admin_role(user_id, role: str) -> bool:
     is refused, so the owner cannot be turned into a sub-admin by accident.
     Promoting another account to owner is allowed and leaves two owners until
     the next `ensure_configured_admin()` run demotes the stale one.
+
+    The UI never calls this with `owner`; that transition is reserved for the
+    explicit `transfer_ownership` operation, which swaps the two roles
+    atomically and always leaves exactly one owner.
     """
     if role not in ROLES:
         return False
@@ -2836,6 +3023,22 @@ async def set_admin_role(user_id, role: str) -> bool:
         return False
     finally:
         await db.close()
+
+
+async def apply_role_preset(user_id, role: str) -> bool:
+    """Persist the role and its baseline permission preset in one go.
+
+    Choosing a role from the UI gives it a well-defined scope; the owner can
+    still adjust individual toggles afterwards. Only owner-scope roles are
+    accepted here — `owner` is reached through `transfer_ownership`.
+    """
+    if role not in ROLE_ASSIGNABLE:
+        return False
+    if not await set_admin_role(user_id, role):
+        return False
+    return await update_admin_permissions(
+        user_id, dict(ROLE_PERMISSION_PRESETS.get(role, {}))
+    )
 
 
 async def update_admin_permissions(user_id, permissions: dict) -> bool:

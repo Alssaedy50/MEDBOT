@@ -628,6 +628,28 @@ async def change_status(query, context, message_id, status):
 # ---------------------------------------------------------------
 
 
+async def _contact_hidden_for(query) -> bool:
+    """True when Contact is hidden for this caller (admins bypass).
+
+    Contact has its own handler precedence before the catch-all router, so it
+    needs its own visibility check to honour `database.is_feature_hidden`.
+    """
+    try:
+        if await database.is_user_admin(query.from_user.id):
+            return False
+        if not await database.is_feature_hidden("contact"):
+            return False
+    except Exception:
+        return False
+
+    await _edit(
+        query,
+        "🛠 هذا القسم غير متاح مؤقتاً للصيانة أو التحديث.",
+        HOME_KEYBOARD,
+    )
+    return True
+
+
 async def messaging_callback_handler(update, context):
     query = update.callback_query
 
@@ -639,10 +661,14 @@ async def messaging_callback_handler(update, context):
     data = query.data or ""
 
     if data == "contact":
+        if await _contact_hidden_for(query):
+            return
         await contact_admin_screen(query, context)
         return
 
     if data.startswith("msg_cat:"):
+        if await _contact_hidden_for(query):
+            return
         await select_category(query, context, data.split(":", 1)[1])
         return
 
@@ -696,6 +722,18 @@ async def contact_command(update, context):
     if not update.message:
         return
     _clear_contact_state(context)
+
+    try:
+        if not await database.is_user_admin(update.effective_user.id):
+            if await database.is_feature_hidden("contact"):
+                await update.message.reply_text(
+                    "🛠 هذا القسم غير متاح مؤقتاً للصيانة أو التحديث.",
+                    reply_markup=HOME_KEYBOARD,
+                )
+                return
+    except Exception:
+        pass
+
     await _reply(
         update,
         "📬 <b>التواصل مع الإدارة</b>\n\n"

@@ -468,6 +468,28 @@ async def _link_picker_level(query, context, topic_id, parent_id):
     )
 
 
+async def _topics_hidden_for(query) -> bool:
+    """True when Search Topics is hidden for this caller (admins bypass).
+
+    Topics registers its own handler ahead of the catch-all router, so it
+    needs its own visibility check to honour `database.is_feature_hidden`.
+    """
+    try:
+        if await database.is_user_admin(query.from_user.id):
+            return False
+        if not await database.is_feature_hidden("topics"):
+            return False
+    except Exception:
+        return False
+
+    await _edit(
+        query,
+        "🛠 هذا القسم غير متاح مؤقتاً للصيانة أو التحديث.",
+        _home_keyboard(),
+    )
+    return True
+
+
 async def topics_callback_handler(update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
 
@@ -480,10 +502,14 @@ async def topics_callback_handler(update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---- Public ----------------------------------------------------
     if data == "topics":
+        if await _topics_hidden_for(query):
+            return
         await show_topics(query)
         return
 
     if data.startswith("topic_open:"):
+        if await _topics_hidden_for(query):
+            return
         try:
             topic_id = int(data.split(":", 1)[1])
         except (TypeError, ValueError):
