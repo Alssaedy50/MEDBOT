@@ -120,6 +120,36 @@ GENERAL_ASSISTANT_PROMPT = """أنت مساعد منصة MEDBOT التعليمي
 6. لا تخترع أي معلومة، وإذا لم تكن متأكداً قل ذلك باختصار.
 """
 
+# MODE 1 — platform resource search. The model is handed the complete current
+# catalog (every registered section/resource with its real path and id) and may
+# reason over it freely, but it may only ever name an entity that exists there.
+# It never receives — and never returns — a Telegram callback or an id, so the
+# backend alone decides what is reachable.
+PLATFORM_SEARCH_PROMPT = """أنت محرّك البحث والتنقّل في منصة MEDBOT التعليمية على Telegram.
+
+هذه ليست محادثة طبية. مهمتك الوحيدة: فهم طلب الطالب البحثي/التنقّلي ثم تحديد
+الموارد المسجّلة فعلاً في المنصة التي تطابق طلبه.
+
+سياقك هو "دليل المنصة" أدناه، وهو القائمة الكاملة الحالية للأقسام والموارد
+المسجّلة. يجوز لك التفكير داخله بحرية: فسّر العامية والأخطاء والاختصارات
+والمرادفات، واستنتج ما الذي يقصده الطالب فعلاً بالرجوع إلى عناصر حقيقية موجودة
+في الدليل.
+
+قواعد إلزامية:
+1. لا يجوز لك اختلاق أي قسم أو مادة أو ملف أو مسار غير موجود في الدليل.
+   كل عنصر تذكره يجب أن يقابل عنصراً مسجّلاً فعلاً في الدليل.
+2. لا تذكر مساراً أو قسماً لمجرد أن معرفتك الطبية/الأكاديمية توحي بوجوده.
+   الدليل وحده هو مصدر حقيقة المنصة.
+3. إذا لم يوجد أي عنصر مطابق فعلاً، قل بوضوح إنه لا يوجد مورد مسجّل مطابق،
+   ولا تقترح بديلاً غير موجود.
+4. إذا وجدت عنصراً واحداً مطابقاً، اعرضه بمساره الفعلي.
+   وإذا وجدت أكثر من عنصر مطابق، اعرض العناصر المطابقة فقط (وليس كل الدليل).
+5. اجعل الرد قصيراً وعملياً: جملة تمهيدية قصيرة ثم أسماء الموارد المطابقة
+   ومساراتها. لا محاضرات ولا شرح طويل ولا معلومات طبية عامة.
+6. لا تنشئ أزراراً ولا روابط ولا معرّفات ولا أهداف تنقّل ولا callbacks؛ النظام
+   الخلفي هو من يبني الوصول من عناصر مسجّلة بعد التحقق منها.
+"""
+
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GROQ_KEY = os.getenv("GROQ_API_KEY", "").strip()
 OR_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -1412,6 +1442,7 @@ MEDICAL_CONCEPT_KEYS = frozenset({
     "cbc", "hemoglobin", "esr", "crp", "electrolytes", "renal", "liver",
     "lipid", "glucose", "thyroid", "urinalysis", "anatomy", "physiology",
     "pathology", "pharmacology", "microbiology", "biochemistry", "immunology",
+    "histology",
 })
 
 # Extra medical keywords that are not part of the synonym table.
@@ -1426,6 +1457,7 @@ _MEDICAL_KEYWORDS = frozenset({
     "cancer", "vaccine", "drug", "drugs", "dose", "therapy", "organ",
     "cell", "cells", "enzyme", "protein", "vitamin", "hormone", "cardiac",
     "clinical", "physiological", "pathological", "syndrome", "disorder",
+    "potential", "receptor", "neuron", "muscle", "nerve", "blood",
 })
 
 # Filler words that carry no subject on their own, used only to decide whether
@@ -1814,30 +1846,6 @@ def _genuine_registry_matches(prompt: str, results: list) -> list:
     return matched
 
 
-def build_registry_answer(results: list) -> str:
-    """Render matched registered items and their real paths — deterministically.
-
-    Platform facts are never delegated to a model: the matched rows are the
-    registry's own rows, so the answer can only name sections/resources that
-    actually exist, with the exact breadcrumb used across the platform.
-    """
-    lines = ["📚 *هذه الموارد موجودة فعلاً في MEDBOT:*", ""]
-
-    for item in results[:MAX_RESULT_ACTIONS]:
-        result_type = item.get("result_type")
-        title = item.get("title") or item.get("name") or "بدون عنوان"
-        path = item.get("path") or "الرئيسية 🏠"
-
-        if result_type in ("FOLDER", "EMPTY_FOLDER"):
-            lines.append(f"📂 *{title}*")
-            lines.append(f"   المسار: {path}")
-        else:
-            lines.append(f"📄 *{title}*")
-            lines.append(f"   داخل: {path}")
-
-    return "\n".join(lines)
-
-
 def _medical_prompt(prompt: str, sources: list) -> str:
     source_context = (
         build_source_context(sources)
@@ -1944,48 +1952,22 @@ async def _provider_failover(
     return ""
 
 
-def _no_provider_answer(results: list) -> str:
-    """Honest fallback when no model is reachable: registered facts or nothing.
-
-    No source footer is attached because no answer was actually generated from
-    those sources; showing citations under a service-down notice would imply a
-    grounding that never happened.
-    """
-    if results:
-        return (
-            "📚 *نتائج البحث داخل MEDBOT*\n\n"
-            f"{build_library_context(results)}\n\n"
-            "⚠️ تعذر الوصول إلى خدمة الذكاء الاصطناعي؛ النتائج أعلاه مأخوذة "
-            "مباشرة من قاعدة بيانات MEDBOT."
-        )
-
-    return (
-        "⚠️ تعذر الوصول إلى خدمة الذكاء الاصطناعي حالياً؛ لم تُنشأ إجابة "
-        "غير مؤكدة من MEDBOT.\nيرجى المحاولة بعد قليل."
-    )
-
-
 async def generate_medbot_unified_result(
     prompt: str,
     user_id: int = None,
 ) -> dict:
-    """The single MEDBOT assistant.
+    """Backward-compatible auto-routing entry point (legacy callers only).
 
-    The message is first classified by ``classify_intent`` so each kind of
-    request uses the lightest reliable workflow:
+    The platform now has TWO explicit modes, and this function exists only so
+    single-textbox / CLI callers keep working: it classifies the message and
+    delegates to the matching workflow.
 
-        resource/navigation -> registered rows only, deterministic (no model)
-        overview            -> registered hierarchy only, deterministic (no model)
-        medical             -> concise verified answer + PubMed, then the model
-        general             -> direct concise answer from the model, no PubMed
+        overview | resource -> MODE 1 platform resource search
+        medical  | general  -> MODE 2 AI chat
 
-    Platform facts are never produced by the model: the model never receives a
-    tree to "read" for a navigation question, so it cannot invent a section.
-    It only ever phrases real matched rows (navigation) or answers a
-    medical/general question (which is forbidden from discussing the platform).
-
-    Returns ``{"text": str, "actions": [{"label", "callback"}, ...]}``. Actions
-    are built only from real registered ids found by deterministic search.
+    It is a thin dispatcher, not a merged workflow: neither mode is re-merged,
+    and the Telegram UI selects a mode explicitly. New callers should call
+    ``generate_platform_search_result`` or ``generate_ai_chat_result``.
     """
     prompt = (prompt or "").strip()
 
@@ -1995,77 +1977,267 @@ async def generate_medbot_unified_result(
     intent = classify_intent(prompt)
     logger.info("Assistant intent=%s", intent)
 
-    # --- Resource / navigation: deterministic registry facts, no model -----
-    if intent == INTENT_OVERVIEW:
-        # "What exists?" needs the structure only: no text search, no model.
+    if intent in (INTENT_OVERVIEW, INTENT_RESOURCE):
+        return await generate_platform_search_result(prompt, user_id=user_id)
+
+    return await generate_ai_chat_result(prompt, user_id=user_id)
+
+
+# ---------------------------------------------------------------------------
+# MODE 1 — PLATFORM RESOURCE SEARCH (registry facts + verified access)
+# ---------------------------------------------------------------------------
+# Separate workflow from AI Chat. It is allowed to read the COMPLETE current
+# platform catalog so it can resolve natural-language Arabic/English resource
+# queries, but it may never produce a platform fact that is not a real
+# registered row, and the backend builds every access button from verified ids.
+#
+# Fast path: when the deterministic engine already finds the named item(s), the
+# answer is rendered from registered rows and no model is called at all. The
+# model is used only for the genuinely hard natural-language query — the way to
+# search the whole catalog when token overlap found nothing — and even then the
+# backend keeps only what it can verify against a real id.
+
+PLATFORM_SEARCH_NO_MATCH = (
+    "لم أجد أي مورد أو قسم مسجّل في MEDBOT يطابق طلبك.\n"
+    "جرّب كتابة اسم المادة أو القسم بشكل آخر."
+)
+
+
+def _search_subject_tokens(prompt: str) -> set:
+    """The content tokens of a resource query, with all search noise removed.
+
+    ``search_engine.meaningful_terms`` already drops stop words and generic
+    platform nouns (محتوى/موارد/بيانات/مواد); here the leftover question/
+    navigation tokens are dropped too, so what remains is the named subject.
+    """
+    subject = _bare_tokens(prompt)
+    return subject - _PLATFORM_NOUNS - _GENERIC_TOKENS - _EXISTENCE_TOKENS
+
+
+async def _platform_search_results(prompt: str) -> list:
+    """Deterministic registry search followed by a verified catalog fallback.
+
+    Returns only real ``search_engine`` result rows. The fallback asks the
+    model to resolve a natural-language query against the full catalog, then
+    discards anything that cannot be matched back to a registered row.
+    """
+    results = await _search_medbot(prompt)
+    matches = _genuine_registry_matches(prompt, results)
+
+    if matches:
+        return matches
+
+    return await _catalog_fallback_matches(prompt)
+
+
+async def _catalog_fallback_matches(prompt: str) -> list:
+    """Query the full catalog with the model, keeping only verifiable hits.
+
+    Only runs for a genuinely harder natural-language question (the
+    deterministic pass found nothing). If no provider is reachable, or the
+    model names nothing that maps back to a registered row, the result is
+    empty and the caller answers with the honest no-match message.
+    """
+    folders, contents, paths = await _load_registry()
+
+    if not folders and not contents:
+        return []
+
+    subject = _search_subject_tokens(prompt)
+
+    if not subject:
+        return []
+
+    candidates = await _get_candidates()
+
+    if not candidates:
+        return []
+
+    catalog = build_platform_catalog(folders, contents, paths)
+    grounded_prompt = (
+        "دليل المنصة (المصدر الوحيد المسموح لمعرفة ما هو مسجّل):\n"
+        f"{catalog}\n\n"
+        f"طلب الطالب:\n{prompt}\n\n"
+        "اذكر فقط الموارد/الأقسام المطابقة لطلب الطالب من الدليل أعلاه، مع "
+        "مسار كل منها. لا تذكر أي شيء غير موجود في الدليل."
+    )
+
+    answer = await _provider_failover(
+        grounded_prompt,
+        PLATFORM_SEARCH_PROMPT,
+        candidates,
+        None,
+        "Platform search",
+    )
+
+    if not answer:
+        return []
+
+    return _verify_catalog_answer(answer, folders, contents, paths)
+
+
+def _verify_catalog_answer(answer, folders, contents, paths) -> list:
+    """Keep only catalog rows the model's answer can be verified against.
+
+    The model's text is a *claim*; a row becomes reachable only when we can
+    confirm it from the registry itself. We iterate the REAL catalog rows (so an
+    invented entity can never be produced) and keep a row only when the model
+    explicitly named it. This is what lets the model bridge colloquial Arabic to
+    an English title while still never minting a platform entity: the model can
+    only ever *select* a row that already exists, never create one.
+    """
+    rows = _catalog_rows_as_results(folders, contents, paths)
+    normalized_answer = search_engine.normalize_text(answer)
+
+    verified = []
+    for item in rows:
+        title = search_engine.normalize_text(
+            item.get("title") or item.get("name") or ""
+        )
+        if title and title in normalized_answer:
+            verified.append(item)
+
+    return verified[:MAX_RESULT_ACTIONS]
+
+
+def _catalog_rows_as_results(folders, contents, paths) -> list:
+    """Render the full catalog as search-shaped result rows (no synthesis).
+
+    Every row is a real folder/content record with its true id, name and
+    breadcrumb; only the columns the rest of the assistant expects are added.
+    """
+    results = []
+
+    for row in folders:
+        folder_id, parent_id, name, node_type = row[0], row[1], row[2], row[3]
+        content_count = sum(1 for c in contents if c[1] == folder_id)
+        results.append({
+            "type": "FOLDER",
+            "result_type": "FOLDER" if content_count else "EMPTY_FOLDER",
+            "id": folder_id,
+            "folder_id": folder_id,
+            "title": name,
+            "name": name,
+            "path": paths.get(folder_id) or "الرئيسية 🏠",
+            "content_count": content_count,
+            "node_type": node_type,
+        })
+
+    for row in contents:
+        content_id, folder_id, title, file_type = row[0], row[1], row[2], row[3]
+        results.append({
+            "type": "CONTENT",
+            "result_type": "CONTENT",
+            "id": content_id,
+            "content_id": content_id,
+            "folder_id": folder_id,
+            "title": title,
+            "name": title,
+            "path": paths.get(folder_id) or "الرئيسية 🏠",
+            "file_type": file_type,
+        })
+
+    return results
+
+
+def _platform_search_line(item: dict) -> str:
+    is_folder = item.get("result_type") in ("FOLDER", "EMPTY_FOLDER")
+    icon = "📂" if is_folder else "📄"
+    title = item.get("title") or item.get("name") or "بدون عنوان"
+    path = item.get("path") or "الرئيسية 🏠"
+    label = "المسار" if is_folder else "داخل"
+    return f"{icon} *{title}*\n   {label}: {path}"
+
+
+def build_platform_search_answer(results: list) -> str:
+    """Short, discovery-oriented answer rendered only from verified rows."""
+    if not results:
+        return PLATFORM_SEARCH_NO_MATCH
+
+    if len(results) == 1:
+        return (
+            "وجدت لك مورداً مرتبطاً بطلبك:\n\n"
+            + _platform_search_line(results[0])
+        )
+
+    lines = ["وجدت عدة موارد مرتبطة بطلبك:", ""]
+
+    for item in results[:MAX_RESULT_ACTIONS]:
+        lines.append(_platform_search_line(item))
+
+    return "\n".join(lines)
+
+
+async def generate_platform_search_result(
+    prompt: str,
+    user_id: int = None,
+) -> dict:
+    """MODE 1: find and reach real MEDBOT resources.
+
+    Pipeline (never invents a platform entity):
+        query -> intent/concept resolution (local, free)
+              -> deterministic registry search (fast path, no model)
+              -> [fallback] full-catalog read + verified-id matching
+              -> short answer + one-tap buttons from VERIFIED registry ids
+
+    Returns ``{"text": str, "actions": [{"label", "callback"}, ...]}`` where
+    every callback is ``folder:<id>`` / ``file:<id>`` built from a real row.
+    """
+    prompt = (prompt or "").strip()
+
+    if not prompt:
+        return {"text": "⚠️ يرجى كتابة ما تبحث عنه.", "actions": []}
+
+    # A bare enumeration ("ما هي الأقسام الموجودة؟") is answered from the
+    # registered hierarchy alone: no search, no model, nothing inventable.
+    if classify_intent(prompt) == INTENT_OVERVIEW:
         folders, _contents, _paths = await _load_registry()
         return {"text": build_registry_overview(folders), "actions": []}
 
-    if intent == INTENT_RESOURCE:
-        results = await _search_medbot(prompt)
+    matches = await _platform_search_results(prompt)
 
-        # A recall-oriented hit is not proof the named item exists: keep only
-        # the hits that really match, so "First Year" cannot be answered with
-        # "Second Year".
-        matches = _genuine_registry_matches(prompt, results)
+    if not matches:
+        return {"text": PLATFORM_SEARCH_NO_MATCH, "actions": []}
 
-        if not matches:
-            return {"text": NOT_REGISTERED_MESSAGE, "actions": []}
+    return {
+        "text": build_platform_search_answer(matches),
+        "actions": build_result_actions(matches),
+    }
 
-        return {
-            "text": build_registry_answer(matches),
-            "actions": build_result_actions(matches),
-        }
 
-    # --- Medical / general: one grounded generation with provider failover -
-    if intent == INTENT_MEDICAL:
-        # A medical question may still map to a registered subject, so the
-        # registry search runs here and can yield direct-access buttons.
-        results, candidates, sources = await asyncio.gather(
-            _search_medbot(prompt),
-            _get_candidates(),
-            _fetch_pubmed_sources(prompt),
-            return_exceptions=True,
-        )
-    else:
-        # A general question is not about the platform: no registry search and
-        # no PubMed. That is the lightest reliable path, and it avoids
-        # attaching a platform action or citation the user never asked for.
-        results = []
-        sources = []
+# ---------------------------------------------------------------------------
+# MODE 2 — AI CHAT (conversational knowledge, never the platform registry)
+# ---------------------------------------------------------------------------
+# Independent from platform search: it answers questions, it does not navigate.
+# A medical question gets an English academic answer plus a concise Arabic
+# explanation and PubMed grounding; anything else is answered naturally and
+# concisely, with no PubMed and no registry access at all.
+
+async def generate_ai_chat_result(
+    prompt: str,
+    user_id: int = None,
+) -> dict:
+    """MODE 2: conversational AI, separate from platform navigation.
+
+    Returns ``{"text": str, "actions": []}``. Actions are always empty: chat
+    never produces platform navigation, so it can never expose platform
+    structure or invent a resource.
+    """
+    prompt = (prompt or "").strip()
+
+    if not prompt:
+        return {"text": "⚠️ يرجى كتابة سؤال واضح.", "actions": []}
+
+    intent = classify_intent(prompt)
+    logger.info("AI chat intent=%s", intent)
+
+    if not _is_medical_question(prompt, intent):
+        # A general question: no PubMed, no registry, one concise answer.
         candidates = await _get_candidates()
 
-    if isinstance(results, BaseException):
-        logger.warning("Library search failed: %s", results)
-        results = []
-    if isinstance(candidates, BaseException):
-        logger.warning("Candidate pool failed: %s", candidates)
-        candidates = []
-    if isinstance(sources, BaseException):
-        logger.warning("PubMed retrieval failed: %s", sources)
-        sources = []
+        if not candidates:
+            return {"text": _chat_no_provider_answer(), "actions": []}
 
-    # Offer direct access only to genuinely related registered items.
-    related = _genuine_registry_matches(prompt, results)
-    actions = build_result_actions(related)
-    sources_footer = build_sources_footer(sources)
-
-    if not candidates:
-        return {
-            "text": _no_provider_answer(related),
-            "actions": actions,
-        }
-
-    if intent == INTENT_MEDICAL:
-        answer = await _provider_failover(
-            _medical_prompt(prompt, sources),
-            UNIFIED_ASSISTANT_PROMPT,
-            candidates,
-            user_id,
-            "Medical assistant",
-            sources_footer,
-        )
-    else:
         answer = await _provider_failover(
             _general_prompt(prompt),
             GENERAL_ASSISTANT_PROMPT,
@@ -2074,24 +2246,74 @@ async def generate_medbot_unified_result(
             "General assistant",
         )
 
-    if not answer:
-        return {
-            "text": _no_provider_answer(related),
-            "actions": actions,
-        }
+        if not answer:
+            return {"text": _chat_no_provider_answer(), "actions": []}
 
-    return {"text": answer, "actions": actions}
+        return {"text": answer, "actions": []}
+
+    # A medical question: PubMed grounding + the bilingual answer contract.
+    # Deliberately no registry search: AI Chat must not surface MEDBOT's
+    # platform structure for a medical question.
+    candidates, sources = await asyncio.gather(
+        _get_candidates(),
+        _fetch_pubmed_sources(prompt),
+        return_exceptions=True,
+    )
+
+    if isinstance(candidates, BaseException):
+        candidates = []
+    if isinstance(sources, BaseException):
+        sources = []
+
+    if not candidates:
+        return {"text": _chat_no_provider_answer(), "actions": []}
+
+    answer = await _provider_failover(
+        _medical_prompt(prompt, sources),
+        UNIFIED_ASSISTANT_PROMPT,
+        candidates,
+        user_id,
+        "Medical assistant",
+        build_sources_footer(sources),
+    )
+
+    if not answer:
+        return {"text": _chat_no_provider_answer(), "actions": []}
+
+    return {"text": answer, "actions": []}
+
+
+def _is_medical_question(prompt: str, intent: str) -> bool:
+    """Whether an AI-Chat message is a medical/scientific question.
+
+    A question like "اشرح لي دورة القلب" names a concept that is both a
+    registered directory and a medical topic; in AI Chat the first person is
+    medical, so any recognized medical concept counts as medical. Everything
+    else is a general question.
+    """
+    if intent == INTENT_MEDICAL:
+        return True
+
+    return bool(search_engine.implied_concepts(prompt) & MEDICAL_CONCEPT_KEYS)
+
+
+def _chat_no_provider_answer() -> str:
+    return (
+        "⚠️ تعذر الوصول إلى خدمة الذكاء الاصطناعي حالياً؛ "
+        "يرجى المحاولة بعد قليل."
+    )
 
 
 async def generate_medbot_unified_response(
     prompt: str,
     user_id: int = None,
 ) -> str:
-    """Backward-compatible text-only wrapper around the unified assistant.
+    """Backward-compatible text-only wrapper (legacy/CLI callers only).
 
-    Callers that only need the answer text (CLI checks, older code) use this;
-    the Telegram layer uses ``generate_medbot_unified_result`` to also get the
-    direct-access action buttons.
+    It auto-routes exactly like ``generate_medbot_unified_result``. The
+    Telegram layer does not use either dispatcher: it selects one of the two
+    explicit modes (``generate_platform_search_result`` /
+    ``generate_ai_chat_result``).
     """
     result = await generate_medbot_unified_result(prompt, user_id=user_id)
     return result.get("text", "")

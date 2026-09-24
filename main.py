@@ -61,23 +61,32 @@ import notifications
 import visibility
 import workflow
 from ai import (
-    generate_medbot_unified_result,
-    generate_medbot_unified_response,
+    generate_ai_chat_result,
+    generate_platform_search_result,
     warm_ai_pool,
 )
-from search_engine import search_library_summary
-
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DAILY_LIMIT = 25
 
-# The assistant answers general and medical questions. In CI there are no keys,
-# so the deterministic grounded path is what the tests exercise.
+# The assistant screen is a mode chooser: platform resource search and AI chat
+# are two independent workflows (see MODE 1 / MODE 2 in `ai.py`). In CI there
+# are no keys, so the deterministic grounded path is what the tests exercise.
 ASSISTANT_PURPOSE = (
-    "يجيب عن أسئلتك الطبية والعامة من مصادر موثوقة، ويوصلك مباشرة إلى "
-    "الموارد والأقسام داخل MEDBOT."
+    "وضعان منفصلان: بحث في موارد المنصة، ومحادثة ذكية للأسئلة الطبية والعامة."
 )
+
+# The only in-assistant modes. `assistant_platform` searches real registered
+# resources and returns verified access buttons; `assistant_chat` answers
+# questions and never touches the registry.
+MODE_PLATFORM = "assistant_platform"
+MODE_CHAT = "assistant_chat"
+
+# Values `context.user_data["assistant_mode"]` may legitimately hold. Legacy
+# "unified" is accepted for older messages and treated as platform search.
+PLATFORM_MODES = frozenset({MODE_PLATFORM, "unified"})
+CHAT_MODES = frozenset({MODE_CHAT})
 
 
 def _quota_reset_text() -> str:
@@ -827,31 +836,6 @@ async def open_file(query, context, content_id):
 # ============================================================
 
 
-async def search_content(query_text):
-    """
-    Canonical MEDBOT resource search entry point.
-
-    search_engine.search_library_summary() returns a stable
-    response object. This wrapper preserves the legacy main.py
-    contract by returning only the result list.
-    """
-    response = await search_library_summary(query_text, limit=15)
-
-    if not isinstance(response, dict):
-        raise TypeError(
-            f"Unexpected search response type: {type(response).__name__}"
-        )
-
-    results = response.get("results", [])
-
-    if not isinstance(results, list):
-        raise TypeError(
-            f"Unexpected search results type: {type(results).__name__}"
-        )
-
-    return results
-
-
 async def _user_is_admin_safe(user_id) -> bool:
     try:
         return await database.is_user_admin(user_id)
@@ -897,8 +881,15 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def run_search(update: Update, query_text):
+    """Standalone /search entry point: the platform-search workflow.
+
+    It resolves the query against the registered resources (understanding
+    Arabic/English and colloquial wording) and replies with a short answer plus
+    verified direct-access buttons. Because RESULTS ARE CONTENT, the reply is
+    registered so a later navigation tap cannot overwrite it in place.
+    """
     try:
-        results = await search_content(query_text)
+        result = await generate_platform_search_result(query_text)
     except Exception:
         logger.exception("Search failed")
         await update.message.reply_text(
@@ -907,67 +898,18 @@ async def run_search(update: Update, query_text):
         )
         return
 
-    if not results:
-        await update.message.reply_text(
-            "🔎 *نتيجة البحث*\n\n"
-            "المورد المطلوب غير مسجل حالياً في MEDBOT.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=await home_for(update),
-        )
-        return
+    if not isinstance(result, dict):
+        result = {"text": str(result), "actions": []}
 
-    lines = ["🔎 *نتائج البحث داخل MEDBOT*\n"]
-    buttons = []
-
-    for item in results:
-        result_type = item.get("result_type")
-        item_id = item.get("id")
-        title = item.get("title") or item.get("name") or "بدون عنوان"
-        path = item.get("path") or "بدون مسار"
-        file_type = item.get("file_type")
-        content_count = item.get("content_count", 0)
-
-        if result_type == "FOLDER":
-            icon = "📁"
-            lines.append(
-                f"{icon} *{title}*\n"
-                f"   🧭 {path}\n"
-                f"   📄 الموارد: {content_count}"
-            )
-            buttons.append(
-                [btn(f"📁 {str(title)[:35]}", f"folder:{item_id}")]
-            )
-
-        elif result_type == "CONTENT":
-            icon = content_icon(file_type)
-            lines.append(
-                f"{icon} *{title}*\n"
-                f"   🧭 {path}"
-            )
-            buttons.append(
-                [btn(f"{icon} {str(title)[:35]}", f"file:{item_id}")]
-            )
-
-        elif result_type == "EMPTY_FOLDER":
-            lines.append(
-                f"📁 *{title}*\n"
-                f"   🧭 {path}\n"
-                f"   لا توجد موارد مسجلة حالياً."
-            )
-            buttons.append(
-                [btn(f"📁 {str(title)[:35]}", f"folder:{item_id}")]
-            )
-
-    buttons.append([btn("🤖 العودة للمساعد", "assistant")])
+    buttons = _assistant_action_rows(result.get("actions"))
+    buttons.append([btn("🤖 افتح المساعد", "assistant")])
     buttons.append([btn("🏠 الرئيسية", "home")])
 
     sent = await update.message.reply_text(
-        "\n".join(lines),
+        result.get("text", ""),
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(buttons),
     )
-    # Search results are persistent educational content: register them so a
-    # later navigation tap cannot overwrite them in place.
     user = getattr(update, "effective_user", None)
     _register_content_message(
         getattr(user, "id", None), getattr(sent, "message_id", None)
@@ -4206,6 +4148,8 @@ def _feature_for_callback(data: str):
         "assistant_start",
         "assistant_search",
         "assistant_medical",
+        MODE_PLATFORM,
+        MODE_CHAT,
         "search",
     ):
         return "assistant"
@@ -4351,40 +4295,35 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "assistant":
+        # Entry point: choose one of the two independent workflows.
         context.user_data["search_mode"] = False
-        context.user_data["assistant_mode"] = "unified"
-        await edit_safe(
-            query,
-            "🤖 *مساعد MEDBOT*\n\n"
-            f"{ASSISTANT_PURPOSE}\n\n"
-            "اكتب سؤالك (طبي أو عام) أو اسم مورد، وسأجيب من مصادر موثوقة "
-            "وأضع لك زراً للوصول المباشر إلى ما وجدته.\n\n"
-            "✍️ اكتب سؤالك الآن.",
-            InlineKeyboardMarkup(
-                [
-                    [btn("🏠 الرئيسية", "home")],
-                ]
-            ),
-        )
+        context.user_data["assistant_mode"] = None
+        await edit_safe(query, ASSISTANT_MENU_TEXT, _assistant_menu_keyboard())
         return
 
-    # Legacy gateway buttons (older messages still carry them): the two
-    # former modes are now a single unified assistant.
+    if data in (MODE_PLATFORM, MODE_CHAT):
+        context.user_data["search_mode"] = False
+        context.user_data["assistant_mode"] = data
+        text = (
+            AI_CHAT_SCREEN_TEXT if data == MODE_CHAT
+            else PLATFORM_SEARCH_SCREEN_TEXT
+        )
+        await edit_safe(query, text, _mode_keyboard(data))
+        return
+
+    # Legacy gateway buttons (older messages still carry them): they must
+    # never dead-end. `assistant_medical` was the conversational path,
+    # `assistant_search`/`assistant_start` were the resource-lookup path, so
+    # each maps to its closest surviving mode.
     if data in ("assistant_search", "assistant_medical", "assistant_start"):
         context.user_data["search_mode"] = False
-        context.user_data["assistant_mode"] = "unified"
-        await edit_safe(
-            query,
-            "🤖 *مساعد MEDBOT*\n\n"
-            "اسأل عن أي موضوع طبي أو عام، أو اكتب اسم مورد للوصول إليه "
-            "داخل المنصة.\n\n"
-            "✍️ اكتب سؤالك أو اسم المورد الآن.",
-            InlineKeyboardMarkup(
-                [
-                    [btn("🏠 الرئيسية", "home")],
-                ]
-            ),
+        legacy_mode = MODE_CHAT if data == "assistant_medical" else MODE_PLATFORM
+        context.user_data["assistant_mode"] = legacy_mode
+        text = (
+            AI_CHAT_SCREEN_TEXT if legacy_mode == MODE_CHAT
+            else PLATFORM_SEARCH_SCREEN_TEXT
         )
+        await edit_safe(query, text, _mode_keyboard(legacy_mode))
         return
 
     if data == "account":
@@ -5338,6 +5277,54 @@ def _assistant_action_rows(actions):
     return rows
 
 
+ASSISTANT_MENU_TEXT = (
+    "🤖 *مساعد MEDBOT*\n\n"
+    "اختر الوضع المناسب:\n\n"
+    "🔎 *بحث موارد المنصة* — يجد الأقسام والموارد المسجّلة فعلاً "
+    "ويوصلك إليها مباشرة بزر واحد.\n\n"
+    "🤖 *المحادثة الذكية* — يجيب عن أسئلتك الطبية والعامة بشرح مختصر."
+)
+
+PLATFORM_SEARCH_SCREEN_TEXT = (
+    "🔎 *بحث موارد MEDBOT*\n\n"
+    "اكتب ما تبحث عنه بالعربية أو الإنجليزية أو العامية.\n"
+    "مثال: «وين الميكرو العملي؟» أو «محتوى الهستو».\n\n"
+    "سأبحث في الموارد المسجّلة فعلاً وأعطيك زر وصول مباشر.\n\n"
+    "✍️ اكتب طلبك الآن."
+)
+
+AI_CHAT_SCREEN_TEXT = (
+    "🤖 *المحادثة الذكية*\n\n"
+    "اسأل عن أي موضوع طبي أو عام.\n"
+    "الأسئلة الطبية تُجاب بالإنجليزية ثم شرح عربي موجز.\n\n"
+    "✍️ اكتب سؤالك الآن."
+)
+
+
+def _assistant_menu_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [btn("🔎 بحث موارد المنصة", MODE_PLATFORM)],
+            [btn("🤖 المحادثة الذكية", MODE_CHAT)],
+            [btn("🏠 الرئيسية", "home")],
+        ]
+    )
+
+
+def _mode_keyboard(mode):
+    """Keyboard shown while a student is typing in one assistant mode."""
+    other = MODE_CHAT if mode in PLATFORM_MODES else MODE_PLATFORM
+    other_label = (
+        "🤖 المحادثة الذكية" if other == MODE_CHAT else "🔎 بحث موارد المنصة"
+    )
+    return InlineKeyboardMarkup(
+        [
+            [btn(other_label, other)],
+            [btn("🏠 الرئيسية", "home")],
+        ]
+    )
+
+
 async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -5420,35 +5407,28 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _feature_offline_notice(update, "assistant"):
         return
 
-    # Legacy standalone search mode (the /search command) still resolves
-    # deterministically; the unified assistant supersedes the two former
-    # assistant modes.
+    # Legacy standalone search mode (the /search command) routes to the
+    # platform-search workflow.
     if context.user_data.get("search_mode"):
         context.user_data["search_mode"] = False
         context.user_data["assistant_mode"] = None
         await run_search(update, query)
         return
 
-    # Explicit /ask always means the unified assistant.
+    # Explicit /ask always means AI Chat (the conversational mode).
     if query.startswith("/ask"):
         query = query.replace("/ask", "", 1).strip()
-        context.user_data["assistant_mode"] = "unified"
+        context.user_data["assistant_mode"] = MODE_CHAT
 
     assistant_mode = context.user_data.get("assistant_mode")
 
-    # The student is not inside the assistant: do not silently guess intent,
-    # just point them at the single assistant entry point.
-    if assistant_mode != "unified":
+    # The student is not inside either assistant mode: do not silently guess,
+    # just open the mode chooser.
+    if assistant_mode not in (PLATFORM_MODES | CHAT_MODES):
         await update.message.reply_text(
-            "🤖 *مساعد MEDBOT*\n\n"
-            "اضغط الزر بالأسفل ثم اكتب سؤالك أو اسم المورد.",
+            ASSISTANT_MENU_TEXT,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [btn("🤖 فتح مساعد MEDBOT", "assistant")],
-                    [btn("🏠 الرئيسية", "home")],
-                ]
-            ),
+            reply_markup=_assistant_menu_keyboard(),
         )
         return
 
@@ -5480,8 +5460,16 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    # Two independent workflows: platform search reads the registry and
+    # returns verified access buttons; AI chat answers questions and never
+    # touches the registry.
     try:
-        ai_result = await generate_medbot_unified_result(query, user_id=user.id)
+        if assistant_mode in CHAT_MODES:
+            ai_result = await generate_ai_chat_result(query, user_id=user.id)
+        else:
+            ai_result = await generate_platform_search_result(
+                query, user_id=user.id
+            )
     except Exception:
         logger.exception("AI request failed")
         ai_result = {

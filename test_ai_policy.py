@@ -161,7 +161,7 @@ class RegistryOverviewTests(PolicyBase):
 class ResourceLookupTests(PolicyBase):
     def test_nonexistent_resource_is_refused_verbatim(self):
         result = self.run_ai("هل يوجد First Year؟")
-        self.assertEqual(result["text"], ai.NOT_REGISTERED_MESSAGE)
+        self.assertEqual(result["text"], ai.PLATFORM_SEARCH_NO_MATCH)
         self.assertNotIn("First Year", result["text"])
 
     def test_real_resource_returns_actual_path(self):
@@ -193,7 +193,7 @@ class ResourceLookupTests(PolicyBase):
 
     def test_unregistered_lookup_offers_no_actions(self):
         result = self.run_ai("هل يوجد قسم اسمه Neurology الموجود؟")
-        if result["text"] == ai.NOT_REGISTERED_MESSAGE:
+        if result["text"] == ai.PLATFORM_SEARCH_NO_MATCH:
             self.assertEqual(result["actions"], [])
 
 
@@ -379,7 +379,7 @@ class TelegramHandlerTests(PolicyBase):
 
     def test_nonexistent_resource_through_handler_is_refused(self):
         delivered, callbacks = self._send("هل يوجد First Year؟")
-        self.assertIn(ai.NOT_REGISTERED_MESSAGE, delivered)
+        self.assertIn(ai.PLATFORM_SEARCH_NO_MATCH, delivered)
         self.assertNotIn("Second Year", delivered)
         # Only the "home" button remains: no invented resource is reachable.
         self.assertEqual(callbacks, {"home"})

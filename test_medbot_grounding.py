@@ -135,11 +135,12 @@ class UnifiedAssistantTests(unittest.TestCase):
         answer = asyncio.run(ai.generate_medbot_unified_response("   "))
         self.assertIn("سؤال واضح", answer)
 
-    def test_no_provider_returns_grounded_results_for_known_resource(self):
+    def test_no_provider_returns_honest_notice_without_inventing(self):
+        # "Anatomy" is a medical concept, so the legacy auto-router sends it to
+        # AI Chat. With no provider there is no answer; it must say so rather
+        # than invent medical content or a MEDBOT resource.
         answer = asyncio.run(ai.generate_medbot_unified_response("Anatomy"))
-        self.assertIn("Anatomy", answer)
-        self.assertIn("MEDBOT", answer)
-        # The unfound resource must never be invented.
+        self.assertIn("الذكاء الاصطناعي", answer)
         self.assertNotIn("Pharmacology", answer)
 
     def test_no_provider_and_no_match_does_not_invent(self):
@@ -147,7 +148,6 @@ class UnifiedAssistantTests(unittest.TestCase):
             ai.generate_medbot_unified_response("zzz-does-not-exist-zzz")
         )
         self.assertNotIn("zzz-does-not-exist-zzz", answer)
-        self.assertIn("MEDBOT", answer)
 
     def test_catalog_renders_registered_folder_and_content(self):
         folders, contents, paths = asyncio.run(
