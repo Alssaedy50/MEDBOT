@@ -150,6 +150,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             "msg_reply:",
             # RBAC admin management + audit viewer (isolated modules).
             "amg_view:abc",
+            "amg_preview:abc",
             "amg_perm:1",
             "amg_perm:abc:can_ai",
             "amg_role:abc:admin",

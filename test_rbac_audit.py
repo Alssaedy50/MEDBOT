@@ -570,6 +570,154 @@ class AdminManagementTests(RBACBase):
 
 
 # ---------------------------------------------------------------
+# Adding an admin by @username / Telegram ID (lookup fix)
+# ---------------------------------------------------------------
+
+
+class AddAdminLookupTests(RBACBase):
+    """A user who has ever used the bot is recognised from the registry."""
+
+    async def _manage(self, user_id, data):
+        query = _FakeQuery(user_id, data)
+        ctx = _FakeContext()
+        await admin_management.admin_management_callback_handler(
+            _FakeUpdate(query), ctx
+        )
+        return query, ctx
+
+    async def _add_via_text(self, identifier):
+        _, ctx = await self._manage(self.owner_id, "amg_add")
+        msg = _TextMessage(identifier)
+        update = _MediaUpdate(self.owner_id, msg)
+        handled = await admin_management.handle_add_admin_text(update, ctx)
+        self.assertTrue(handled)
+        return msg
+
+    async def test_add_by_at_username_of_existing_user(self):
+        # The user has used the bot before (registry row exists); no /start.
+        await database.register_user(4242, "DrWho", "Dr Who")
+
+        msg = await self._add_via_text("@DrWho")
+        self.assertIn("تمت إضافة المشرف بنجاح", msg.replies[-1])
+        self.assertTrue(await database.is_user_admin(4242))
+
+    async def test_add_by_username_without_at_and_case_insensitive(self):
+        await database.register_user(4343, "CardioDoc", "Cardio Doc")
+
+        msg = await self._add_via_text("cardiodoc")
+        self.assertIn("تمت إضافة المشرف بنجاح", msg.replies[-1])
+        self.assertTrue(await database.is_user_admin(4343))
+
+    async def test_add_by_telegram_id(self):
+        await database.register_user(4444, "physio", "Physio User")
+
+        msg = await self._add_via_text("4444")
+        self.assertIn("تمت إضافة المشرف بنجاح", msg.replies[-1])
+        self.assertTrue(await database.is_user_admin(4444))
+
+    async def test_add_creates_no_duplicate_user_row(self):
+        await database.register_user(4545, "unique_user", "Unique User")
+        before = await database.get_all_user_ids()
+
+        await self._add_via_text("@unique_user")
+
+        after = await database.get_all_user_ids()
+        self.assertEqual(sorted(before), sorted(after))
+        self.assertEqual(after.count(4545), 1)
+
+    async def test_add_unknown_username_reports_clearly(self):
+        msg = await self._add_via_text("@ghost_account")
+
+        self.assertIn("لا يوجد حساب", msg.replies[-1])
+        self.assertIn("Telegram ID", msg.replies[-1])
+        # Nothing was created for an unknown handle.
+        admins = {r["telegram_id"] for r in await database.get_admins_full_records()}
+        self.assertNotIn(0, admins)
+
+    async def test_add_existing_admin_resets_to_least_privilege(self):
+        await database.register_user(4646, "reviewer_x", "Reviewer X")
+        await database.apply_role_preset(4646, "reviewer")
+
+        await self._add_via_text("@reviewer_x")
+
+        record = await database.get_admin_record(4646)
+        self.assertEqual(record["role"], "admin")
+        self.assertFalse(await database.user_has_permission(4646, "can_folders"))
+
+    async def test_add_owner_is_refused_and_owner_kept_intact(self):
+        await database.ensure_configured_admin(self.owner_id)
+        await database.register_user(self.owner_id, "the_owner", "The Owner")
+
+        msg = await self._add_via_text("@the_owner")
+
+        self.assertIn("المالك", msg.replies[-1])
+        record = await database.get_admin_record(self.owner_id)
+        self.assertEqual(record["role"], "owner")
+        self.assertTrue(await database.is_owner(self.owner_id))
+
+
+# ---------------------------------------------------------------
+# Owner/admin preview of another admin's access (read-only)
+# ---------------------------------------------------------------
+
+
+class AdminPreviewTests(RBACBase):
+    async def test_non_admin_cannot_preview(self):
+        query, _ = await self._manage_target(self.student_id, self.sub_id)
+        self.assertIn("غير مصرح", query.last_text)
+
+    async def _manage_target(self, actor_id, target_id):
+        query = _FakeQuery(actor_id, f"amg_preview:{target_id}")
+        await admin_management.admin_management_callback_handler(
+            _FakeUpdate(query), _FakeContext()
+        )
+        return query, None
+
+    async def test_preview_lists_real_permissions_read_only(self):
+        await database.ensure_configured_admin(self.owner_id)
+        await database.apply_role_preset(self.sub_id, "reviewer")
+
+        record_before = await database.get_admin_record(self.sub_id)
+        query, _ = await self._manage_target(self.owner_id, self.sub_id)
+
+        text = query.last_text or ""
+        self.assertIn("معاينة واجهة المشرف", text)
+        self.assertIn(database.PERMISSION_LABELS["can_contributions"], text)
+        self.assertIn(database.PERMISSION_LABELS["can_messages"], text)
+        # Owner-only capability is never shown as granted to a reviewer.
+        self.assertNotIn(database.PERMISSION_LABELS["can_admins"], text)
+
+        # Nothing about the target was mutated by a preview.
+        record_after = await database.get_admin_record(self.sub_id)
+        self.assertEqual(record_before["role"], record_after["role"])
+        self.assertEqual(
+            record_before["permissions"], record_after["permissions"]
+        )
+
+    async def test_preview_does_not_change_caller_identity_or_create_session(self):
+        await database.ensure_configured_admin(self.owner_id)
+
+        # The caller remains the owner; the target gains nothing.
+        await self._manage_target(self.owner_id, self.sub_id)
+        self.assertTrue(await database.is_owner(self.owner_id))
+        self.assertFalse(await database.user_has_permission(self.owner_id, "can_x"))
+        # The previewed sub-admin is untouched and still not an owner.
+        self.assertFalse(await database.is_owner(self.sub_id))
+
+    async def test_preview_of_unknown_admin_is_honest(self):
+        await database.ensure_configured_admin(self.owner_id)
+        query, _ = await self._manage_target(self.owner_id, 999999)
+        self.assertIn("غير موجود", query.last_text)
+
+    async def test_preview_is_audited(self):
+        await database.ensure_configured_admin(self.owner_id)
+        await self._manage_target(self.owner_id, self.sub_id)
+        rows = await database.get_audit_entries(action="admin_preview")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], self.owner_id)
+
+
+# ---------------------------------------------------------------
 # End-to-end: gated admin operations emit exactly one audit row
 # ---------------------------------------------------------------
 
