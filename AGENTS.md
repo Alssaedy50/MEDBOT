@@ -445,11 +445,42 @@ Both consume one daily quota unit per call and return
   (approved contribution) call it right after `database.add_content`, inside
   their own try/except, so it can never fail, delay or roll back the resource
   write.
-- Phase 3 (Scoped Admin / RBAC over a subject/folder) still needs only a scope
-  layer over the same tables: `news.section_folder_id`/`subject_folder_id`
-  already carry the scope, and every admin mutation already goes through the
-  `can_news` gate + audit. No news rewrite is required.
+- Phase 3 (Scoped Admin / RBAC over a subject/folder) is implemented: a scope
+  layer over the same tables. `news.section_folder_id`/`subject_folder_id` (and
+  the referenced resource's folder) carry the scope, and every admin mutation
+  goes through the `can_news` capability + the scope layer + audit.
 
+## Scoped RBAC (Phase 3)
+- `authorization.py` is the ONLY place that combines a capability with a scope.
+  Handlers call `authorization.can(...)`/`require(...)` (or the wrappers); they
+  never re-implement the decision. Deny-by-default order: active admin -> known
+  scoped op -> role clears the coarse key -> `admin_has_scopes` -> target in
+  scope. Unknown permission, unknown/global target, or a target whose row was
+  deleted -> DENY (fail-closed). It never raises.
+- Scopes are **opt-in**: an admin with no `admin_scopes` rows keeps the
+  pre-Phase-3 platform-wide reach, so installing the phase revokes nothing.
+  `SCOPE_TYPES` = `folder` (subtree), `topic` (folders linked to a Search
+  Topic), `resource` (one content row); `SCOPED_PERMISSIONS` maps each scoped op
+  to exactly one coarse `PERMISSION_KEYS` entry via `SCOPED_PERMISSION_COARSE`.
+- `admin_scopes` (v16) is keyed UNIQUE `(admin_id, scope_type, scope_id)`;
+  `scope_id` is a polymorphic reference (no FK), always validated against the
+  live registry by `add_admin_scope` and re-resolved at decision time, so a
+  deleted target simply matches nothing. Never store a scope without the target
+  row existing.
+- Target testers: `folder_in_admin_scope` (ancestor walk), `resource_in_admin_scope`
+  (direct resource scope, else its real folder), `is_topic_in_admin_scope`
+  (exact topic), `news_scope_folder_ids`/`news_resource_id` (a news item is in
+  scope when any real folder it references — or its resource — is),
+  `contribution_folder_id`. A global operation (broadcast) has no target, so a
+  scope-restricted admin is always refused; unscoped admins/owner are unchanged.
+- List filtering: `scoped_folder_ids` (folders) and `list_news_ids_for_admin`
+  (news) return the reachable set for a restricted admin, or None when
+  platform-wide. Movement pickers must not offer the root or an out-of-scope
+  branch to a restricted admin.
+- Owner-only by design: `can_admins` and the whole `admin_management` scope
+  surface. Owner protection (single owner) is unchanged; the owner is
+  unrestricted and is refused a scope grant/revoke.
+- Audit events: `scope_grant`, `scope_revoke`, `authz_denied`.
 
 ## Emergency Resource Archive (disaster recovery)
 - `archive.py` is the ONLY archive implementation: it mirrors registered
@@ -489,7 +520,13 @@ Both consume one daily quota unit per call and return
 
 ## Testing
 - `python -m py_compile` all modules.
-- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update test_medbot_fixes test_visibility test_ai_policy test_ai_modes test_archive_sync test_news_core test_news_phase2 test_news_phase2_fixes`
+- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update test_medbot_fixes test_visibility test_ai_policy test_ai_modes test_archive_sync test_news_core test_news_phase2 test_news_phase2_fixes test_news_phase3`
+- `test_news_phase3.py` pins Scoped RBAC: migration v16 additive/idempotent,
+  deny-by-default with no scope rows = platform-wide, fail-closed on a deleted
+  target, folder/topic/resource/news/contribution scope resolution, the
+  scope-restricted admin being refused a global broadcast, the owner-only scope
+  surface, audit events, and that the existing permission/resource/broadcast
+  systems are unaffected.
 - `test_ai_policy.py` pins the AI behavior policy: intent classification,
   resource-hallucination refusal, and that only the medical path fetches
   PubMed. It never calls a real provider.
