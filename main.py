@@ -2673,6 +2673,15 @@ async def _register_admin_upload(query, context, preview):
     except Exception:
         logger.exception("Archive mirror failed for content id=%s", content_id)
 
+    # Best-effort 🟢 news for the new resource (Phase 2). Idempotent and
+    # failure-isolated: it never delays or fails the resource registration.
+    try:
+        await news.publish_news_for_resource(
+            context.bot, content_id, sender_id=query.from_user.id
+        )
+    except Exception:
+        logger.exception("Auto resource news failed for content id=%s", content_id)
+
     await edit_safe(
         query,
         "✅ <b>تم تسجيل المورد بنجاح.</b>\n\n"
@@ -4032,6 +4041,17 @@ async def process_approval(query, contribution_id, approve):
                         result[5],
                     )
 
+                # Best-effort 🟢 news for the approved resource (Phase 2).
+                try:
+                    await news.publish_news_for_resource(
+                        query.get_bot(), result[5], sender_id=query.from_user.id
+                    )
+                except Exception:
+                    logger.exception(
+                        "Auto resource news failed for approved content id=%s",
+                        result[5],
+                    )
+
     except Exception as exc:
         logger.exception("Contribution approval/rejection failed")
         await edit_safe(
@@ -4222,7 +4242,10 @@ def _feature_for_callback(data: str):
     if data == "topics" or data.startswith("topic_open:"):
         return "topics"
     if data == "news" or data.startswith(
-        ("news_open:", "news_more:", "news_filter:", "news_readall")
+        (
+            "news_open:", "news_more:", "news_filter:", "news_readall",
+            "news_subs", "news_sub:", "news_subs_section:",
+        )
     ):
         return "news"
     if data == "contact" or data.startswith("msg_"):

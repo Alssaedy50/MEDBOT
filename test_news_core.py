@@ -657,7 +657,7 @@ class NewsHomeBadgeTests(NewsBase):
 class NewsAdminTests(NewsBase):
     async def test_owner_can_open_news_admin(self):
         query, _ = await self._open(self.owner_id, "admin_news", _FakeContext())
-        self.assertIn("إدارة الأخبار", query.last_text)
+        self.assertIn("مركز النشر", query.last_text)
 
     async def test_student_cannot_open_news_admin(self):
         query, _ = await self._open(self.student_id, "admin_news", _FakeContext())
@@ -818,11 +818,16 @@ class NewsWizardTests(NewsBase):
         self.assertTrue(handled)
         handled, msg = await self._text(self.owner_id, "10:00 in hall 3", ctx)
         self.assertTrue(handled)
+        # Phase 2: doctor and event are optional steps (skip both).
+        await self._text(self.owner_id, "Dr. Ali", ctx)
+        await self._text(self.owner_id, "12:00", ctx)
 
         drafts = await database.list_news(status="draft")
         self.assertEqual(len(drafts), 1)
         self.assertEqual(drafts[0]["title"], "Lecture today")
         self.assertEqual(drafts[0]["body"], "10:00 in hall 3")
+        self.assertEqual(drafts[0]["doctor"], "Dr. Ali")
+        self.assertEqual(drafts[0]["event_at"], "12:00")
         self.assertEqual(drafts[0]["status"], "draft")
 
     async def test_wizard_skip_body(self):
@@ -830,8 +835,12 @@ class NewsWizardTests(NewsBase):
         await self._open(self.owner_id, "news_new:section", ctx)
         await self._text(self.owner_id, "Micro news", ctx)
         await self._text(self.owner_id, "/skip", ctx)
+        await self._text(self.owner_id, "/skip", ctx)
+        await self._text(self.owner_id, "/skip", ctx)
         draft = (await database.list_news(status="draft"))[0]
         self.assertIsNone(draft["body"])
+        self.assertIsNone(draft["doctor"])
+        self.assertIsNone(draft["event_at"])
 
     async def test_wizard_cancel_creates_nothing(self):
         ctx = _FakeContext()
@@ -850,6 +859,8 @@ class NewsWizardTests(NewsBase):
         await self._open(self.owner_id, "news_new:notify", ctx)
         await self._text(self.owner_id, "Title", ctx)
         await self._text(self.owner_id, "Body", ctx)
+        await self._text(self.owner_id, "/skip", ctx)
+        await self._text(self.owner_id, "/skip", ctx)
         for key in news._ALL_STATE_KEYS:
             self.assertNotIn(key, ctx.user_data)
 

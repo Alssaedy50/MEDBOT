@@ -214,6 +214,7 @@ async def init_db():
         await _migrate_v11(db)
         await _migrate_v12(db)
         await _migrate_v13(db)
+        await _migrate_v14(db)
 
         # ------------------------------------------------------------
         # Performance / integrity indexes
@@ -959,6 +960,21 @@ NEWS_VISIBILITIES = ("all", "students")
 # column never has to be added later (no breaking redesign).
 NEWS_DELIVERY_SCOPES = ("all", "subscribed")
 
+# Phase 2 — subscriptions live in `news_subscriptions(user_id, topic_kind,
+# topic_value)`. `type` subscribes to a whole news kind (topic_value is one of
+# NEWS_TYPES); `section` subscribes to one real folder (topic_value is the
+# folder id as text). No new taxonomy is introduced: a section is a folder.
+NEWS_SUB_TYPE = "type"
+NEWS_SUB_SECTION = "section"
+NEWS_SUB_KINDS = (NEWS_SUB_TYPE, NEWS_SUB_SECTION)
+
+# Phase 2 — private delivery lifecycle per (news, user). `skipped` records a
+# recipient who was no longer relevant at send time; `failed` is retryable.
+NEWS_DELIVERY_STATUSES = ("pending", "sent", "failed", "skipped")
+
+# `news.source` value for a resource-generated news row.
+NEWS_SOURCE_AUTO = "resource"
+
 MAX_NEWS_TITLE_LENGTH = 200
 MAX_NEWS_BODY_LENGTH = 3000
 MAX_NEWS_DOCTOR_LENGTH = 120
@@ -1059,6 +1075,61 @@ async def _migrate_v13(db):
         except Exception:
             logger.exception("Migration v13: statement failed")
     logger.info("Migration v13: ensured news core tables")
+
+
+def _migrate_v14_sql():
+    """DDL statements owned by migration v14, exposed for testing/review."""
+    return (
+        """
+        CREATE TABLE IF NOT EXISTS news_deliveries (
+            news_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            kind TEXT,
+            channel TEXT NOT NULL DEFAULT 'private',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            channel_message_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (news_id, user_id),
+            FOREIGN KEY (news_id) REFERENCES news (id) ON DELETE CASCADE
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_news_deliveries_status "
+        "ON news_deliveries(status)",
+        "CREATE INDEX IF NOT EXISTS idx_news_deliveries_user "
+        "ON news_deliveries(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_news_deliveries_news "
+        "ON news_deliveries(news_id, status)",
+        "CREATE INDEX IF NOT EXISTS idx_news_subs_topic "
+        "ON news_subscriptions(topic_kind, topic_value)",
+    )
+
+
+async def _migrate_v14(db):
+    """Phase 2 News: private-delivery tracking.
+
+    Adds the ``news_deliveries`` table, keyed by ``(news_id, user_id)`` so the
+    same item can never be delivered to the same student twice — a restart, a
+    retry, a repeated publish or a crash all converge on one row and one
+    Telegram message. Status is one of ``pending`` / ``sent`` / ``failed`` /
+    ``skipped``; ``attempts`` + ``error`` make a failure auditable and
+    retryable. ``kind`` records the delivery reason (news type or section) and
+    ``channel``/``channel_message_id`` the transport, so a future transport is
+    a value change, not a schema change.
+
+    Subscriptions need no new table: Phase 1's ``news_subscriptions`` already
+    carries ``(user_id, topic_kind, topic_value)``. This migration only adds
+    the index the delivery target query needs. Additive, idempotent, and safe
+    on an existing database (never rewrites or drops).
+    """
+    for statement in _migrate_v14_sql():
+        try:
+            await db.execute(statement)
+        except Exception:
+            logger.exception("Migration v14: statement failed")
+    logger.info("Migration v14: ensured news delivery tracking table")
 
 # Message categories and lifecycle states.
 MESSAGE_CATEGORIES = ("message", "summary", "suggestion", "report")
@@ -3462,13 +3533,39 @@ async def get_news_counts_by_type() -> dict:
 
 
 async def add_news_subscription(user_id, topic_kind: str, topic_value: str) -> bool:
-    """Phase 2 stub: reserve the write path so the schema is exercised."""
+    """Subscribe a user to a news topic. Idempotent and validated.
+
+    ``topic_kind='type'`` accepts a real news kind (``notify``/``section``/
+    ``resource``); ``'section'`` accepts a real folder id. A bogus kind or a
+    folder that does not exist is rejected, so a subscription can never point
+    at a non-existent entity. Re-subscribing is a no-op (PRIMARY KEY).
+    """
+    topic_kind = str(topic_kind or "").strip()
+    if topic_kind not in NEWS_SUB_KINDS:
+        return False
+    topic_value = str(topic_value or "").strip()
+    if not topic_value:
+        return False
+
     db = await get_db()
     try:
+        if topic_kind == NEWS_SUB_TYPE:
+            if topic_value not in NEWS_TYPES:
+                return False
+        else:  # section
+            folder_id = _int_or_none(topic_value)
+            if folder_id is None:
+                return False
+            async with db.execute(
+                "SELECT id FROM folders WHERE id = ?", (folder_id,)
+            ) as cur:
+                if not await cur.fetchone():
+                    return False
+
         await db.execute(
             "INSERT OR IGNORE INTO news_subscriptions "
             "(user_id, topic_kind, topic_value) VALUES (?, ?, ?)",
-            (_int_or_none(user_id), str(topic_kind), str(topic_value)),
+            (_int_or_none(user_id), topic_kind, topic_value),
         )
         await db.commit()
         return True
@@ -3477,6 +3574,327 @@ async def add_news_subscription(user_id, topic_kind: str, topic_value: str) -> b
         return False
     finally:
         await db.close()
+
+
+async def remove_news_subscription(user_id, topic_kind: str, topic_value: str) -> bool:
+    """Unsubscribe a user from a news topic. Returns True when a row removed."""
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "DELETE FROM news_subscriptions "
+            "WHERE user_id = ? AND topic_kind = ? AND topic_value = ?",
+            (_int_or_none(user_id), str(topic_kind), str(topic_value)),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def get_news_subscriptions_map(user_ids=None) -> dict:
+    """{user_id: [(kind, value), ...]} for target resolution without N+1.
+
+    When ``user_ids`` is given the result is limited to those users (and a
+    user with no rows is simply absent, not filled with an empty list).
+    """
+    db = await get_db()
+    try:
+        if user_ids is None:
+            async with db.execute(
+                "SELECT user_id, topic_kind, topic_value FROM news_subscriptions"
+            ) as cur:
+                rows = await cur.fetchall()
+        else:
+            ids = [_int_or_none(uid) for uid in user_ids]
+            ids = [i for i in ids if i is not None]
+            if not ids:
+                return {}
+            placeholders = ",".join("?" for _ in ids)
+            async with db.execute(
+                "SELECT user_id, topic_kind, topic_value FROM news_subscriptions "
+                f"WHERE user_id IN ({placeholders})",
+                tuple(ids),
+            ) as cur:
+                rows = await cur.fetchall()
+
+        mapping: dict = {}
+        for user_id, kind, value in rows:
+            mapping.setdefault(user_id, []).append((kind, value))
+        return mapping
+    finally:
+        await db.close()
+
+
+async def resolve_news_recipients(news_type: str, section_folder_id=None) -> list:
+    """The user ids subscribed to receive `news_type` privately.
+
+    Important (``notify``)  -> subscribers of the ``notify`` type.
+    Resource (``resource``) -> subscribers of the ``resource`` type.
+    Section (``section``)   -> subscribers of the ``section`` type, plus
+        subscribers of that exact section folder. A section news that carries
+        no section reference reaches only the broad ``section`` subscribers.
+
+    One query per subscription shape (never per user), de-duplicated, so the
+    target set for a large audience is still cheap.
+    """
+    news_type = str(news_type or "").strip()
+    if news_type not in NEWS_TYPES:
+        return []
+
+    clauses = ["(topic_kind = ? AND topic_value = ?)"]
+    params = [NEWS_SUB_TYPE, news_type]
+
+    if news_type == "section" and section_folder_id is not None:
+        folder_id = _int_or_none(section_folder_id)
+        if folder_id is not None:
+            clauses.append("(topic_kind = ? AND topic_value = ?)")
+            params.extend([NEWS_SUB_SECTION, str(folder_id)])
+
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT DISTINCT user_id FROM news_subscriptions "
+            f"WHERE {' OR '.join(clauses)} ORDER BY user_id",
+            tuple(params),
+        ) as cur:
+            return [row[0] for row in await cur.fetchall()]
+    finally:
+        await db.close()
+
+
+async def reserve_news_deliveries(news_id, user_ids, kind: str = None) -> list:
+    """Create a ``pending`` delivery row per recipient; return the NEW ones.
+
+    ``INSERT OR IGNORE`` on the ``(news_id, user_id)`` primary key makes the
+    reservation idempotent: a recipient already recorded (pending/sent/failed/
+    skipped) is not returned again, so a retry or a repeated publish never
+    queues a second delivery.
+    """
+    news_id = _int_or_none(news_id)
+    if news_id is None:
+        return []
+
+    reserved = []
+    db = await get_db()
+    try:
+        for user_id in user_ids:
+            user_id = _int_or_none(user_id)
+            if user_id is None:
+                continue
+            cur = await db.execute(
+                "INSERT OR IGNORE INTO news_deliveries "
+                "(news_id, user_id, status, kind) VALUES (?, ?, 'pending', ?)",
+                (news_id, user_id, kind),
+            )
+            if cur.rowcount:
+                reserved.append(user_id)
+        await db.commit()
+        return reserved
+    finally:
+        await db.close()
+
+
+async def get_pending_news_deliveries(news_id: int, retry_failed: bool = True) -> list:
+    """Recipient ids whose delivery is still ``pending`` (and ``failed`` when
+    ``retry_failed``). ``sent``/``skipped`` rows are terminal and never resent.
+    """
+    news_id = _int_or_none(news_id)
+    if news_id is None:
+        return []
+    statuses = ("pending", "failed") if retry_failed else ("pending",)
+
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT user_id FROM news_deliveries "
+            "WHERE news_id = ? AND status IN (?, ?) ORDER BY user_id",
+            (news_id, statuses[0], statuses[-1]),
+        ) as cur:
+            return [row[0] for row in await cur.fetchall()]
+    finally:
+        await db.close()
+
+
+async def mark_news_delivery(news_id, user_id, status: str, error: str = None,
+                             channel_message_id=None) -> bool:
+    """Record the outcome of one delivery attempt (upsert semantics).
+
+    Increments ``attempts`` on every call. A ``sent`` row is terminal: it is
+    never overwritten, so a late/duplicate attempt cannot reopen it.
+    """
+    if status not in NEWS_DELIVERY_STATUSES:
+        return False
+    news_id = _int_or_none(news_id)
+    user_id = _int_or_none(user_id)
+    if news_id is None or user_id is None:
+        return False
+
+    if error is not None:
+        error = str(error)[:500]
+
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT status FROM news_deliveries WHERE news_id = ? AND user_id = ?",
+            (news_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+
+        if row is None:
+            await db.execute(
+                "INSERT INTO news_deliveries "
+                "(news_id, user_id, status, attempts, error, channel_message_id, "
+                " updated_at) VALUES (?, ?, ?, 1, ?, ?, CURRENT_TIMESTAMP)",
+                (news_id, user_id, status, error, channel_message_id),
+            )
+            await db.commit()
+            return True
+
+        if row[0] == "sent":
+            return True  # terminal; keep the successful record
+
+        await db.execute(
+            "UPDATE news_deliveries SET status = ?, attempts = attempts + 1, "
+            "error = ?, channel_message_id = COALESCE(?, channel_message_id), "
+            "updated_at = CURRENT_TIMESTAMP "
+            "WHERE news_id = ? AND user_id = ?",
+            (status, error, channel_message_id, news_id, user_id),
+        )
+        await db.commit()
+        return True
+    finally:
+        await db.close()
+
+
+async def get_news_delivery_counts(news_id: int) -> dict:
+    """{status: count} for one news item (admin delivery log)."""
+    news_id = _int_or_none(news_id)
+    if news_id is None:
+        return {}
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT status, COUNT(*) FROM news_deliveries "
+            "WHERE news_id = ? GROUP BY status",
+            (news_id,),
+        ) as cur:
+            return {row[0]: row[1] for row in await cur.fetchall()}
+    finally:
+        await db.close()
+
+
+async def get_news_deliveries(news_id: int, status: str = None, limit: int = 50) -> list:
+    """Delivery rows for one news item, newest attempt first (bounded)."""
+    news_id = _int_or_none(news_id)
+    if news_id is None:
+        return []
+    try:
+        limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        limit = 50
+
+    clause = ""
+    params = [news_id]
+    if status in NEWS_DELIVERY_STATUSES:
+        clause = " AND status = ?"
+        params.append(status)
+
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT user_id, status, kind, attempts, error, updated_at "
+            f"FROM news_deliveries WHERE news_id = ?{clause} "
+            "ORDER BY updated_at DESC, user_id ASC LIMIT ?",
+            tuple(params) + (limit,),
+        ) as cur:
+            return [
+                {
+                    "user_id": row[0],
+                    "status": row[1],
+                    "kind": row[2],
+                    "attempts": row[3],
+                    "error": row[4],
+                    "updated_at": row[5],
+                }
+                for row in await cur.fetchall()
+            ]
+    finally:
+        await db.close()
+
+
+async def get_resource_news_for_content(content_id):
+    """The auto-generated resource news row for a content id, or None.
+
+    Lets resource creation stay idempotent: the same resource can never spawn
+    two 🟢 news rows.
+    """
+    content_id = _int_or_none(content_id)
+    if content_id is None:
+        return None
+    db = await get_db()
+    try:
+        async with db.execute(
+            f"SELECT {_NEWS_COLUMNS} FROM news "
+            "WHERE resource_id = ? AND source = ? ORDER BY id ASC LIMIT 1",
+            (content_id, NEWS_SOURCE_AUTO),
+        ) as cur:
+            row = await cur.fetchone()
+        return _news_row_to_dict(row) if row else None
+    finally:
+        await db.close()
+
+
+async def create_resource_news_for_content(content_id, sender_id=None,
+                                          status: str = "draft") -> int:
+    """Create (once) the 🟢 news row for a registered resource.
+
+    Resolves the resource's REAL folder from the registry and stores the
+    section reference (plus its parent as the subject when one exists), so the
+    generated news is navigable through the same section as the resource. If a
+    row already exists for this content id it is returned unchanged, making
+    this safe to call from a retry, a restart or a repeated approval.
+    Returns None when the content row does not exist.
+    """
+    content_id = _int_or_none(content_id)
+    if content_id is None:
+        return None
+
+    existing = await get_resource_news_for_content(content_id)
+    if existing:
+        return existing["id"]
+
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT id, folder_id, title FROM content WHERE id = ?",
+            (content_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return None
+        _cid, folder_id, title = row
+
+        subject_id = None
+        if folder_id is not None:
+            async with db.execute(
+                "SELECT parent_id FROM folders WHERE id = ?", (folder_id,)
+            ) as cur:
+                parent = await cur.fetchone()
+            if parent and parent[0] is not None:
+                subject_id = parent[0]
+    finally:
+        await db.close()
+
+    return await create_news(
+        news_type="resource",
+        title=title or "مورد جديد",
+        sender_id=sender_id,
+        subject_folder_id=subject_id,
+        section_folder_id=folder_id,
+        resource_id=content_id,
+        status=status,
+        source=NEWS_SOURCE_AUTO,
+    )
 
 
 def _int_or_none(value):

@@ -63,8 +63,11 @@ WORKFLOWS = {
     "notification_body": ("notifications_body",),
     "news_draft": (
         "news_new_type",
+        "news_new_step",
         "news_new_title",
         "news_new_body",
+        "news_new_doctor",
+        "news_new_event",
         "news_new_section",
         "news_new_resource",
     ),

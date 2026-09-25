@@ -178,8 +178,9 @@ Both consume one daily quota unit per call and return
   `content`; `_migrate_v11` heals a database left with more than one `owner` row
   (keeps the persisted owner, demotes the rest to `admin`); `_migrate_v12`
   creates the isolated `archive_sync` mirror table; `_migrate_v13` creates the
-  News Core tables (`news`/`news_reads`/`news_subscriptions`). Never rewrite
-  v1..v4.
+  News Core tables (`news`/`news_reads`/`news_subscriptions`); `_migrate_v14`
+  creates the News private-delivery table (`news_deliveries`, keyed by
+  `(news_id, user_id)`). Never rewrite v1..v4.
 - Role scope is explicit: `ROLE_PERMISSION_PRESETS` maps each role to a baseline
   capability set (owner = all, admin = all except `can_admins`, reviewer =
   contributions + messages, none = nothing) and `ROLE_DESCRIPTIONS` is the
@@ -358,6 +359,71 @@ Both consume one daily quota unit per call and return
   workflow + subscriptions + private delivery + resource-generated news) and
   Phase 3 (Scoped Admin / RBAC over a subject/folder) without a redesign.
 
+## News Phase 2 (النشر + الاشتراكات + التوصيل) — built on the Phase 1 Core
+- `_migrate_v14` adds `news_deliveries`, keyed by `(news_id, user_id)` with
+  `status` (`pending`/`sent`/`failed`/`skipped`), `kind`, `channel`,
+  `attempts`, `error`, `channel_message_id` and timestamps. The primary key is
+  the idempotency guarantee: a republish, retry, restart or crash converges on
+  one row and at most one Telegram message. Subscriptions need no new table —
+  v13's `news_subscriptions(user_id, topic_kind, topic_value)` is used as-is
+  (`type` = a news kind, `section` = a real folder id).
+- `news_delivery.py` is the transport service (no handlers, no callbacks):
+  `plan_delivery` resolves subscribers and reserves their rows,
+  `deliver` batches + throttles (`DELIVERY_BATCH_SIZE`, `asyncio.sleep(0)`)
+  and isolates every per-recipient failure (one blocked chat never aborts the
+  batch), `enqueue_publish_delivery` delivers inline for a small audience and
+  hands a large one to a tracked background task (`drain_background` for
+  tests/teardown), `retry_failed` resends only `pending`/`failed` (never a
+  `sent` row). `build_delivery_text`/`build_delivery_markup` mirror the News
+  Center detail and offer a direct button only for a reference that still
+  exists.
+- Delivery never marks an item read: `news_reads` stays empty until the
+  student opens it, so a private push and the unread badge stay consistent.
+- Subscriptions control **private delivery only**: `show_news_feed` still lists
+  every published item to everyone, and a non-subscriber simply is not pushed.
+  `database.resolve_news_recipients(news_type, section_folder_id)` resolves the
+  target set in one query per subscription shape (`notify`→notify subscribers,
+  `resource`→resource subscribers, `section`→section-type + that exact folder),
+  de-duplicated.
+- `database.add_news_subscription` validates the topic (a real kind, or a real
+  folder id) and is idempotent; `remove_news_subscription`,
+  `get_news_subscriptions`, `get_news_subscriptions_map` (no N+1) and the
+  delivery helpers `reserve_news_deliveries` /
+  `get_pending_news_deliveries` / `mark_news_delivery` (sent is terminal) /
+  `get_news_delivery_counts` / `get_news_deliveries` complete the layer.
+- Publishing centre: `show_admin_news` is 📝 مركز النشر. The draft wizard
+  (`news_new:<type>`) is title → body → doctor → event (each optional via
+  `/skip`), then a section/resource news routes to the real-registry pickers
+  (`pick_section` / `pick_resource`, callbacks `news_ref_*`) — ids are never
+  typed. `_reference_missing_for` blocks `_publish` until a section/resource
+  news has its real reference. On publish, `_publish` flips the row first and
+  then calls `news_delivery.enqueue_publish_delivery` (best-effort; a delivery
+  failure never rolls back the publish).
+- Per-row admin callbacks add `news_admin_deliveries:<id>` (delivery log with
+  counts + recent rows) and `news_admin_retry:<id>`; `_admin_item_menu` shapes
+  its actions by state (draft → picker/Preview/Publish, published →
+  View/Archive/Delivery log, archived → View/Restore/Delivery log). Every
+  mutation is audited (`news_create`, `news_reference`, `news_delivery_retry`
+  added to `audit.ACTIONS`/`ACTION_LABELS`).
+- Student subscriptions surface: the feed gains a `news_subs` entry;
+  `show_subscriptions` toggles the three kinds (`news_sub:<type>`) and
+  `show_section_subscriptions` browses the live folder tree
+  (`news_subs_section:<folder_id>`) so a student subscribes only to real
+  sections. Dedicated i18n key `news_subs`.
+- Resource-generated news: `news.publish_news_for_resource(bot, content_id)`
+  creates AT MOST one 🟢 row per content id
+  (`database.create_resource_news_for_content` / `get_resource_news_for_content`,
+  `source='resource'`), resolves the resource's real folder from the registry
+  and publishes+delivers best-effort. `main._register_admin_upload` (admin
+  upload) and `main.process_approval` (approved contribution) call it right
+  after `database.add_content`, inside their own try/except, so it can never
+  fail, delay or roll back the resource write.
+- Phase 3 (Scoped Admin / RBAC over a subject/folder) still needs only a scope
+  layer over the same tables: `news.section_folder_id`/`subject_folder_id`
+  already carry the scope, and every admin mutation already goes through the
+  `can_news` gate + audit. No news rewrite is required.
+
+
 ## Emergency Resource Archive (disaster recovery)
 - `archive.py` is the ONLY archive implementation: it mirrors registered
   resources into a standalone Telegram channel that keeps them reachable when
@@ -396,7 +462,7 @@ Both consume one daily quota unit per call and return
 
 ## Testing
 - `python -m py_compile` all modules.
-- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update test_medbot_fixes test_visibility test_ai_policy test_ai_modes test_archive_sync test_news_core`
+- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update test_medbot_fixes test_visibility test_ai_policy test_ai_modes test_archive_sync test_news_core test_news_phase2`
 - `test_ai_policy.py` pins the AI behavior policy: intent classification,
   resource-hallucination refusal, and that only the medical path fetches
   PubMed. It never calls a real provider.
@@ -433,6 +499,17 @@ Both consume one daily quota unit per call and return
   seams (`news_subscriptions`, `delivery_scope`, `source`, `payload`). It also
   asserts the existing notification broadcast and resource navigation still
   work.
+- `test_news_phase2.py` pins News Phase 2: migration v14 is additive/idempotent
+  and its `(news_id, user_id)` key makes a duplicate delivery impossible;
+  subscriptions validate their topic and resolve recipients by kind/section
+  without duplicates; the delivery engine marks sent, isolates a per-recipient
+  failure, retries only pending/failed, runs a large audience in the background
+  and never marks an item read; a section/resource news cannot publish without
+  a real reference and the pickers reject an unknown id; the News Center still
+  lists everything to non-subscribers; resource-generated news is created once
+  and never raises; the admin surfaces are `can_news`-gated and audited. Only
+  the Telegram bot boundary is stubbed; the database and all business logic are
+  real.
 - Tests must exercise real code paths against temporary SQLite; no mocks.
 - Root folders are stored with `parent_id IS NULL` (not `0`).
 
