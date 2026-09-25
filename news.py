@@ -52,7 +52,10 @@ NEWS_CALLBACKS = (
     "news_readall",
     "news_filter:",
     "admin_news",
+    "news_admin_all",
+    "news_admin_archived",
     "news_admin_view:",
+    "news_admin_preview:",
     "news_admin_pub:",
     "news_admin_archive:",
     "news_admin_restore:",
@@ -248,37 +251,12 @@ async def show_news_feed(query, page: int = 0, news_type: str = None):
     await _edit(query, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
-async def open_news(query, context, news_id):
-    """Open one news item, mark it read, and offer the right access action.
+def _detail_lines(news, lang) -> list:
+    """The student-facing detail body for one resolved news row.
 
-    The detail view resolves the referenced folder/resource live, so the
-    buttons shown always match the current registry: a resource news offers
-    "📂 عرض المورد" only when the content row still exists, and a
-    section/notification news offers "🗂 فتح القسم" only when its section does.
+    Shared by the student reader and the admin preview so both always show
+    the same real registry context (current names/breadcrumb, not a copy).
     """
-    user_id = query.from_user.id
-    lang = await _lang(user_id)
-
-    try:
-        news = await database.get_news_detail(news_id)
-    except Exception:
-        logger.exception("news: detail failed for %s", news_id)
-        news = None
-
-    if not news:
-        await _edit(
-            query,
-            i18n.t("news_no_match", lang),
-            InlineKeyboardMarkup([[btn(i18n.t("news_back_feed", lang), "news")]]),
-        )
-        return
-
-    # An unread news is marked read on open (idempotent).
-    try:
-        await database.mark_news_read(user_id, news_id)
-    except Exception:
-        logger.debug("news: mark_news_read failed", exc_info=True)
-
     lines = [
         f"{database.NEWS_TYPE_ICONS.get(news['news_type'], '📰')} "
         f"<b>{esc(news['title'])}</b>",
@@ -304,17 +282,75 @@ async def open_news(query, context, news_id):
     if news.get("body"):
         lines.append(esc(news["body"]))
 
-    rows = []
-
-    # Access action, chosen by kind and only when the target is real.
     if news["news_type"] == "resource" and news.get("resource_present"):
         lines.append("")
         lines.append(f"📄 {esc(news.get('resource_title') or '')}")
-        rows.append([btn(i18n.t("news_view_resource", lang), f"file:{news['resource_id']}")])
+
+    return lines
+
+
+def _detail_access_rows(news, lang) -> list:
+    """The real access button for a resolved news row (or none)."""
+    rows = []
+    if news["news_type"] == "resource" and news.get("resource_present"):
+        rows.append(
+            [btn(i18n.t("news_view_resource", lang), f"file:{news['resource_id']}")]
+        )
     elif news.get("folder_id"):
         # A section notice, or a resource whose content row was removed but
         # whose registered section still exists: navigate to the real section.
-        rows.append([btn(i18n.t("news_open_section", lang), f"folder:{news['folder_id']}")])
+        rows.append(
+            [btn(i18n.t("news_open_section", lang), f"folder:{news['folder_id']}")]
+        )
+    return rows
+
+
+async def open_news(query, context, news_id, admin: bool = False):
+    """Open one news item, mark it read, and offer the right access action.
+
+    A student may only open **published** news: `draft` and `archived` are
+    admin lifecycle states, so a stale/invented callback id can never expose
+    unpublished text. When the row is refused no read record is created. An
+    authorised admin (`can_news`) may preview any state, but that goes through
+    the admin surface (`show_admin_news_item`), never this student path.
+
+    The detail view resolves the referenced folder/resource live, so the
+    buttons shown always match the current registry: a resource news offers
+    "📂 عرض المورد" only when the content row still exists, and a
+    section/notification news offers "🗂 فتح القسم" only when its section does.
+    """
+    user_id = query.from_user.id
+    lang = await _lang(user_id)
+
+    try:
+        news = await database.get_news_detail(news_id)
+    except Exception:
+        logger.exception("news: detail failed for %s", news_id)
+        news = None
+
+    # Only a published row is visible on the student path. A non-published row
+    # is treated exactly like a missing one: no text, no read record.
+    if news and not admin and news.get("status") != "published":
+        news = None
+
+    if not news:
+        await _edit(
+            query,
+            i18n.t("news_no_match", lang),
+            InlineKeyboardMarkup([[btn(i18n.t("news_back_feed", lang), "news")]]),
+        )
+        return
+
+    # An unread news is marked read on open (idempotent). Never reached for a
+    # refused draft/archived row. Admin previews never record a read.
+    if not admin:
+        try:
+            await database.mark_news_read(user_id, news_id)
+        except Exception:
+            logger.debug("news: mark_news_read failed", exc_info=True)
+
+    lines = _detail_lines(news, lang)
+    rows = _detail_access_rows(news, lang)
 
     rows.append([btn(i18n.t("news_back_feed", lang), "news")])
     rows.append([btn(i18n.t("home", lang), "home")])
@@ -343,15 +379,39 @@ def _admin_menu() -> InlineKeyboardMarkup:
             [btn("🔴 إشعار هام", "news_new:notify")],
             [btn("🟡 خبر قسم", "news_new:section")],
             [btn("🟢 مورد جديد", "news_new:resource")],
-            [btn("📋 كل الأخبار", "admin_news")],
+            [btn("📋 كل الأخبار", "news_admin_all")],
+            [btn("🗄 الأرشيف", "news_admin_archived")],
             [btn("⬅️ إدارة المنصة", "admin")],
             [btn("🏠 الرئيسية", "home")],
         ]
     )
 
 
-async def show_admin_news(query, context=None):
-    """Admin news overview: type counts + every non-archived row."""
+def _status_filter_for_view(view: str):
+    """Map an admin view to the `list_news` status filter.
+
+    ``active`` is the default working set (everything except archived);
+    ``archived`` reaches the archived rows so they can be restored; ``all``
+    is the unfiltered list exposed through the explicit filter callbacks.
+    """
+    if view == "archived":
+        return "archived", False
+    if view == "all":
+        return None, True
+    return None, False
+
+
+async def show_admin_news(query, context=None, view: str = "active"):
+    """Admin news overview: type counts + a clickable list of rows.
+
+    Every row is a `news_admin_view:<id>` button, so an admin can open any
+    news item — including archived ones — and reach its publish/archive/
+    restore/delete actions. `view` selects the working set:
+
+    * ``active``   — draft + published (the default working set)
+    * ``archived`` — archived rows only (so restore is reachable)
+    * ``all``      — every lifecycle state, archived included
+    """
     if not await _is_manager(query.from_user.id):
         await _edit(query, "🔒 غير مصرح.", _home_keyboard())
         return
@@ -359,53 +419,107 @@ async def show_admin_news(query, context=None):
     if context is not None:
         _clear_state(context)
 
+    status, include_archived = _status_filter_for_view(view)
+
     try:
         counts = await database.get_news_counts_by_type()
-        recent = await database.list_news(status="all", limit=10)
+        rows_data = await database.list_news(
+            status=status, include_archived=include_archived, limit=20
+        )
+        archived_count = await database.count_news(
+            status="archived", include_archived=True
+        )
     except Exception:
         logger.exception("news: admin overview failed")
-        counts, recent = {}, []
+        counts, rows_data, archived_count = {}, [], 0
+
+    title = {
+        "archived": "🗄 <b>الأخبار المؤرشفة</b>",
+        "all": "📋 <b>كل الأخبار</b>",
+    }.get(view, "📰 <b>إدارة الأخبار</b>")
 
     lines = [
-        "📰 <b>إدارة الأخبار</b>",
+        title,
         "",
-        "الأنواع الثلاثة مدعومة: إشعار هام، خبر قسم، مورد جديد.",
+        "الأنواع الثلاثة: إشعار هام، خبر قسم، مورد جديد.",
         "أنشئ الخبر كمسودة، راجعه، ثم انشره للطلاب.",
         "",
         f"🔴 {counts.get('notify', 0)} | 🟡 {counts.get('section', 0)} | "
-        f"🟢 {counts.get('resource', 0)}",
-        "\n📋 <b>أحدث الأخبار</b>",
+        f"🟢 {counts.get('resource', 0)}  ·  🗄 {archived_count}",
+        "",
     ]
 
-    if not recent:
-        lines.append("• لا توجد أخبار بعد.")
+    if not rows_data:
+        lines.append("• لا توجد أخبار في هذا العرض.")
     else:
-        for item in recent:
-            status = database.NEWS_STATUS_LABELS.get(item["status"], item["status"])
+        for item in rows_data:
+            state = database.NEWS_STATUS_LABELS.get(item["status"], item["status"])
             lines.append(
                 f"• {database.NEWS_TYPE_ICONS.get(item['news_type'], '📰')} "
-                f"{esc(str(item['title'])[:40])} — {esc(status)}"
+                f"{esc(str(item['title'])[:40])} — {esc(state)}"
             )
+        lines.append("")
+        lines.append("اضغط على أي خبر للفتح والتحكم.")
 
-    await _edit(query, "\n".join(lines), _admin_menu())
+    keyboard = []
+    for item in rows_data:
+        state = database.NEWS_STATUS_LABELS.get(item["status"], "")
+        keyboard.append(
+            [
+                btn(
+                    f"{database.NEWS_TYPE_ICONS.get(item['news_type'], '📰')} "
+                    f"{str(item['title'])[:26]} · {state}",
+                    f"news_admin_view:{item['id']}",
+                )
+            ]
+        )
+
+    filter_row = [btn("📋 الكل", "news_admin_all")]
+    if view == "archived":
+        filter_row.append(btn("↩️ العودة للعرض العادي", "admin_news"))
+    else:
+        filter_row.append(btn("🗄 الأرشيف", "news_admin_archived"))
+    keyboard.append(filter_row)
+
+    keyboard.append([btn("⬅️ إدارة المنصة", "admin")])
+    keyboard.append([btn("🏠 الرئيسية", "home")])
+
+    await _edit(query, "\n".join(lines), InlineKeyboardMarkup(keyboard))
 
 
-def _admin_item_menu(news) -> InlineKeyboardMarkup:
+def _admin_item_menu(news, back: str = None) -> InlineKeyboardMarkup:
+    """Actions for one news row, shaped by its lifecycle state.
+
+    draft     -> Preview / Publish / Delete / Back
+    published -> View    / Archive / Delete / Back
+    archived  -> View    / Restore / Delete / Back
+
+    ``View``/``Preview`` renders the student-facing detail (and its real
+    resource/section access button) without marking it read for the admin.
+    ``back`` defaults to the listing that owns the row so an archived item
+    returns to the archive view and everything else to the working set.
+    """
+    if back is None:
+        back = "news_admin_archived" if news["status"] == "archived" else "admin_news"
+
     rows = []
     if news["status"] == "draft":
+        rows.append([btn("👁 معاينة", f"news_admin_preview:{news['id']}")])
         rows.append([btn("📢 نشر", f"news_admin_pub:{news['id']}")])
-    if news["status"] == "published":
+    elif news["status"] == "published":
+        rows.append([btn("👁 عرض", f"news_admin_preview:{news['id']}")])
         rows.append([btn("🗄 أرشفة", f"news_admin_archive:{news['id']}")])
-    if news["status"] == "archived":
+    elif news["status"] == "archived":
+        rows.append([btn("👁 عرض", f"news_admin_preview:{news['id']}")])
         rows.append([btn("♻️ استرجاع كمسودة", f"news_admin_restore:{news['id']}")])
+
     rows.append([btn("🗑 حذف", f"news_admin_delete:{news['id']}")])
-    rows.append([btn("⬅️ إدارة الأخبار", "admin_news")])
+    rows.append([btn("⬅️ رجوع", back)])
     rows.append([btn("🏠 الرئيسية", "home")])
     return InlineKeyboardMarkup(rows)
 
-
-async def show_admin_news_item(query, news_id):
-    """Admin preview of one news row (any lifecycle state)."""
+async def show_admin_news_item(query, news_id, back: str = None):
+    """Admin manage view of one news row: status + lifecycle actions."""
     if not await _is_manager(query.from_user.id):
         await _edit(query, "🔒 غير مصرح.", _home_keyboard())
         return
@@ -424,31 +538,46 @@ async def show_admin_news_item(query, news_id):
         return
 
     status = database.NEWS_STATUS_LABELS.get(news["status"], news["status"])
-    lines = [
-        f"{database.NEWS_TYPE_ICONS.get(news['news_type'], '📰')} "
-        f"<b>{esc(news['title'])}</b>",
-        f"🏷 {_type_label(news['news_type'])}",
-        f"📊 {esc(status)}",
-    ]
-    if news.get("subject_name"):
-        lines.append(f"🧪 المادة: {esc(news['subject_name'])}")
-    if news.get("section_name"):
-        lines.append(f"🗂 القسم: {esc(news['section_name'])}")
-    if news.get("folder_path"):
-        lines.append(f"📍 {esc(news['folder_path'])}")
-    if news.get("doctor"):
-        lines.append(f"👨‍⚕️ {esc(news['doctor'])}")
-    if news.get("event_at"):
-        lines.append(f"📅 {esc(news['event_at'])}")
-    if news.get("resource_id"):
-        resource_label = news.get("resource_title") or f"#{news['resource_id']}"
-        suffix = "" if news.get("resource_present") else " (غير موجود حالياً)"
-        lines.append(f"📄 المورد: {esc(resource_label)}{suffix}")
-    if news.get("body"):
-        lines.append("")
-        lines.append(esc(news["body"]))
+    lang = await _lang(query.from_user.id)
+    lines = _detail_lines(news, lang)
+    lines.insert(2, f"📊 {esc(status)}")
 
-    await _edit(query, "\n".join(lines), _admin_item_menu(news))
+    await _edit(query, "\n".join(lines), _admin_item_menu(news, back=back))
+
+
+async def preview_admin_news(query, news_id, back: str = "admin_news"):
+    """Render the student-facing view of a news row for an authorised admin.
+
+    Read-only: nothing is marked read, and the lifecycle buttons stay
+    reachable so the admin can act right after reviewing. Any state (draft /
+    published / archived) is previewable here because the caller passed the
+    `can_news` gate.
+    """
+    if not await _is_manager(query.from_user.id):
+        await _edit(query, "🔒 غير مصرح.", _home_keyboard())
+        return
+
+    try:
+        news = await database.get_news_detail(news_id)
+    except Exception:
+        news = None
+
+    if not news:
+        await _edit(
+            query,
+            "⚠️ الخبر غير موجود.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة الأخبار", "admin_news")]]),
+        )
+        return
+
+    lang = await _lang(query.from_user.id)
+    lines = ["🔎 <b>معاينة (كما يراها الطالب)</b>", ""]
+    lines.extend(_detail_lines(news, lang))
+
+    rows = _detail_access_rows(news, lang)
+    rows.extend(_admin_item_menu(news, back=back).inline_keyboard)
+
+    await _edit(query, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
 async def start_create_news(query, context, news_type):
@@ -622,6 +751,7 @@ async def _restore(query, news_id):
             query.from_user.id, "news_restore",
             target_type="news", target_id=news_id,
         )
+    # A restored row leaves the archive, so land back on the working set.
     await show_admin_news_item(query, news_id)
 
 
@@ -719,6 +849,14 @@ async def news_callback_handler(update, context: ContextTypes.DEFAULT_TYPE):
         await show_admin_news(query, context)
         return
 
+    if data == "news_admin_all":
+        await show_admin_news(query, context, view="all")
+        return
+
+    if data == "news_admin_archived":
+        await show_admin_news(query, context, view="archived")
+        return
+
     if data.startswith("news_new:"):
         await start_create_news(query, context, data.split(":", 1)[1])
         return
@@ -728,7 +866,21 @@ async def news_callback_handler(update, context: ContextTypes.DEFAULT_TYPE):
         if news_id is None:
             await _edit(query, "⚠️ معرف غير صالح.", _home_keyboard())
             return
+        if not await _is_manager(query.from_user.id):
+            await _edit(query, "🔒 غير مصرح.", _home_keyboard())
+            return
         await show_admin_news_item(query, news_id)
+        return
+
+    if data.startswith("news_admin_preview:"):
+        news_id = _int_or_none(data.split(":", 1)[1])
+        if news_id is None:
+            await _edit(query, "⚠️ معرف غير صالح.", _home_keyboard())
+            return
+        if not await _is_manager(query.from_user.id):
+            await _edit(query, "🔒 غير مصرح.", _home_keyboard())
+            return
+        await preview_admin_news(query, news_id)
         return
 
     if data.startswith("news_admin_pub:"):

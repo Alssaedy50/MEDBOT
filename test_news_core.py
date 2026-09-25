@@ -537,6 +537,70 @@ class NewsAccessTests(NewsBase):
         query, _ = await self._open(self.student_id, "news_open:abc")
         self.assertIn("غير صالح", query.last_text)
 
+    # ---- H1: a student may only open published news -------------------
+
+    async def test_student_cannot_open_draft(self):
+        nid = await self._make("notify", "SECRET DRAFT", status="draft")
+        query, _ = await self._open(self.student_id, f"news_open:{nid}")
+        self.assertIn("غير موجود", query.last_text)
+        self.assertNotIn("SECRET DRAFT", query.last_text)
+
+    async def test_student_cannot_open_archived(self):
+        nid = await self._make("notify", "SECRET ARCHIVED")
+        await database.archive_news(nid)
+        query, _ = await self._open(self.student_id, f"news_open:{nid}")
+        self.assertIn("غير موجود", query.last_text)
+        self.assertNotIn("SECRET ARCHIVED", query.last_text)
+
+    async def test_refused_open_creates_no_read_record(self):
+        draft = await self._make("notify", "draft", status="draft")
+        archived = await self._make("notify", "old")
+        await database.archive_news(archived)
+
+        await self._open(self.student_id, f"news_open:{draft}")
+        await self._open(self.student_id, f"news_open:{archived}")
+
+        self.assertFalse(await database.is_news_read(self.student_id, draft))
+        self.assertFalse(await database.is_news_read(self.student_id, archived))
+        self.assertEqual(
+            await database.get_unread_news_count(self.student_id), 0
+        )
+
+    async def test_published_open_creates_read_record(self):
+        nid = await self._make("notify", "visible")
+        await self._open(self.student_id, f"news_open:{nid}")
+        self.assertTrue(await database.is_news_read(self.student_id, nid))
+
+    async def test_admin_can_preview_draft_without_recording_a_read(self):
+        nid = await self._make("notify", "SECRET DRAFT", status="draft")
+        query, _ = await self._open(
+            self.owner_id, f"news_admin_view:{nid}", _FakeContext()
+        )
+        self.assertIn("SECRET DRAFT", query.last_text)
+        self.assertFalse(await database.is_news_read(self.owner_id, nid))
+
+    async def test_admin_can_preview_archived(self):
+        nid = await self._make("notify", "OLD NOTICE")
+        await database.archive_news(nid)
+        query, _ = await self._open(
+            self.owner_id, f"news_admin_view:{nid}", _FakeContext()
+        )
+        self.assertIn("OLD NOTICE", query.last_text)
+
+    async def test_admin_student_style_preview_is_readonly(self):
+        nid = await self._make("notify", "draft text", status="draft")
+        query, _ = await self._open(
+            self.owner_id, f"news_admin_preview:{nid}", _FakeContext()
+        )
+        self.assertIn("draft text", query.last_text)
+        self.assertIn("معاينة", query.last_text)
+        self.assertFalse(await database.is_news_read(self.owner_id, nid))
+        # Lifecycle actions stay reachable right after the preview.
+        callbacks = [
+            b.callback_data for row in query.last_markup.inline_keyboard for b in row
+        ]
+        self.assertIn(f"news_admin_pub:{nid}", callbacks)
+
 
 # ---------------------------------------------------------------
 # 8. Home unread badge
@@ -645,6 +709,94 @@ class NewsAdminTests(NewsBase):
             for b in row
         ]
         self.assertEqual(callbacks.count("admin_news"), 1)
+
+    # ---- H2: the admin list is fully navigable ------------------------
+
+    async def test_admin_list_rows_are_clickable(self):
+        draft = await self._make("notify", "draft one", status="draft")
+        published = await self._make("notify", "live one")
+        query, _ = await self._open(self.owner_id, "admin_news", _FakeContext())
+        callbacks = [
+            b.callback_data for row in query.last_markup.inline_keyboard for b in row
+        ]
+        self.assertIn(f"news_admin_view:{draft}", callbacks)
+        self.assertIn(f"news_admin_view:{published}", callbacks)
+
+    async def test_admin_list_exposes_archived_filter(self):
+        query, _ = await self._open(self.owner_id, "admin_news", _FakeContext())
+        callbacks = [
+            b.callback_data for row in query.last_markup.inline_keyboard for b in row
+        ]
+        self.assertIn("news_admin_archived", callbacks)
+        self.assertIn("news_admin_all", callbacks)
+
+    async def test_archived_items_are_reachable_and_restorable(self):
+        nid = await self._make("notify", "old notice")
+        await database.archive_news(nid)
+
+        # The default working set hides it; the archive view reaches it.
+        query, _ = await self._open(self.owner_id, "admin_news", _FakeContext())
+        callbacks = [
+            b.callback_data for row in query.last_markup.inline_keyboard for b in row
+        ]
+        self.assertNotIn(f"news_admin_view:{nid}", callbacks)
+
+        query, _ = await self._open(self.owner_id, "news_admin_archived", _FakeContext())
+        callbacks = [
+            b.callback_data for row in query.last_markup.inline_keyboard for b in row
+        ]
+        self.assertIn(f"news_admin_view:{nid}", callbacks)
+
+        query, _ = await self._open(self.owner_id, f"news_admin_view:{nid}", _FakeContext())
+        callbacks = [
+            b.callback_data for row in query.last_markup.inline_keyboard for b in row
+        ]
+        self.assertIn(f"news_admin_restore:{nid}", callbacks)
+        self.assertIn("news_admin_archived", callbacks)
+
+    async def test_draft_item_menu_actions(self):
+        nid = await self._make("notify", "d", status="draft")
+        query, _ = await self._open(self.owner_id, f"news_admin_view:{nid}", _FakeContext())
+        callbacks = {
+            b.callback_data for row in query.last_markup.inline_keyboard for b in row
+        }
+        self.assertIn(f"news_admin_pub:{nid}", callbacks)
+        self.assertIn(f"news_admin_delete:{nid}", callbacks)
+        self.assertIn(f"news_admin_preview:{nid}", callbacks)
+        self.assertNotIn(f"news_admin_archive:{nid}", callbacks)
+
+    async def test_published_item_menu_actions(self):
+        nid = await self._make("notify", "p")
+        query, _ = await self._open(self.owner_id, f"news_admin_view:{nid}", _FakeContext())
+        callbacks = {
+            b.callback_data for row in query.last_markup.inline_keyboard for b in row
+        }
+        self.assertIn(f"news_admin_archive:{nid}", callbacks)
+        self.assertIn(f"news_admin_preview:{nid}", callbacks)
+        self.assertNotIn(f"news_admin_pub:{nid}", callbacks)
+        self.assertNotIn(f"news_admin_restore:{nid}", callbacks)
+
+    async def test_news_admin_all_view_lists_archived_too(self):
+        nid = await self._make("notify", "old")
+        await database.archive_news(nid)
+        query, _ = await self._open(self.owner_id, "news_admin_all", _FakeContext())
+        callbacks = [
+            b.callback_data for row in query.last_markup.inline_keyboard for b in row
+        ]
+        self.assertIn(f"news_admin_view:{nid}", callbacks)
+
+    async def test_student_cannot_reach_admin_list_or_preview(self):
+        nid = await self._make("notify", "SECRET", status="draft")
+        for data in (
+            "admin_news",
+            "news_admin_all",
+            "news_admin_archived",
+            f"news_admin_view:{nid}",
+            f"news_admin_preview:{nid}",
+        ):
+            query, _ = await self._open(self.student_id, data, _FakeContext())
+            self.assertIn("غير مصرح", query.last_text)
+            self.assertNotIn("SECRET", query.last_text)
 
 
 # ---------------------------------------------------------------

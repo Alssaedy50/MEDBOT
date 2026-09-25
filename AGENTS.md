@@ -332,10 +332,19 @@ Both consume one daily quota unit per call and return
   (`main._home_badges` → `home_keyboard(..., badges=...)`), never a zero badge.
 - Student callbacks: `news` (feed), `news_open:<id>` (marks read + shows the
   detail and its real access button), `news_more:<page>`, `news_filter:<type>`,
-  `news_readall`. Admin callbacks: `admin_news`, `news_new:<type>`,
-  `news_admin_view|pub|archive|restore|delete:<id>`. The admin surface is gated
-  by `can_news` and every mutation is audited (`news_publish`, `news_archive`,
-  `news_restore`, `news_delete`).
+  `news_readall`. A student may open **published** news only: `open_news`
+  refuses `draft`/`archived` exactly like a missing row and creates NO
+  `news_reads` record, so an unpublished id can never leak text or inflate the
+  unread count. Admin callbacks: `admin_news` (draft+published working set),
+  `news_admin_all`, `news_admin_archived` (reach archived rows),
+  `news_new:<type>`, and per-row `news_admin_view:<id>` (manage actions),
+  `news_admin_preview:<id>` (read-only student-style preview),
+  `news_admin_pub|archive|restore|delete:<id>`. The admin list is fully
+  clickable and each item shows state-appropriate actions (draft →
+  Preview/Publish/Delete; published → View/Archive/Delete; archived →
+  View/Restore/Delete). The admin surface is gated by `can_news`, never
+  records a read for the admin, and every mutation is audited
+  (`news_publish`, `news_archive`, `news_restore`, `news_delete`).
 - `news` is a `database.FEATURES` key (hideable) and its public callbacks are
   feature-gated; news registers its own handler BEFORE the catch-all
   `callback_router`, so it owns its namespace and its own hidden check
