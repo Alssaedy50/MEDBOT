@@ -57,10 +57,14 @@ AUDIT_ACTIONS = (
     "notification_send",
     "language_set",
     "feature_visibility",
+    "news_create",
     "news_publish",
     "news_archive",
     "news_restore",
     "news_delete",
+    "news_reference",
+    "news_delivery_retry",
+    "news_resource_auto",
 )
 
 ACTION_LABELS = {
@@ -95,10 +99,14 @@ ACTION_LABELS = {
     "notification_send": "🔔 إرسال إشعار",
     "language_set": "🌐 تغيير اللغة",
     "feature_visibility": "🙈 إظهار/إخفاء قسم",
+    "news_create": "📝 إنشاء خبر",
     "news_publish": "📰 نشر خبر",
     "news_archive": "🗄 أرشفة خبر",
     "news_restore": "♻️ استرجاع خبر",
     "news_delete": "🗑 حذف خبر",
+    "news_reference": "🔗 ربط خبر بقسم/مورد",
+    "news_delivery_retry": "🔁 إعادة إرسال خبر",
+    "news_resource_auto": "🟢 خبر مورد تلقائي",
 }
 
 

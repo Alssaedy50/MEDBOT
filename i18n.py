@@ -264,6 +264,7 @@ _TRANSLATIONS = {
     "news_no_match": {"ar": "⚠️ الخبر غير موجود.", "en": "⚠️ This news item was not found."},
     "news_more": {"ar": "🔽 المزيد", "en": "🔽 More"},
     "news_back_feed": {"ar": "⬅️ الأخبار", "en": "⬅️ News"},
+    "news_subs": {"ar": "⚙️ اشتراكات الأخبار", "en": "⚙️ News subscriptions"},
 }
 
 
