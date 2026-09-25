@@ -180,7 +180,10 @@ Both consume one daily quota unit per call and return
   creates the isolated `archive_sync` mirror table; `_migrate_v13` creates the
   News Core tables (`news`/`news_reads`/`news_subscriptions`); `_migrate_v14`
   creates the News private-delivery table (`news_deliveries`, keyed by
-  `(news_id, user_id)`). Never rewrite v1..v4.
+  `(news_id, user_id)`); `_migrate_v15` adds the partial unique index
+  `idx_news_auto_resource_unique` on `news(resource_id) WHERE
+  source='resource'` (collapsing any pre-existing auto duplicates first), so an
+  auto resource news row is idempotent at the DB level. Never rewrite v1..v4.
 - Role scope is explicit: `ROLE_PERMISSION_PRESETS` maps each role to a baseline
   capability set (owner = all, admin = all except `can_admins`, reviewer =
   contributions + messages, none = nothing) and `ROLE_DESCRIPTIONS` is the
@@ -368,15 +371,35 @@ Both consume one daily quota unit per call and return
   v13's `news_subscriptions(user_id, topic_kind, topic_value)` is used as-is
   (`type` = a news kind, `section` = a real folder id).
 - `news_delivery.py` is the transport service (no handlers, no callbacks):
-  `plan_delivery` resolves subscribers and reserves their rows,
-  `deliver` batches + throttles (`DELIVERY_BATCH_SIZE`, `asyncio.sleep(0)`)
-  and isolates every per-recipient failure (one blocked chat never aborts the
-  batch), `enqueue_publish_delivery` delivers inline for a small audience and
-  hands a large one to a tracked background task (`drain_background` for
+  `plan_delivery` resolves subscribers and reserves their rows, `deliver`
+  batches + rate-limits (`DELIVERY_BATCH_SIZE`, `DELIVERY_BATCH_DELAY` — a real
+  delay between batches, never `sleep(0)`) and isolates every per-recipient
+  failure (one blocked chat never aborts the batch),
+  `enqueue_publish_delivery` delivers inline for a small audience and hands a
+  large one to a tracked background task (`drain_background` for
   tests/teardown), `retry_failed` resends only `pending`/`failed` (never a
   `sent` row). `build_delivery_text`/`build_delivery_markup` mirror the News
   Center detail and offer a direct button only for a reference that still
-  exists.
+  exists. Telegram `RetryAfter` (429) is honoured, capped at
+  `DELIVERY_RETRY_AFTER_CAP` and retried at most `DELIVERY_MAX_SEND_RETRIES`
+  times per recipient before recording `failed`.
+- Delivery status is `pending` → `sending` (a transient claim written BEFORE
+  the Telegram call) → `sent`/`failed`; `skipped` is terminal too.
+  `claim_news_delivery` takes the claim, `mark_news_delivery` resolves it
+  (`sent` is terminal, increments `attempts`). DB guarantees no duplicate
+  reservation and a terminal `sent`, but there is **no external exactly-once
+  guarantee**: a crash between "Telegram accepted" and the DB write leaves a
+  recoverable `sending` row and the item may be delivered again — documented
+  at-least-once in the crash window, never claimed otherwise.
+- Startup recovery: `news_delivery.start_recovery(bot)` is called from
+  `main.post_init` AFTER `init_db`. It is a single background worker
+  (idempotent — a second startup call never spawns a rival), never awaited, so
+  polling starts immediately. `recover_pending_deliveries` resets stale
+  `sending` claims (`reset_stale_news_deliveries`,
+  `NEWS_DELIVERY_STALE_SECONDS`) and replays the oldest published items with
+  `pending`/`failed` rows (`list_recoverable_news_ids`, bounded by
+  `RECOVERY_MAX_NEWS`) through the same engine. `sent`/`skipped` are never
+  reselected, so recovery cannot resend a completed delivery.
 - Delivery never marks an item read: `news_reads` stays empty until the
   student opens it, so a private push and the unread badge stay consistent.
 - Subscriptions control **private delivery only**: `show_news_feed` still lists
@@ -414,10 +437,14 @@ Both consume one daily quota unit per call and return
   creates AT MOST one 🟢 row per content id
   (`database.create_resource_news_for_content` / `get_resource_news_for_content`,
   `source='resource'`), resolves the resource's real folder from the registry
-  and publishes+delivers best-effort. `main._register_admin_upload` (admin
-  upload) and `main.process_approval` (approved contribution) call it right
-  after `database.add_content`, inside their own try/except, so it can never
-  fail, delay or roll back the resource write.
+  and publishes+delivers best-effort. Idempotency is DB-level (v15's partial
+  unique index), not a check-then-insert race: a concurrent second call gets
+  the winner's row back from `create_news` (which catches `IntegrityError` for
+  an auto row only). A manual news row for the same resource is unaffected.
+  `main._register_admin_upload` (admin upload) and `main.process_approval`
+  (approved contribution) call it right after `database.add_content`, inside
+  their own try/except, so it can never fail, delay or roll back the resource
+  write.
 - Phase 3 (Scoped Admin / RBAC over a subject/folder) still needs only a scope
   layer over the same tables: `news.section_folder_id`/`subject_folder_id`
   already carry the scope, and every admin mutation already goes through the
@@ -462,7 +489,7 @@ Both consume one daily quota unit per call and return
 
 ## Testing
 - `python -m py_compile` all modules.
-- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update test_medbot_fixes test_visibility test_ai_policy test_ai_modes test_archive_sync test_news_core test_news_phase2`
+- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update test_medbot_fixes test_visibility test_ai_policy test_ai_modes test_archive_sync test_news_core test_news_phase2 test_news_phase2_fixes`
 - `test_ai_policy.py` pins the AI behavior policy: intent classification,
   resource-hallucination refusal, and that only the medical path fetches
   PubMed. It never calls a real provider.
@@ -509,6 +536,20 @@ Both consume one daily quota unit per call and return
   lists everything to non-subscribers; resource-generated news is created once
   and never raises; the admin surfaces are `can_news`-gated and audited. Only
   the Telegram bot boundary is stubbed; the database and all business logic are
+  real.
+- `test_news_phase2_fixes.py` pins the Phase 2 review fixes: delivery
+  crash/restart recovery (a `pending` row is finished, a `failed` row is
+  retried, a stale `sending` claim is reset and redelivered, `sent`/`skipped`
+  are never resent, recovery ignores drafts, one failure does not stop the
+  rest, the worker is non-blocking and idempotent, repeat passes do not
+  duplicate); Telegram-aware rate limiting (real waits between batches, none
+  after the last, `RetryAfter` honoured and capped, a persistent 429 records
+  `failed`); DB-level resource-news idempotency (first call makes one row,
+  repeat returns it, concurrent calls converge, a direct auto insert returns
+  the winner, manual news for the same resource is still allowed, v15 is
+  idempotent and collapses pre-existing duplicates without touching unrelated
+  news); and the documented at-least-once crash-window semantics. Only the
+  Telegram bot boundary is stubbed; the database and all business logic are
   real.
 - Tests must exercise real code paths against temporary SQLite; no mocks.
 - Root folders are stored with `parent_id IS NULL` (not `0`).

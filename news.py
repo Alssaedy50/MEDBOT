@@ -866,6 +866,7 @@ async def show_news_deliveries(query, news_id):
         "📬 <b>سجل التوصيل</b>",
         "",
         f"✅ منشور: {counts.get('sent', 0)}  ·  ⏳ معلّق: {counts.get('pending', 0)}"
+        f"  ·  📤 قيد الإرسال: {counts.get('sending', 0)}"
         f"  ·  ⚠️ فشل: {counts.get('failed', 0)}",
     ]
     if rows_data:

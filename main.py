@@ -60,6 +60,7 @@ import platform_settings
 import topics
 import notifications
 import news
+import news_delivery
 import visibility
 import workflow
 from ai import (
@@ -5676,6 +5677,11 @@ async def post_init(application: Application):
     # Warm the AI discovery/probe cache so the first assistant reply does not
     # pay for provider discovery. Runs in the background and is best-effort.
     asyncio.create_task(warm_ai_pool())
+
+    # Resume deliveries left unfinished by a crash/restart. Started as a single
+    # background worker (never awaited) so Telegram polling begins immediately;
+    # it is idempotent, so a repeated startup cannot spawn a second worker.
+    news_delivery.start_recovery(application.bot)
 
 
 def main():

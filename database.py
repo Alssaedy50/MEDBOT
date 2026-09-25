@@ -1,6 +1,7 @@
 import aiosqlite
 import logging
 import os
+import sqlite3
 
 from datetime import datetime, date
 from typing import Tuple
@@ -215,6 +216,7 @@ async def init_db():
         await _migrate_v12(db)
         await _migrate_v13(db)
         await _migrate_v14(db)
+        await _migrate_v15(db)
 
         # ------------------------------------------------------------
         # Performance / integrity indexes
@@ -970,7 +972,13 @@ NEWS_SUB_KINDS = (NEWS_SUB_TYPE, NEWS_SUB_SECTION)
 
 # Phase 2 — private delivery lifecycle per (news, user). `skipped` records a
 # recipient who was no longer relevant at send time; `failed` is retryable.
-NEWS_DELIVERY_STATUSES = ("pending", "sent", "failed", "skipped")
+# `sending` is a transient claim written *before* the Telegram call so a crash
+# mid-send is recoverable without a false "sent".
+NEWS_DELIVERY_STATUSES = ("pending", "sending", "sent", "failed", "skipped")
+
+# A `sending` claim older than this is treated as a crashed attempt and reset
+# to `pending` on recovery. Bounds how long a stuck send blocks a resend.
+NEWS_DELIVERY_STALE_SECONDS = 900
 
 # `news.source` value for a resource-generated news row.
 NEWS_SOURCE_AUTO = "resource"
@@ -1130,6 +1138,43 @@ async def _migrate_v14(db):
         except Exception:
             logger.exception("Migration v14: statement failed")
     logger.info("Migration v14: ensured news delivery tracking table")
+
+
+async def _migrate_v15(db):
+    """Phase 2 fix: DB-level idempotency for auto-generated resource news.
+
+    A partial UNIQUE index on ``news(resource_id)`` for ``source='resource'``
+    rows makes a second auto-news row for the same resource *impossible* even
+    under a concurrent check-then-insert race. Manual news is untouched: the
+    ``WHERE source = 'resource'`` predicate excludes it, so an admin may still
+    post any number of manual items about the same resource.
+
+    Before creating the index, pre-existing duplicates (from the old
+    non-atomic path) are collapsed keeping the earliest row, so the migration
+    cannot fail on a database that already contains one. The index predicate
+    and cleanup are scoped to auto rows only; no other news row is read,
+    changed, or removed. Additive and idempotent.
+    """
+    try:
+        # Collapse any pre-existing auto duplicates (keep the lowest id).
+        await db.execute(
+            "DELETE FROM news WHERE source = ? AND resource_id IS NOT NULL "
+            "AND id NOT IN ("
+            "  SELECT MIN(id) FROM news "
+            "  WHERE source = ? AND resource_id IS NOT NULL "
+            "  GROUP BY resource_id"
+            ")",
+            (NEWS_SOURCE_AUTO, NEWS_SOURCE_AUTO),
+        )
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_news_auto_resource_unique "
+            "ON news(resource_id) "
+            f"WHERE source = '{NEWS_SOURCE_AUTO}' AND resource_id IS NOT NULL"
+        )
+        await db.commit()
+    except Exception:
+        logger.exception("Migration v15: statement failed")
+    logger.info("Migration v15: ensured auto resource news uniqueness")
 
 # Message categories and lifecycle states.
 MESSAGE_CATEGORIES = ("message", "summary", "suggestion", "report")
@@ -3095,6 +3140,18 @@ async def create_news(
         )
         await db.commit()
         return cursor.lastrowid
+    except sqlite3.IntegrityError:
+        # Only the auto-resource partial unique index can conflict here: a
+        # concurrent creation won the race, so return the row it created.
+        if (source or "manual").strip() != NEWS_SOURCE_AUTO:
+            raise
+        async with db.execute(
+            f"SELECT {_NEWS_COLUMNS} FROM news "
+            "WHERE resource_id = ? AND source = ? ORDER BY id ASC LIMIT 1",
+            (resource_id, NEWS_SOURCE_AUTO),
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
     finally:
         await db.close()
 
@@ -3695,8 +3752,10 @@ async def reserve_news_deliveries(news_id, user_ids, kind: str = None) -> list:
 
 
 async def get_pending_news_deliveries(news_id: int, retry_failed: bool = True) -> list:
-    """Recipient ids whose delivery is still ``pending`` (and ``failed`` when
-    ``retry_failed``). ``sent``/``skipped`` rows are terminal and never resent.
+    """Recipient ids still owed the item: ``pending`` (and ``failed`` when
+    ``retry_failed``). ``sent``/``skipped`` rows are terminal and never resent;
+    a stale ``sending`` claim is owned by `recover_news_deliveries`, which
+    resets it to ``pending`` before this ever runs.
     """
     news_id = _int_or_none(news_id)
     if news_id is None:
@@ -3715,12 +3774,47 @@ async def get_pending_news_deliveries(news_id: int, retry_failed: bool = True) -
         await db.close()
 
 
+async def claim_news_delivery(news_id, user_id) -> bool:
+    """Reserve a send by moving the row to the transient ``sending`` state.
+
+    Returns True when the claim was taken (from ``pending``/``failed``/
+    ``sending``, or by creating the row) and False for a terminal
+    ``sent``/``skipped`` row. Written BEFORE the Telegram call, so a crash
+    mid-send leaves a recoverable ``sending`` row instead of a false ``sent``
+    or a silent loss.
+    """
+    news_id = _int_or_none(news_id)
+    user_id = _int_or_none(user_id)
+    if news_id is None or user_id is None:
+        return False
+
+    db = await get_db()
+    try:
+        # Single atomic upsert: create the row as `sending`, or move a
+        # non-terminal row to `sending`. A terminal `sent`/`skipped` row is
+        # left untouched (the WHERE excludes it), so it can never be reopened.
+        cur = await db.execute(
+            "INSERT INTO news_deliveries (news_id, user_id, status) "
+            "VALUES (?, ?, 'sending') "
+            "ON CONFLICT(news_id, user_id) DO UPDATE SET "
+            "status = 'sending', updated_at = CURRENT_TIMESTAMP "
+            "WHERE news_deliveries.status IN ('pending', 'failed', 'sending')",
+            (news_id, user_id),
+        )
+        await db.commit()
+        return bool(cur.rowcount)
+    finally:
+        await db.close()
+
+
 async def mark_news_delivery(news_id, user_id, status: str, error: str = None,
-                             channel_message_id=None) -> bool:
+                             channel_message_id=None, count_attempt: bool = True) -> bool:
     """Record the outcome of one delivery attempt (upsert semantics).
 
-    Increments ``attempts`` on every call. A ``sent`` row is terminal: it is
-    never overwritten, so a late/duplicate attempt cannot reopen it.
+    Increments ``attempts`` on ``sent``/``failed`` (not on the transient
+    ``sending`` claim, which already happened via `claim_news_delivery`). A
+    ``sent`` row is terminal: it is never overwritten, so a late/duplicate
+    attempt cannot reopen it.
     """
     if status not in NEWS_DELIVERY_STATUSES:
         return False
@@ -3731,6 +3825,8 @@ async def mark_news_delivery(news_id, user_id, status: str, error: str = None,
 
     if error is not None:
         error = str(error)[:500]
+
+    bump = 1 if count_attempt else 0
 
     db = await get_db()
     try:
@@ -3744,8 +3840,8 @@ async def mark_news_delivery(news_id, user_id, status: str, error: str = None,
             await db.execute(
                 "INSERT INTO news_deliveries "
                 "(news_id, user_id, status, attempts, error, channel_message_id, "
-                " updated_at) VALUES (?, ?, ?, 1, ?, ?, CURRENT_TIMESTAMP)",
-                (news_id, user_id, status, error, channel_message_id),
+                " updated_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                (news_id, user_id, status, bump, error, channel_message_id),
             )
             await db.commit()
             return True
@@ -3754,14 +3850,70 @@ async def mark_news_delivery(news_id, user_id, status: str, error: str = None,
             return True  # terminal; keep the successful record
 
         await db.execute(
-            "UPDATE news_deliveries SET status = ?, attempts = attempts + 1, "
+            "UPDATE news_deliveries SET status = ?, attempts = attempts + ?, "
             "error = ?, channel_message_id = COALESCE(?, channel_message_id), "
             "updated_at = CURRENT_TIMESTAMP "
             "WHERE news_id = ? AND user_id = ?",
-            (status, error, channel_message_id, news_id, user_id),
+            (status, bump, error, channel_message_id, news_id, user_id),
         )
         await db.commit()
         return True
+    finally:
+        await db.close()
+
+
+async def reset_stale_news_deliveries(older_than_seconds: int = None) -> int:
+    """Move crashed ``sending`` claims back to ``pending``. Returns the count.
+
+    A send that was claimed but never resolved (process crash mid-Telegram
+    call) is otherwise stuck forever. Anything older than
+    ``NEWS_DELIVERY_STALE_SECONDS`` is assumed crashed and becomes recoverable.
+    """
+    if older_than_seconds is None:
+        older_than_seconds = NEWS_DELIVERY_STALE_SECONDS
+    try:
+        older_than_seconds = max(0, int(older_than_seconds))
+    except (TypeError, ValueError):
+        older_than_seconds = NEWS_DELIVERY_STALE_SECONDS
+
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "UPDATE news_deliveries SET status = 'pending', "
+            "updated_at = CURRENT_TIMESTAMP "
+            "WHERE status = 'sending' "
+            "AND updated_at <= datetime('now', ?)",
+            (f"-{older_than_seconds} seconds",),
+        )
+        await db.commit()
+        return cur.rowcount or 0
+    finally:
+        await db.close()
+
+
+async def list_recoverable_news_ids(limit: int = 50) -> list:
+    """Published news ids with an undelivered row, oldest first (bounded).
+
+    The startup-recovery work list: only ``pending``/``failed`` rows of a
+    *published* item qualify (a stale ``sending`` is reset to ``pending`` by
+    `reset_stale_news_deliveries` beforehand). ``sent``/``skipped`` never
+    appear, so recovery can never resend a completed delivery.
+    """
+    try:
+        limit = max(1, min(int(limit), 500))
+    except (TypeError, ValueError):
+        limit = 50
+
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT DISTINCT d.news_id, MIN(d.updated_at) AS oldest "
+            "FROM news_deliveries d JOIN news n ON n.id = d.news_id "
+            "WHERE d.status IN ('pending', 'failed') AND n.status = 'published' "
+            "GROUP BY d.news_id ORDER BY oldest ASC LIMIT ?",
+            (limit,),
+        ) as cur:
+            return [row[0] for row in await cur.fetchall()]
     finally:
         await db.close()
 
@@ -3850,10 +4002,13 @@ async def create_resource_news_for_content(content_id, sender_id=None,
 
     Resolves the resource's REAL folder from the registry and stores the
     section reference (plus its parent as the subject when one exists), so the
-    generated news is navigable through the same section as the resource. If a
-    row already exists for this content id it is returned unchanged, making
-    this safe to call from a retry, a restart or a repeated approval.
-    Returns None when the content row does not exist.
+    generated news is navigable through the same section as the resource.
+
+    Idempotency is enforced by the database, not by this check: migration v15's
+    partial unique index on ``news(resource_id) WHERE source='resource'`` makes
+    a second auto row impossible even under a concurrent race. The pre-check is
+    just a fast path; if a concurrent caller wins, `create_news` returns the
+    winner's row. Returns None when the content row does not exist.
     """
     content_id = _int_or_none(content_id)
     if content_id is None:
