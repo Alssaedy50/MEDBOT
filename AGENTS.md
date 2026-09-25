@@ -183,7 +183,9 @@ Both consume one daily quota unit per call and return
   `(news_id, user_id)`); `_migrate_v15` adds the partial unique index
   `idx_news_auto_resource_unique` on `news(resource_id) WHERE
   source='resource'` (collapsing any pre-existing auto duplicates first), so an
-  auto resource news row is idempotent at the DB level. Never rewrite v1..v4.
+  auto resource news row is idempotent at the DB level; `_migrate_v17` folds
+  the legacy `resource` news kind into `section` (see News Core below). Never
+  rewrite v1..v4.
 - Role scope is explicit: `ROLE_PERMISSION_PRESETS` maps each role to a baseline
   capability set (owner = all, admin = all except `can_admins`, reviewer =
   contributions + messages, none = nothing) and `ROLE_DESCRIPTIONS` is the
@@ -307,13 +309,22 @@ Both consume one daily quota unit per call and return
   so a supervisor without the relevant capability is not pinged.
 
 ## News Core (الأخبار) — Phase 1
-- `news.py` is the ONLY news implementation: the student 📰 News Center and a
-  minimal admin publishing surface, built directly on migration v13's tables.
-  Nothing existing is rewritten; the existing `notifications` broadcast is a
-  separate subsystem and is untouched.
-- Three first-class kinds share one chronological feed: `notify` (🔴 important
-  notification), `section` (🟡 subject/section news), `resource` (🟢 new
-  resource). `database.NEWS_TYPES` is the source of truth.
+- `news.py` is the ONLY news implementation: the student 📰 News Center and the
+  admin publishing surface, built directly on migration v13's tables. Nothing
+  existing is rewritten; the existing `notifications` broadcast is a separate
+  subsystem and is untouched (it no longer has an Admin Panel entry — 📰 News
+  replaced 🔔 Notifications — but its handlers/text flow stay registered so a
+  legacy message never dead-ends).
+- TWO first-class kinds share one chronological feed: `notify` (🚨 Important /
+  Urgent) and `section` (📚 Section News). `database.NEWS_TYPES` is the source
+  of truth. A resource, explanation post, announcement, etc. is **not** a news
+  kind: it is an optional *linked reference* (`resource_id`) on a 📚 Section
+  News item. The legacy `resource` kind is kept only so an old row/subscription
+  is understood (`database.LEGACY_NEWS_TYPES`/`NEWS_TYPE_ALIASES`); every write
+  funnels through `database.normalize_news_type`, and migration v17 rewrites
+  historical rows/subscriptions to `section`. `NEWS_SOURCE_AUTO` stays the
+  string `"resource"` as the auto-row marker on `news.source` (the v15 partial
+  unique index depends on it), so auto-idempotency is unchanged.
 - Real references only: a news row stores `section_folder_id`/
   `subject_folder_id`/`resource_id`, never a copied name or path.
   `create_news`/`update_news` validate every reference against the live
@@ -406,37 +417,46 @@ Both consume one daily quota unit per call and return
   every published item to everyone, and a non-subscriber simply is not pushed.
   `database.resolve_news_recipients(news_type, section_folder_id)` resolves the
   target set in one query per subscription shape (`notify`→notify subscribers,
-  `resource`→resource subscribers, `section`→section-type + that exact folder),
-  de-duplicated.
+  `section`→section-type + that exact folder), de-duplicated.
 - `database.add_news_subscription` validates the topic (a real kind, or a real
   folder id) and is idempotent; `remove_news_subscription`,
   `get_news_subscriptions`, `get_news_subscriptions_map` (no N+1) and the
   delivery helpers `reserve_news_deliveries` /
   `get_pending_news_deliveries` / `mark_news_delivery` (sent is terminal) /
   `get_news_delivery_counts` / `get_news_deliveries` complete the layer.
-- Publishing centre: `show_admin_news` is 📝 مركز النشر. The draft wizard
-  (`news_new:<type>`) is title → body → doctor → event (each optional via
-  `/skip`), then a section/resource news routes to the real-registry pickers
-  (`pick_section` / `pick_resource`, callbacks `news_ref_*`) — ids are never
-  typed. `_reference_missing_for` blocks `_publish` until a section/resource
-  news has its real reference. On publish, `_publish` flips the row first and
-  then calls `news_delivery.enqueue_publish_delivery` (best-effort; a delivery
-  failure never rolls back the publish).
+- Admin publishing surface: `show_admin_news` is 📰 الأخبار, whose entry screen
+  offers exactly three entries — ➕ نشر خبر (`news_new`), 📋 الأخبار المنشورة
+  (`news_admin_published`) and 🗄 الأرشيف (`news_admin_archived`). `news_new`
+  opens a type chooser (🚨 هام/عاجل / 📚 أخبار الأقسام) gated by scope; the
+  draft wizard (`news_new:<type>`) is title → body → doctor → event (each
+  optional via `/skip`), then a 📚 Section News item routes to the real-registry
+  section picker (`pick_section`, callbacks `news_ref_*`) — ids are never typed.
+  A linked resource is *optional*: `news_ref_resource`/`news_ref_set_resource`
+  link one and `news_ref_unlink` clears it. `_reference_missing_for` blocks
+  `_publish` only for a section news without its real section. On publish,
+  `_publish` flips the row first and then calls
+  `news_delivery.enqueue_publish_delivery` (best-effort; a delivery failure
+  never rolls back the publish).
 - Per-row admin callbacks add `news_admin_deliveries:<id>` (delivery log with
   counts + recent rows) and `news_admin_retry:<id>`; `_admin_item_menu` shapes
-  its actions by state (draft → picker/Preview/Publish, published →
-  View/Archive/Delivery log, archived → View/Restore/Delivery log). Every
+  its actions by state (draft → picker/optional-link/Preview/Publish, published
+  → View/Archive/Delivery log, archived → View/Restore/Delivery log). Every
   mutation is audited (`news_create`, `news_reference`, `news_delivery_retry`
   added to `audit.ACTIONS`/`ACTION_LABELS`).
 - Student subscriptions surface: the feed gains a `news_subs` entry;
-  `show_subscriptions` toggles the three kinds (`news_sub:<type>`) and
-  `show_section_subscriptions` browses the live folder tree
-  (`news_subs_section:<folder_id>`) so a student subscribes only to real
-  sections. Dedicated i18n key `news_subs`.
+  `show_subscriptions` (⚙️ اشتراكات الأخبار) toggles the two kinds
+  (`news_sub:<type>`) and `show_section_subscriptions` (📚 إدارة الأقسام
+  المتابَعة) browses the live folder tree (`news_subs_section:<folder_id>`) so a
+  student subscribes only to real sections. Every toggle shows its state
+  explicitly ("مشترك ✓" / "غير مشترك"). Dedicated i18n key `news_subs`.
+- Student feed filters are explicit, self-describing labels — 📋 كل الأخبار,
+  🚨 هام / عاجل, 📚 أخبار الأقسام — never icon-only/colour-only chips, and there
+  is no "resource" filter.
 - Resource-generated news: `news.publish_news_for_resource(bot, content_id)`
-  creates AT MOST one 🟢 row per content id
+  creates AT MOST one 📚 Section News row per content id
   (`database.create_resource_news_for_content` / `get_resource_news_for_content`,
-  `source='resource'`), resolves the resource's real folder from the registry
+  `source='resource'`, `news_type='section'`), resolves the resource's real
+  folder from the registry
   and publishes+delivers best-effort. Idempotency is DB-level (v15's partial
   unique index), not a check-then-insert race: a concurrent second call gets
   the winner's row back from `create_news` (which catches `IntegrityError` for
@@ -555,12 +575,16 @@ Both consume one daily quota unit per call and return
   `AdminPreviewTests` (preview is authorized, read-only, audited, and changes
   neither the caller's identity nor the target's role/permissions).
 - `test_news_core.py` pins the News Core (Phase 1): migration v13 is additive
-  and idempotent, the three news kinds and their real folder/resource
-  references (an unknown id is rejected), the newest-first paginated feed,
-  publish/archive/restore/delete lifecycle, independent read tracking with no
-  duplicate records, per-user unread counts, the home unread badge, the
-  `can_news`-gated and audited admin surface, and the future-compatibility
-  seams (`news_subscriptions`, `delivery_scope`, `source`, `payload`). It also
+  and idempotent, migration v17 folds the legacy `resource` kind into `section`
+  (rows and subscriptions, idempotently), the two news kinds and their real
+  folder/resource references (an unknown id is rejected), the newest-first
+  paginated feed, publish/archive/restore/delete lifecycle, independent read
+  tracking with no duplicate records, per-user unread counts, the home unread
+  badge, the `can_news`-gated and audited admin surface, the merged News/Admin
+  UX (`NewsUXTests`: explicit feed labels, the two-kind publish form, the
+  subscribe-state wording, the three admin entries, and a linked resource never
+  being a separate kind), and the future-compatibility seams
+  (`news_subscriptions`, `delivery_scope`, `source`, `payload`). It also
   asserts the existing notification broadcast and resource navigation still
   work.
 - `test_news_phase2.py` pins News Phase 2: migration v14 is additive/idempotent
@@ -568,11 +592,12 @@ Both consume one daily quota unit per call and return
   subscriptions validate their topic and resolve recipients by kind/section
   without duplicates; the delivery engine marks sent, isolates a per-recipient
   failure, retries only pending/failed, runs a large audience in the background
-  and never marks an item read; a section/resource news cannot publish without
-  a real reference and the pickers reject an unknown id; the News Center still
-  lists everything to non-subscribers; resource-generated news is created once
-  and never raises; the admin surfaces are `can_news`-gated and audited. Only
-  the Telegram bot boundary is stubbed; the database and all business logic are
+  and never marks an item read; a Section News item cannot publish without a
+  real section reference (a linked resource is optional and never blocks it)
+  and the pickers reject an unknown id; the News Center still lists everything
+  to non-subscribers; resource-generated Section News is created once and never
+  raises; the admin surfaces are `can_news`-gated and audited. Only the
+  Telegram bot boundary is stubbed; the database and all business logic are
   real.
 - `test_news_phase2_fixes.py` pins the Phase 2 review fixes: delivery
   crash/restart recovery (a `pending` row is finished, a `failed` row is

@@ -558,7 +558,8 @@ class NewsScopeTests(ScopedRbacBase):
 
     async def test_scoped_admin_cannot_reference_out_of_scope_resource(self):
         news_id = await database.create_news(
-            news_type="resource", title="R news", sender_id=self.owner_id
+            news_type="section", title="R news", sender_id=self.owner_id,
+            section_folder_id=self.section_a,
         )
         await self._news(
             self.scoped_id,
@@ -579,9 +580,10 @@ class NewsScopeTests(ScopedRbacBase):
 
     async def test_direct_resource_scope_covers_its_news(self):
         # An admin scoped only to the resource (no folder scope) may manage the
-        # resource news that references it.
+        # Section News item that links it.
         news_id = await database.create_news(
-            news_type="resource", title="R news", sender_id=self.owner_id
+            news_type="section", title="R news", sender_id=self.owner_id,
+            section_folder_id=self.section_a,
         )
         await database.update_news(news_id, resource_id=self.resource_a)
         await database.clear_admin_scopes(self.scoped_id)
@@ -591,7 +593,8 @@ class NewsScopeTests(ScopedRbacBase):
 
     async def test_direct_resource_scope_does_not_cover_other_resource_news(self):
         news_id = await database.create_news(
-            news_type="resource", title="R news", sender_id=self.owner_id
+            news_type="section", title="R news", sender_id=self.owner_id,
+            section_folder_id=self.section_a,
         )
         await database.update_news(news_id, resource_id=self.resource_b)
         await database.clear_admin_scopes(self.scoped_id)

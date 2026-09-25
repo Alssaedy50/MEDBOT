@@ -3540,8 +3540,8 @@ async def show_admin(query):
         rows.append([btn("📬 رسائل الطلاب", "admin_messages")])
     if await _allowed("can_ai"):
         rows.append([btn("🤖 AI Registry", "admin_ai")])
-    if await _allowed("can_notifications"):
-        rows.append([btn("🔔 الإشعارات", "admin_notifications")])
+    # News is the single publishing surface (replaces the old standalone
+    # Notifications entry); the gate is the same `can_news` capability.
     if await _allowed("can_news"):
         rows.append([btn("📰 الأخبار", "admin_news")])
     if await _allowed("can_topics"):
@@ -5674,7 +5674,9 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await topics.handle_topics_text(update, context):
         return
 
-    # Notifications: admin typing a broadcast body.
+    # Notifications: legacy broadcast body flow. It has no Admin Panel entry
+    # any more (📰 News replaced it), but the flow stays wired so an old
+    # message that starts it can still be completed.
     if await notifications.handle_notification_text(update, context):
         return
 
@@ -5957,6 +5959,9 @@ def main():
     admin_management.register_admin_management_handlers(app)
     platform_settings.register_platform_settings_handlers(app)
     topics.register_topics_handlers(app)
+    # Notifications has no Admin Panel entry any more (📰 News replaced it), but
+    # its legacy callbacks/text flow stay reachable so an old message never
+    # dead-ends. It is NOT a second admin surface: nothing in the UI links here.
     notifications.register_notifications_handlers(app)
     news.register_news_handlers(app)
     visibility.register_visibility_handlers(app)

@@ -365,10 +365,11 @@ class NewsDeliveryEngineTests(NewsPhase2Base):
         self.assertEqual(await database.get_unread_news_count(self.student_id), 1)
 
     async def test_message_carries_real_reference_button(self):
+        # A linked resource on a Section News item yields a direct button.
         nid = await self._make(
-            news_type="resource", title="New file", resource_id=self.resource
+            news_type="section", title="New file", resource_id=self.resource
         )
-        await database.add_news_subscription(self.student_id, "type", "resource")
+        await database.add_news_subscription(self.student_id, "type", "section")
         await news_delivery.enqueue_publish_delivery(_RecordingBot(), nid)
         markup = news_delivery.build_delivery_markup(
             await database.get_news_detail(nid)
@@ -378,7 +379,7 @@ class NewsDeliveryEngineTests(NewsPhase2Base):
 
     async def test_removed_resource_has_no_dead_button(self):
         nid = await self._make(
-            news_type="resource", title="Gone", resource_id=self.resource
+            news_type="section", title="Gone", resource_id=self.resource
         )
         await database.delete_file(self.resource)
         markup = news_delivery.build_delivery_markup(
@@ -400,11 +401,15 @@ class NewsPublishingTests(NewsPhase2Base):
         self.assertIn("قبل اختيار القسم", query.last_text)
         self.assertEqual((await database.get_news(nid))["status"], "draft")
 
-    async def test_resource_news_requires_reference_before_publish(self):
-        nid = await database.create_news("resource", "File news", status="draft")
-        query, _ = await self._open(self.owner_id, f"news_admin_pub:{nid}")
-        self.assertIn("قبل اختيار المورد", query.last_text)
-        self.assertEqual((await database.get_news(nid))["status"], "draft")
+    async def test_linked_resource_does_not_block_publish(self):
+        # A resource is optional metadata on a Section News item, so a section
+        # with a real reference publishes even without one.
+        nid = await database.create_news(
+            "section", "File news", status="draft",
+            section_folder_id=self.section,
+        )
+        await self._open(self.owner_id, f"news_admin_pub:{nid}")
+        self.assertEqual((await database.get_news(nid))["status"], "published")
 
     async def test_notify_news_publishes_without_reference(self):
         nid = await database.create_news("notify", "No ref", status="draft")
@@ -433,7 +438,10 @@ class NewsPublishingTests(NewsPhase2Base):
         self.assertEqual(row["subject_folder_id"], self.subject)
 
     async def test_resource_picker_sets_real_reference(self):
-        nid = await database.create_news("resource", "File news", status="draft")
+        nid = await database.create_news(
+            "section", "File news", status="draft",
+            section_folder_id=self.section,
+        )
         query, _ = await self._open(
             self.owner_id, f"news_ref_set_resource:{nid}:{self.resource}"
         )
@@ -446,7 +454,10 @@ class NewsPublishingTests(NewsPhase2Base):
         self.assertIsNone((await database.get_news(nid))["section_folder_id"])
 
     async def test_resource_picker_rejects_unknown_content(self):
-        nid = await database.create_news("resource", "File news", status="draft")
+        nid = await database.create_news(
+            "section", "File news", status="draft",
+            section_folder_id=self.section,
+        )
         query, _ = await self._open(
             self.owner_id, f"news_ref_set_resource:{nid}:99999"
         )
@@ -540,7 +551,7 @@ class NewsSubscriptionUITests(NewsPhase2Base):
 
     async def test_section_browser_lists_real_folders(self):
         query, _ = await self._open(self.student_id, "news_subs_sections")
-        self.assertIn("اشتراكات الأقسام", query.last_text)
+        self.assertIn("إدارة الأقسام المتابَعة", query.last_text)
         labels = [b.text for row in query.last_markup.inline_keyboard for b in row]
         self.assertTrue(any("Second Year" in label for label in labels))
 
@@ -567,7 +578,9 @@ class NewsResourceAutoTests(NewsPhase2Base):
         nid = await news.publish_news_for_resource(bot, self.resource)
         self.assertIsNotNone(nid)
         row = await database.get_news(nid)
-        self.assertEqual(row["news_type"], "resource")
+        # A resource is no longer its own kind: the auto row is a Section News
+        # item anchored to the resource's real folder.
+        self.assertEqual(row["news_type"], "section")
         self.assertEqual(row["status"], "published")
         self.assertEqual(row["resource_id"], self.resource)
         self.assertEqual(row["section_folder_id"], self.section)
@@ -578,7 +591,7 @@ class NewsResourceAutoTests(NewsPhase2Base):
         self.assertEqual(len(await database.list_news(status="all")), 1)
 
     async def test_auto_news_delivers_to_resource_subscribers(self):
-        await database.add_news_subscription(self.student_id, "type", "resource")
+        await database.add_news_subscription(self.student_id, "type", "section")
         bot = _RecordingBot()
         nid = await news.publish_news_for_resource(bot, self.resource)
         await news_delivery.drain_background(timeout=2.0)

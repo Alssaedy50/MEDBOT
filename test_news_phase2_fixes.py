@@ -394,7 +394,8 @@ class ResourceNewsIdempotencyTests(NewsPhase2FixBase):
         # second auto row.
         first = await database.create_resource_news_for_content(self.resource)
         dup = await database.create_news(
-            news_type="resource", title="dup", resource_id=self.resource,
+            news_type="section", title="dup", resource_id=self.resource,
+            section_folder_id=self.section,
             source=database.NEWS_SOURCE_AUTO,
         )
         self.assertEqual(dup, first)
@@ -405,10 +406,12 @@ class ResourceNewsIdempotencyTests(NewsPhase2FixBase):
     async def test_manual_news_for_same_resource_still_allowed(self):
         await database.create_resource_news_for_content(self.resource)
         manual_a = await database.create_news(
-            news_type="resource", title="Manual A", resource_id=self.resource,
+            news_type="section", title="Manual A", resource_id=self.resource,
+            section_folder_id=self.section,
         )
         manual_b = await database.create_news(
-            news_type="resource", title="Manual B", resource_id=self.resource,
+            news_type="section", title="Manual B", resource_id=self.resource,
+            section_folder_id=self.section,
         )
         self.assertTrue(manual_a and manual_b)
         rows = await database.list_news(status="all")
