@@ -159,6 +159,23 @@ class CallbackGateTests(VisibilityBase):
                     main._feature_for_callback(callback), feature, callback
                 )
 
+    async def test_news_subscription_callbacks_map_to_news(self):
+        # The subscription tree uses news_pick_child/news_pick_root to descend
+        # and news_subs_section to toggle; a hidden news feature must block all
+        # of them, not only the first screen.
+        for callback in (
+            "news",
+            "news_subs",
+            "news_sub:section",
+            "news_unsub:section",
+            "news_subs_section:5",
+            "news_pick_child:5",
+            "news_pick_root:0",
+            "news_open:3",
+            "news_more:1",
+        ):
+            self.assertEqual(main._feature_for_callback(callback), "news", callback)
+
 
 class VisibilityAdminSurfaceTests(VisibilityBase):
     async def _manage(self, user_id, data):

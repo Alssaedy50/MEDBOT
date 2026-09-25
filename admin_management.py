@@ -22,10 +22,20 @@ from telegram.ext import (
 )
 
 import audit
+import authorization
 import database
 import workflow
 
 logger = logging.getLogger(__name__)
+
+
+def _int_or_none(value):
+    try:
+        if value is None or value is True or value is False:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def esc(value) -> str:
@@ -74,6 +84,7 @@ def _admins_menu(admins) -> InlineKeyboardMarkup:
             [btn(f"{role_label} | {name[:18]} | {telegram_id}", f"amg_view:{telegram_id}")]
         )
     rows.append([btn("➕ إضافة مشرف", "amg_add")])
+    rows.append([btn("⚙️ إدارة الصلاحيات", "amg_perms_guide")])
     rows.append([btn("ℹ️ صلاحيات الأدوار", "amg_roles")])
     rows.append([btn("⬅️ Admin", "admin")])
     rows.append([btn("🏠 الرئيسية", "home")])
@@ -196,6 +207,13 @@ async def show_admin_detail(query, target_id):
     # can manage, without changing anyone's Telegram identity.
     rows.append([btn("👁 معاينة واجهة المشرف", f"amg_preview:{target_id}")])
 
+    # Phase 3 — scoped responsibility (folder / topic / resource). Only
+    # meaningful for a non-owner; the owner is unrestricted by design.
+    if not target_is_owner:
+        scopes = await database.get_admin_scopes(target_id)
+        scope_note = f" ({len(scopes)})" if scopes else ""
+        rows.append([btn(f"🧭 نطاقات المسؤولية{scope_note}", f"amg_scopes:{target_id}")])
+
     rows.append([btn("🗑 إزالة المشرف", f"amg_remove:{target_id}")])
     rows.append([btn("⬅️ إدارة المشرفين", "amg_list")])
     rows.append([btn("🏠 الرئيسية", "home")])
@@ -288,6 +306,364 @@ async def execute_transfer(query, target_id):
             ]
         ),
     )
+
+
+async def show_permissions_guide(query):
+    """The '⚙️ إدارة الصلاحيات' surface: roles + scoped operations explained.
+
+    Read-only guidance for owners so the permission/scope model is explicit.
+    Gated by `can_admins`; a scoped admin never reaches it (they lack
+    `can_admins`, and the panel hides the entry for them).
+    """
+    if not await _is_authorized(query.from_user.id):
+        await _edit(query, "🔒 غير مصرح.", _home_keyboard())
+        return
+
+    lines = [
+        "⚙️ <b>إدارة الصلاحيات والنطاقات</b>",
+        "",
+        "النموذج: <b>الدور + الصلاحيات + النطاقات</b>.",
+        "«المشرف» يحصل على صلاحيات محددة، ويمكن تقييده بنطاق "
+        "(قسم / موضوع / مورد) فلا يعمل إلا داخله.",
+        "",
+        "🛡 <b>الصلاحيات المتاحة (Scope-aware)</b>",
+    ]
+    for key in database.SCOPED_PERMISSIONS:
+        lines.append(f"• {esc(database.SCOPED_PERMISSION_LABELS.get(key, key))}")
+
+    lines.append("")
+    lines.append("🧭 <b>النطاقات</b>")
+    for key in database.SCOPE_TYPES:
+        lines.append(f"• {esc(database.SCOPE_TYPE_LABELS.get(key, key))}")
+
+    lines.append("")
+    lines.append(
+        "ℹ️ المشرف بلا نطاقات = وصول كامل بحسب صلاحياته. "
+        "بمجرد إضافة نطاق واحد يصبح مقيّدًا به."
+    )
+
+    await _edit(
+        query,
+        "\n".join(lines),
+        InlineKeyboardMarkup(
+            [
+                [btn("👥 إدارة المشرفين", "amg_list")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
+def _scopes_keyboard(target_id, scopes) -> InlineKeyboardMarkup:
+    rows = []
+    for scope in scopes:
+        label = database.SCOPE_TYPE_LABELS.get(scope["scope_type"], scope["scope_type"])
+        rows.append(
+            [
+                btn(
+                    f"🗑 {label} #{scope['scope_id']}",
+                    f"amg_scope_view:{target_id}:{scope['scope_type']}:{scope['scope_id']}",
+                )
+            ]
+        )
+    rows.append([btn("➕ إضافة نطاق", f"amg_scope_add:{target_id}")])
+    rows.append([btn("⬅️ بيانات المشرف", f"amg_view:{target_id}")])
+    rows.append([btn("🏠 الرئيسية", "home")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_admin_scopes(query, target_id):
+    """List one admin's scopes with add/remove controls. Owner-gated."""
+    if not await _is_authorized(query.from_user.id):
+        await _edit(query, "🔒 غير مصرح.", _home_keyboard())
+        return
+
+    record = await database.get_admin_record(target_id)
+    if not record:
+        await _edit(
+            query,
+            "⚠️ المشرف غير موجود.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة المشرفين", "amg_list")]]),
+        )
+        return
+
+    scopes = await database.get_admin_scopes(target_id)
+    name = str(record.get("username") or "").strip() or "بدون اسم"
+
+    lines = [
+        "🧭 <b>نطاقات المشرف</b>",
+        f"🆔 <code>{esc(target_id)}</code> · {esc(name)}",
+        "",
+    ]
+
+    if scopes:
+        lines.append("النطاقات الحالية (يعمل داخلها فقط):")
+        for scope in scopes:
+            label = database.SCOPE_TYPE_LABELS.get(
+                scope["scope_type"], scope["scope_type"]
+            )
+            lines.append(f"• {esc(label)} — <code>{esc(scope['scope_id'])}</code>")
+    else:
+        lines.append(
+            "لا توجد نطاقات — هذا المشرف غير مقيّد ويعمل على كامل المنصة "
+            "بحسب صلاحياته."
+        )
+
+    lines.append("")
+    lines.append(
+        "ℹ️ اضغط على نطاق لسحبه، أو أضف نطاقًا جديدًا (قسم / موضوع / مورد)."
+    )
+
+    await _edit(query, "\n".join(lines), _scopes_keyboard(target_id, scopes))
+
+
+async def revoke_admin_scope(query, target_id, scope_type, scope_id):
+    """Remove one scope and audit it. Refuses the owner."""
+    if not await _is_authorized(query.from_user.id):
+        await _edit(query, "🔒 غير مصرح.", _home_keyboard())
+        return
+
+    if await database.is_owner(target_id):
+        # The owner is unrestricted by design; scoping them is meaningless and
+        # could look like a grant. Refuse explicitly.
+        await _edit(
+            query,
+            "ℹ️ المالك غير مقيّد بنطاقات.",
+            InlineKeyboardMarkup([[btn("⬅️ بيانات المشرف", f"amg_view:{target_id}")]]),
+        )
+        return
+
+    ok = await database.remove_admin_scope(target_id, scope_type, scope_id)
+    if ok:
+        await audit.log_action(
+            query.from_user.id,
+            "scope_revoke",
+            target_type=scope_type,
+            target_id=scope_id,
+            details=f"admin={target_id}",
+        )
+
+    await show_admin_scopes(query, target_id)
+
+
+async def show_scope_add_menu(query, target_id):
+    """Choose the scope type to add: folder / topic / resource."""
+    if not await _is_authorized(query.from_user.id):
+        await _edit(query, "🔒 غير مصرح.", _home_keyboard())
+        return
+
+    record = await database.get_admin_record(target_id)
+    if not record:
+        await _edit(
+            query,
+            "⚠️ المشرف غير موجود.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة المشرفين", "amg_list")]]),
+        )
+        return
+
+    await _edit(
+        query,
+        "➕ <b>إضافة نطاق</b>\n\n"
+        "اختر نوع النطاق الذي سيكون المشرف مسؤولًا عنه:",
+        InlineKeyboardMarkup(
+            [
+                [btn("🗂 قسم", f"amg_scope_roots:{target_id}:folder")],
+                [btn("🧭 موضوع", f"amg_scope_add_topic:{target_id}")],
+                [btn("📄 مورد", f"amg_scope_res_roots:{target_id}")],
+                [btn("⬅️ نطاقات المشرف", f"amg_scopes:{target_id}")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
+async def _folder_pick_keyboard(target_id, scope_type, parent_id, folders):
+    rows = []
+    if scope_type == "folder":
+        rows.append(
+            [btn("✅ اختيار هذا القسم", f"amg_scope_set:{target_id}:folder:{parent_id}")]
+        )
+    for folder in folders:
+        try:
+            folder_id, name = folder[0], folder[1]
+        except Exception:
+            continue
+        rows.append(
+            [
+                btn(
+                    f"📁 {str(name)[:30]}",
+                    f"amg_scope_browse:{target_id}:{scope_type}:{folder_id}",
+                ),
+                btn("✅", f"amg_scope_set:{target_id}:{scope_type}:{folder_id}"),
+            ]
+        )
+    rows.append([btn("⬅️ رجوع", f"amg_scopes:{target_id}")])
+    rows.append([btn("🏠 الرئيسية", "home")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def browse_scope_folders(query, target_id, scope_type, parent_id=0):
+    """Browse the real folder tree to pick a folder scope (or a resource)."""
+    if not await _is_authorized(query.from_user.id):
+        await _edit(query, "🔒 غير مصرح.", _home_keyboard())
+        return
+
+    try:
+        folders = await database.get_folders(parent_id)
+    except Exception:
+        folders = []
+
+    if scope_type == "resource":
+        # Pick a folder, then a resource inside it.
+        rows = []
+        for folder in folders:
+            try:
+                folder_id, name = folder[0], folder[1]
+            except Exception:
+                continue
+            rows.append(
+                [btn(f"📁 {str(name)[:30]}", f"amg_scope_res:{target_id}:{folder_id}")]
+            )
+        rows.append([btn("⬅️ رجوع", f"amg_scopes:{target_id}")])
+        rows.append([btn("🏠 الرئيسية", "home")])
+        await _edit(
+            query,
+            "📄 <b>اختيار مورد</b>\n\nاختر القسم الذي يحتوي المورد:",
+            InlineKeyboardMarkup(rows),
+        )
+        return
+
+    await _edit(
+        query,
+        "🗂 <b>اختيار قسم</b>\n\n"
+        "ادخل إلى القسم المطلوب ثم اضغط «✅ اختيار هذا القسم».",
+        _folder_pick_keyboard(target_id, scope_type, parent_id, folders),
+    )
+
+
+async def pick_scope_resources(query, target_id, folder_id):
+    """List the real resources in a folder to pick one as a resource scope."""
+    if not await _is_authorized(query.from_user.id):
+        await _edit(query, "🔒 غير مصرح.", _home_keyboard())
+        return
+
+    try:
+        files = await database.get_files(folder_id)
+    except Exception:
+        files = []
+
+    rows = []
+    for item in files:
+        try:
+            content_id, title = item[0], item[1]
+        except Exception:
+            continue
+        rows.append(
+            [
+                btn(
+                    f"📄 {str(title)[:30]}",
+                    f"amg_scope_set:{target_id}:resource:{content_id}",
+                )
+            ]
+        )
+
+    if not files:
+        rows.append([btn("ℹ️ لا توجد موارد في هذا القسم", "noop")])
+
+    rows.append([btn("⬅️ رجوع", f"amg_scope_res_roots:{target_id}")])
+    rows.append([btn("🏠 الرئيسية", "home")])
+
+    await _edit(
+        query,
+        "📄 <b>اختيار مورد</b>\n\nاختر المورد الذي سيكون نطاقًا للمشرف:",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+async def pick_scope_topic(query, target_id):
+    """List the real Search Topics to pick one as a topic scope."""
+    if not await _is_authorized(query.from_user.id):
+        await _edit(query, "🔒 غير مصرح.", _home_keyboard())
+        return
+
+    try:
+        topics = await database.get_topics(active_only=False)
+    except Exception:
+        topics = []
+
+    rows = []
+    for topic in topics:
+        try:
+            topic_id, name = topic["id"], topic["name"]
+        except Exception:
+            continue
+        rows.append(
+            [
+                btn(
+                    f"🧭 {str(name)[:30]}",
+                    f"amg_scope_set:{target_id}:topic:{topic_id}",
+                )
+            ]
+        )
+
+    if not topics:
+        rows.append([btn("ℹ️ لا توجد مواضيع", "noop")])
+
+    rows.append([btn("⬅️ رجوع", f"amg_scope_add:{target_id}")])
+    rows.append([btn("🏠 الرئيسية", "home")])
+
+    await _edit(
+        query,
+        "🧭 <b>اختيار موضوع</b>\n\n"
+        "سيشمل النطاق كل الأقسام المرتبطة بهذا الموضوع:",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+async def set_admin_scope(query, target_id, scope_type, scope_id):
+    """Grant one scope (validated against the live registry) and audit it."""
+    if not await _is_authorized(query.from_user.id):
+        await _edit(query, "🔒 غير مصرح.", _home_keyboard())
+        return
+
+    if await database.is_owner(target_id):
+        await _edit(
+            query,
+            "ℹ️ المالك غير مقيّد بنطاقات.",
+            InlineKeyboardMarkup([[btn("⬅️ بيانات المشرف", f"amg_view:{target_id}")]]),
+        )
+        return
+
+    record = await database.get_admin_record(target_id)
+    if not record:
+        await _edit(
+            query,
+            "⚠️ المشرف غير موجود.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة المشرفين", "amg_list")]]),
+        )
+        return
+
+    ok = await database.add_admin_scope(
+        target_id, scope_type, scope_id, created_by=query.from_user.id
+    )
+
+    if not ok:
+        await _edit(
+            query,
+            "⚠️ تعذّر إضافة النطاق (العنصر غير موجود).",
+            InlineKeyboardMarkup([[btn("⬅️ نطاقات المشرف", f"amg_scopes:{target_id}")]]),
+        )
+        return
+
+    await audit.log_action(
+        query.from_user.id,
+        "scope_grant",
+        target_type=scope_type,
+        target_id=scope_id,
+        details=f"admin={target_id}",
+    )
+
+    await show_admin_scopes(query, target_id)
 
 
 async def show_admin_preview(query, target_id):
@@ -593,6 +969,99 @@ async def admin_management_callback_handler(update, context: ContextTypes.DEFAUL
         await show_role_reference(query)
         return
 
+    if data == "amg_perms_guide":
+        await show_permissions_guide(query)
+        return
+
+    if data.startswith("amg_scopes:"):
+        target_id = _int_or_none(data.split(":", 1)[1])
+        if target_id is None:
+            await _edit(query, "⚠️ معرف غير صالح.", _home_keyboard())
+            return
+        await show_admin_scopes(query, target_id)
+        return
+
+    if data.startswith("amg_scope_add:"):
+        target_id = _int_or_none(data.split(":", 1)[1])
+        if target_id is None:
+            await _edit(query, "⚠️ معرف غير صالح.", _home_keyboard())
+            return
+        await show_scope_add_menu(query, target_id)
+        return
+
+    if data.startswith("amg_scope_add_topic:"):
+        target_id = _int_or_none(data.split(":", 1)[1])
+        if target_id is None:
+            await _edit(query, "⚠️ معرف غير صالح.", _home_keyboard())
+            return
+        await pick_scope_topic(query, target_id)
+        return
+
+    if data.startswith("amg_scope_roots:") or data.startswith("amg_scope_res_roots:"):
+        parts = data.split(":")
+        if len(parts) < 3:
+            await _edit(query, "⚠️ بيانات غير صالحة.", _home_keyboard())
+            return
+        target_id = _int_or_none(parts[1])
+        if target_id is None:
+            await _edit(query, "⚠️ معرف غير صالح.", _home_keyboard())
+            return
+        scope_type = parts[2] if parts[0] == "amg_scope_roots" else "resource"
+        await browse_scope_folders(query, target_id, scope_type, 0)
+        return
+
+    if data.startswith("amg_scope_browse:"):
+        parts = data.split(":")
+        if len(parts) != 4:
+            await _edit(query, "⚠️ بيانات غير صالحة.", _home_keyboard())
+            return
+        target_id = _int_or_none(parts[1])
+        folder_id = _int_or_none(parts[3])
+        if target_id is None or folder_id is None:
+            await _edit(query, "⚠️ معرف غير صالح.", _home_keyboard())
+            return
+        await browse_scope_folders(query, target_id, parts[2], folder_id)
+        return
+
+    if data.startswith("amg_scope_res:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            await _edit(query, "⚠️ بيانات غير صالحة.", _home_keyboard())
+            return
+        target_id = _int_or_none(parts[1])
+        folder_id = _int_or_none(parts[2])
+        if target_id is None or folder_id is None:
+            await _edit(query, "⚠️ معرف غير صالح.", _home_keyboard())
+            return
+        await pick_scope_resources(query, target_id, folder_id)
+        return
+
+    if data.startswith("amg_scope_set:"):
+        parts = data.split(":")
+        if len(parts) != 4:
+            await _edit(query, "⚠️ بيانات غير صالحة.", _home_keyboard())
+            return
+        target_id = _int_or_none(parts[1])
+        scope_id = _int_or_none(parts[3])
+        if target_id is None or scope_id is None:
+            await _edit(query, "⚠️ معرف غير صالح.", _home_keyboard())
+            return
+        await set_admin_scope(query, target_id, parts[2], scope_id)
+        return
+
+    if data.startswith("amg_scope_view:"):
+        parts = data.split(":")
+        if len(parts) != 4:
+            await _edit(query, "⚠️ بيانات غير صالحة.", _home_keyboard())
+            return
+        target_id = _int_or_none(parts[1])
+        scope_id = _int_or_none(parts[3])
+        if target_id is None or scope_id is None:
+            await _edit(query, "⚠️ معرف غير صالح.", _home_keyboard())
+            return
+        await revoke_admin_scope(query, target_id, parts[2], scope_id)
+        return
+
     if data.startswith("amg_view:"):
         try:
             target_id = int(data.split(":", 1)[1])
@@ -673,6 +1142,6 @@ def register_admin_management_handlers(app):
     app.add_handler(
         CallbackQueryHandler(
             admin_management_callback_handler,
-            pattern=r"^(amg_list|amg_add|amg_roles|amg_view:|amg_preview:|amg_perm:|amg_role:|amg_remove:|amg_transfer)",
+            pattern=r"^(amg_list|amg_add|amg_roles|amg_perms_guide|amg_view:|amg_preview:|amg_perm:|amg_role:|amg_remove:|amg_transfer|amg_scopes:|amg_scope_)",
         )
     )

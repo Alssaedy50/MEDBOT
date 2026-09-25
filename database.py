@@ -217,6 +217,7 @@ async def init_db():
         await _migrate_v13(db)
         await _migrate_v14(db)
         await _migrate_v15(db)
+        await _migrate_v16(db)
 
         # ------------------------------------------------------------
         # Performance / integrity indexes
@@ -560,6 +561,86 @@ ROLE_DESCRIPTIONS = {
         "• لا يملك أي صلاحية إدارية."
     ),
 }
+
+# ------------------------------------------------------------
+# Phase 3 — Scoped RBAC (permissions + scopes)
+# ------------------------------------------------------------
+# The coarse `PERMISSION_KEYS` above remain the single source of truth for
+# "can this admin reach this surface at all" (backward compatible with every
+# existing handler and admin row). Phase 3 adds a *finer, scope-aware* layer on
+# top: a named operation that maps to exactly one coarse key and is evaluated
+# against a target object by `authorization.can()`.
+#
+# `authorization.py` is the ONLY place that combines the two, so no handler
+# duplicates the "permission + scope" decision. Add a new operation here (and
+# to its coarse key) to make it enforceable; an unknown operation is denied.
+SCOPED_PERMISSIONS = (
+    "resource.view",
+    "resource.create",
+    "resource.edit",
+    "resource.delete",
+    "news.view",
+    "news.create",
+    "news.edit",
+    "news.publish",
+    "news.archive",
+    "section.view",
+    "section.manage",
+    "contribution.review",
+    "notification.send",
+    "ai_registry.manage",
+)
+
+# Operation -> coarse capability. A scoped admin must hold the coarse key AND
+# pass the scope test; the two are never checked in isolation for these ops.
+SCOPED_PERMISSION_COARSE = {
+    "resource.view": "can_content",
+    "resource.create": "can_content",
+    "resource.edit": "can_content",
+    "resource.delete": "can_content",
+    "news.view": "can_news",
+    "news.create": "can_news",
+    "news.edit": "can_news",
+    "news.publish": "can_news",
+    "news.archive": "can_news",
+    "section.view": "can_folders",
+    "section.manage": "can_folders",
+    "contribution.review": "can_contributions",
+    "notification.send": "can_notifications",
+    "ai_registry.manage": "can_ai",
+}
+
+SCOPED_PERMISSION_LABELS = {
+    "resource.view": "👁 عرض الموارد",
+    "resource.create": "➕ إنشاء مورد",
+    "resource.edit": "✏️ تعديل مورد",
+    "resource.delete": "🗑 حذف مورد",
+    "news.view": "👁 عرض الأخبار",
+    "news.create": "📝 إنشاء خبر",
+    "news.edit": "✏️ تعديل خبر",
+    "news.publish": "📢 نشر خبر",
+    "news.archive": "🗄 أرشفة خبر",
+    "section.view": "👁 عرض الأقسام",
+    "section.manage": "🗂 إدارة الأقسام",
+    "contribution.review": "📥 مراجعة المساهمات",
+    "notification.send": "🔔 إرسال إشعار",
+    "ai_registry.manage": "🤖 إدارة AI Registry",
+}
+
+# Scope target kinds. A scope restricts an admin to a real registry object:
+#   folder   -> that folder and all of its descendants
+#   topic    -> every folder linked to that Search Topic (and descendants)
+#   resource -> that one content row
+# `folder`/`resource` reference the existing `folders`/`content` tables — no
+# second hierarchy is introduced. `topic` references the existing `topics`.
+SCOPE_TYPES = ("folder", "topic", "resource")
+
+SCOPE_TYPE_LABELS = {
+    "folder": "🗂 قسم",
+    "topic": "🧭 موضوع",
+    "resource": "📄 مورد",
+}
+
 
 # ------------------------------------------------------------
 # Public navigation features (hide/show from the home page)
@@ -1175,6 +1256,57 @@ async def _migrate_v15(db):
     except Exception:
         logger.exception("Migration v15: statement failed")
     logger.info("Migration v15: ensured auto resource news uniqueness")
+
+
+def _migrate_v16_sql():
+    """DDL statements owned by migration v16, exposed for testing/review."""
+    return (
+        """
+        CREATE TABLE IF NOT EXISTS admin_scopes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL,
+            scope_type TEXT NOT NULL,
+            scope_id INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_by INTEGER,
+            UNIQUE (admin_id, scope_type, scope_id)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_admin_scopes_admin "
+        "ON admin_scopes(admin_id)",
+        "CREATE INDEX IF NOT EXISTS idx_admin_scopes_target "
+        "ON admin_scopes(scope_type, scope_id)",
+    )
+
+
+async def _migrate_v16(db):
+    """Phase 3 Scoped RBAC: per-admin scope assignments.
+
+    One additive table, ``admin_scopes``, records which real registry objects
+    an admin is responsible for: a ``folder`` (the branch plus all of its
+    descendants), a ``topic`` (every folder linked to that Search Topic), or a
+    single ``resource`` (one content row). ``(admin_id, scope_type, scope_id)``
+    is UNIQUE, so a scope can never be duplicated. References point at the
+    existing ``admins`` / ``folders`` / ``content`` / ``topics`` rows — no
+    second hierarchy and no user table is introduced.
+
+    No foreign keys are declared on ``scope_id`` on purpose: it is a
+    polymorphic reference (folder OR topic OR content depending on
+    ``scope_type``), so a single FK column cannot be correct. Resolution is
+    always validated against the live registry by ``authorization.py``, and a
+    scope whose target was later deleted simply matches nothing (fail-closed).
+
+    Additive and idempotent: CREATE ... IF NOT EXISTS only, nothing existing is
+    read, rewritten, or dropped. An admin with no scope rows keeps
+    platform-wide reach (the pre-Phase-3 behaviour), so this migration grants
+    and revokes nothing by itself.
+    """
+    for statement in _migrate_v16_sql():
+        try:
+            await db.execute(statement)
+        except Exception:
+            logger.exception("Migration v16: statement failed")
+    logger.info("Migration v16: ensured admin scope table")
 
 # Message categories and lifecycle states.
 MESSAGE_CATEGORIES = ("message", "summary", "suggestion", "report")
@@ -4727,6 +4859,439 @@ async def user_has_permission(user_id, permission: str) -> bool:
     if record["role"] == "owner":
         return True
     return bool(record["permissions"].get(permission))
+
+
+# ------------------------------------------------------------
+# Phase 3 — scope storage & resolution (touches only `admin_scopes` + registry)
+# ------------------------------------------------------------
+async def add_admin_scope(admin_id, scope_type: str, scope_id, created_by=None) -> bool:
+    """Grant an admin a scope over a real registry object.
+
+    Validates the target against the live registry before persisting, so a
+    scope can never point at a non-existent folder/topic/resource. Idempotent
+    via the UNIQUE constraint. Unknown scope_type or unknown target: no write.
+    """
+    admin_id = _int_or_none(admin_id)
+    scope_id = _int_or_none(scope_id)
+    if admin_id is None or scope_id is None:
+        return False
+    if scope_type not in SCOPE_TYPES:
+        return False
+
+    db = await get_db()
+    try:
+        table = {"folder": "folders", "topic": "topics", "resource": "content"}[scope_type]
+        async with db.execute(
+            f"SELECT id FROM {table} WHERE id = ?", (scope_id,)
+        ) as cur:
+            if not await cur.fetchone():
+                return False
+        try:
+            await db.execute(
+                "INSERT INTO admin_scopes (admin_id, scope_type, scope_id, created_by) "
+                "VALUES (?, ?, ?, ?)",
+                (admin_id, scope_type, scope_id, _int_or_none(created_by)),
+            )
+            await db.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return True  # already present (UNIQUE) -> idempotent success
+    except Exception:
+        return False
+    finally:
+        await db.close()
+
+
+async def remove_admin_scope(admin_id, scope_type: str, scope_id) -> bool:
+    """Revoke one scope. Returns True when a row was removed."""
+    admin_id = _int_or_none(admin_id)
+    scope_id = _int_or_none(scope_id)
+    if admin_id is None or scope_id is None or scope_type not in SCOPE_TYPES:
+        return False
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "DELETE FROM admin_scopes "
+            "WHERE admin_id = ? AND scope_type = ? AND scope_id = ?",
+            (admin_id, scope_type, scope_id),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+    except Exception:
+        return False
+    finally:
+        await db.close()
+
+
+async def clear_admin_scopes(admin_id) -> int:
+    """Remove every scope of an admin. Returns the number removed."""
+    admin_id = _int_or_none(admin_id)
+    if admin_id is None:
+        return 0
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "DELETE FROM admin_scopes WHERE admin_id = ?", (admin_id,)
+        )
+        await db.commit()
+        return cur.rowcount
+    except Exception:
+        return 0
+    finally:
+        await db.close()
+
+
+async def get_admin_scopes(admin_id) -> list:
+    """The admin's scope rows as dicts (empty list when none)."""
+    admin_id = _int_or_none(admin_id)
+    if admin_id is None:
+        return []
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT scope_type, scope_id, created_at FROM admin_scopes "
+            "WHERE admin_id = ? ORDER BY scope_type ASC, scope_id ASC",
+            (admin_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            {"scope_type": row[0], "scope_id": row[1], "created_at": row[2]}
+            for row in rows
+        ]
+    finally:
+        await db.close()
+
+
+async def admin_has_scopes(admin_id) -> bool:
+    """True when the admin is *restricted* by at least one scope.
+
+    An admin with no scope rows is platform-wide (pre-Phase-3 behaviour), so
+    the scope layer is opt-in and revokes nothing by its mere existence.
+    """
+    admin_id = _int_or_none(admin_id)
+    if admin_id is None:
+        return False
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT 1 FROM admin_scopes WHERE admin_id = ? LIMIT 1", (admin_id,)
+        ) as cur:
+            return await cur.fetchone() is not None
+    finally:
+        await db.close()
+
+
+async def _scope_root_folder_ids(db, admin_id) -> set:
+    """Folder ids that anchor the admin's scopes.
+
+    ``folder`` scopes contribute their id directly; ``topic`` scopes expand to
+    every folder linked to that topic (via the existing ``topic_folders``);
+    ``resource`` scopes contribute nothing here — they are matched directly by
+    ``resource`` target, never by folder containment.
+    """
+    roots = set()
+    async with db.execute(
+        "SELECT scope_type, scope_id FROM admin_scopes WHERE admin_id = ?",
+        (admin_id,),
+    ) as cur:
+        scopes = await cur.fetchall()
+    for scope_type, scope_id in scopes:
+        if scope_type == "folder":
+            roots.add(scope_id)
+        elif scope_type == "topic":
+            async with db.execute(
+                "SELECT folder_id FROM topic_folders WHERE topic_id = ?",
+                (scope_id,),
+            ) as cur:
+                roots.update(row[0] for row in await cur.fetchall())
+    return roots
+
+
+async def topic_folder_roots(admin_id) -> set:
+    """Folder ids anchoring the admin's scopes (the resolution entry point).
+
+    ``folder`` scopes contribute their own id; ``topic`` scopes expand to every
+    folder linked to that topic through the existing ``topic_folders`` table.
+    ``resource`` scopes contribute nothing here — they are matched directly by
+    the resource tester, never by folder containment. Empty set when the admin
+    has no scopes or no reachable folders.
+    """
+    admin_id = _int_or_none(admin_id)
+    if admin_id is None:
+        return set()
+    db = await get_db()
+    try:
+        return await _scope_root_folder_ids(db, admin_id)
+    finally:
+        await db.close()
+
+
+async def folder_in_admin_scope(admin_id, folder_id) -> bool:
+    """True when `folder_id` is at or beneath any of the admin's scope roots."""
+    admin_id = _int_or_none(admin_id)
+    folder_id = _int_or_none(folder_id)
+    if admin_id is None or folder_id is None:
+        return False
+    db = await get_db()
+    try:
+        roots = await _scope_root_folder_ids(db, admin_id)
+        if not roots:
+            return False
+        # Walk the target's ancestor chain once; a root anywhere on it means
+        # the target lies inside the scope. Cycle-safe.
+        current = folder_id
+        visited = set()
+        while current is not None and current not in visited:
+            if current in roots:
+                return True
+            visited.add(current)
+            async with db.execute(
+                "SELECT parent_id FROM folders WHERE id = ?", (current,)
+            ) as cur:
+                row = await cur.fetchone()
+            if not row:
+                break
+            current = row[0]
+        return False
+    finally:
+        await db.close()
+
+
+async def content_folder_id(content_id):
+    """The real folder of a content row, or None when it no longer exists."""
+    content_id = _int_or_none(content_id)
+    if content_id is None:
+        return None
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT folder_id FROM content WHERE id = ?", (content_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
+    finally:
+        await db.close()
+
+
+async def resource_in_admin_scope(admin_id, content_id) -> bool:
+    """True when an admin's scopes cover this specific resource.
+
+    Covered when a ``resource`` scope names it directly OR when a folder/topic
+    scope contains the resource's real folder.
+    """
+    admin_id = _int_or_none(admin_id)
+    content_id = _int_or_none(content_id)
+    if admin_id is None or content_id is None:
+        return False
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT folder_id FROM content WHERE id = ?", (content_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            # The target no longer exists: a dangling scope must not grant
+            # access (fail-closed), even a direct `resource` scope.
+            return False
+        async with db.execute(
+            "SELECT 1 FROM admin_scopes WHERE admin_id = ? "
+            "AND scope_type = 'resource' AND scope_id = ? LIMIT 1",
+            (admin_id, content_id),
+        ) as cur:
+            if await cur.fetchone():
+                return True
+        roots = await _scope_root_folder_ids(db, admin_id)
+        if not roots:
+            return False
+        current = row[0]
+        visited = set()
+        while current is not None and current not in visited:
+            if current in roots:
+                return True
+            visited.add(current)
+            async with db.execute(
+                "SELECT parent_id FROM folders WHERE id = ?", (current,)
+            ) as cur:
+                prow = await cur.fetchone()
+            if not prow:
+                break
+            current = prow[0]
+        return False
+    finally:
+        await db.close()
+
+
+async def news_resource_id(news_id):
+    """The content id a news row references, or None."""
+    news_id = _int_or_none(news_id)
+    if news_id is None:
+        return None
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT resource_id FROM news WHERE id = ?", (news_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row and row[0] else None
+    finally:
+        await db.close()
+
+
+async def news_scope_folder_ids(news_id) -> set:
+    """Every real folder id a news row points at (subject/section/anchor + the
+    folder of its referenced resource). Used by the authorization layer to
+    decide whether a scoped admin may manage that news item."""
+    news_id = _int_or_none(news_id)
+    if news_id is None:
+        return set()
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT subject_folder_id, section_folder_id, folder_id, resource_id "
+            "FROM news WHERE id = ?",
+            (news_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return set()
+        folders = {fid for fid in row[:3] if fid}
+        if row[3]:
+            async with db.execute(
+                "SELECT folder_id FROM content WHERE id = ?", (row[3],)
+            ) as cur:
+                crow = await cur.fetchone()
+            if crow:
+                folders.add(crow[0])
+        return folders
+    finally:
+        await db.close()
+
+
+async def is_topic_in_admin_scope(admin_id, topic_id) -> bool:
+    """True when the admin holds a `topic` scope on this exact topic."""
+    admin_id = _int_or_none(admin_id)
+    topic_id = _int_or_none(topic_id)
+    if admin_id is None or topic_id is None:
+        return False
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT 1 FROM admin_scopes WHERE admin_id = ? "
+            "AND scope_type = 'topic' AND scope_id = ? LIMIT 1",
+            (admin_id, topic_id),
+        ) as cur:
+            return await cur.fetchone() is not None
+    finally:
+        await db.close()
+
+
+async def list_news_ids_in_folders(folder_ids) -> set:
+    """Ids of news rows anchored in any of `folder_ids`.
+
+    Matches a news row when its section/subject/anchor folder is in the set,
+    or when its referenced resource lives in one of them. Used to build a
+    scoped admin's news list without ever exposing an out-of-scope row.
+    """
+    folder_ids = {fid for fid in (folder_ids or []) if fid}
+    if not folder_ids:
+        return set()
+    placeholders = ",".join("?" for _ in folder_ids)
+    ids = set()
+    db = await get_db()
+    try:
+        async with db.execute(
+            f"SELECT DISTINCT id FROM news WHERE section_folder_id IN ({placeholders}) "
+            f"OR subject_folder_id IN ({placeholders}) "
+            f"OR folder_id IN ({placeholders})",
+            tuple(folder_ids) * 3,
+        ) as cur:
+            ids.update(row[0] for row in await cur.fetchall())
+        async with db.execute(
+            f"SELECT DISTINCT n.id FROM news n JOIN content c ON c.id = n.resource_id "
+            f"WHERE c.folder_id IN ({placeholders})",
+            tuple(folder_ids),
+        ) as cur:
+            ids.update(row[0] for row in await cur.fetchall())
+        return ids
+    finally:
+        await db.close()
+
+
+async def list_folder_ids_under(roots) -> set:
+    """All folder ids in the subtree rooted at any of `roots` (inclusive).
+
+    Breadth-first so a deep branch is covered in one query pass; cycle-safe.
+    """
+    roots = {rid for rid in (roots or []) if rid}
+    if not roots:
+        return set()
+    seen = set()
+    pending = list(roots)
+    db = await get_db()
+    try:
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            async with db.execute(
+                "SELECT id FROM folders WHERE parent_id = ?", (current,)
+            ) as cur:
+                pending.extend(row[0] for row in await cur.fetchall())
+        return seen
+    finally:
+        await db.close()
+
+
+async def list_news_ids_for_admin(admin_id) -> set:
+    """News ids a scope-restricted admin may manage.
+
+    Mirrors the per-news `authorization` test in one pass: a row qualifies when
+    any of its real folder references (subject/section/anchor or its resource's
+    folder) falls inside the admin's folder/topic scope, OR when its referenced
+    resource is itself a direct `resource` scope. Never returns an out-of-scope
+    row. Empty set when the admin has no reachable scope.
+    """
+    admin_id = _int_or_none(admin_id)
+    if admin_id is None:
+        return set()
+    roots = await topic_folder_roots(admin_id)
+    folders = await list_folder_ids_under(roots)
+    ids = await list_news_ids_in_folders(folders)
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT scope_id FROM admin_scopes WHERE admin_id = ? "
+            "AND scope_type = 'resource'",
+            (admin_id,),
+        ) as cur:
+            resource_ids = [row[0] for row in await cur.fetchall()]
+        if resource_ids:
+            placeholders = ",".join("?" for _ in resource_ids)
+            async with db.execute(
+                f"SELECT DISTINCT id FROM news WHERE resource_id IN ({placeholders})",
+                tuple(resource_ids),
+            ) as cur:
+                ids.update(row[0] for row in await cur.fetchall())
+        return ids
+    finally:
+        await db.close()
+
+
+async def contribution_folder_id(contribution_id):
+    """The real destination folder of a contribution row, or None."""
+    contribution_id = _int_or_none(contribution_id)
+    if contribution_id is None:
+        return None
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT folder_id FROM contributions WHERE id = ?", (contribution_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
+    finally:
+        await db.close()
 
 
 # ------------------------------------------------------------

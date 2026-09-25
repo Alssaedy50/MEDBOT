@@ -55,6 +55,7 @@ import messaging
 import audit
 import archive
 import admin_management
+import authorization
 import i18n
 import platform_settings
 import topics
@@ -1557,6 +1558,39 @@ async def _require_permission(query, permission) -> bool:
     return False
 
 
+async def _require_scoped(query, permission, target_type=None, target_id=None) -> bool:
+    """Central scope-aware gate for a privileged operation (Phase 3).
+
+    Combines the coarse capability with the target's scope test through
+    `authorization.require` (the single authorization layer) and renders the
+    appropriate denial. The message distinguishes "you never had this
+    capability" from "this object is outside your responsibility", so a scoped
+    admin understands the refusal. Returns True only on ALLOW.
+    """
+    try:
+        decision = await authorization.require(
+            query.from_user.id, permission, target_type, target_id
+        )
+    except Exception:
+        logger.exception("scoped authorization failed; denying")
+        decision = authorization.DECISION_OUT_OF_SCOPE
+
+    if decision == authorization.DECISION_ALLOW:
+        return True
+
+    if decision == authorization.DECISION_OUT_OF_SCOPE:
+        text = "🚫 هذا العنصر خارج نطاق مسؤوليتك."
+    else:
+        text = "🔒 غير مصرح."
+
+    await edit_safe(
+        query,
+        text,
+        InlineKeyboardMarkup([[btn("🏠 الرئيسية", "home")]]),
+    )
+    return False
+
+
 async def _audit(query, action, target_type=None, target_id=None, details=None):
     """Best-effort audit write. Never raises into the calling handler."""
     try:
@@ -1571,6 +1605,24 @@ async def _audit(query, action, target_type=None, target_id=None, details=None):
         pass
 
 
+async def _is_scope_restricted(user_id) -> bool:
+    """True when the admin is constrained by at least one scope (Phase 3)."""
+    try:
+        if await database.is_owner(user_id):
+            return False
+        return await database.admin_has_scopes(user_id)
+    except Exception:
+        return False
+
+
+async def _scoped_roots(user_id) -> set:
+    """Folder ids anchoring a scoped admin's reach (empty when unscoped)."""
+    try:
+        return await database.topic_folder_roots(user_id)
+    except Exception:
+        return set()
+
+
 async def show_admin_folder(query, folder_id: int):
     """Show management actions for one existing folder."""
     if not await _admin_check(query):
@@ -1581,8 +1633,10 @@ async def show_admin_folder(query, folder_id: int):
         )
         return
 
-    # Capability gate (RBAC).
-    if not await _require_permission(query, "can_folders"):
+    # Capability + scope gate (RBAC). Checked before loading so an
+    # out-of-scope folder id (forged or deep-linked) is refused without
+    # confirming whether it exists.
+    if not await _require_scoped(query, "section.view", "folder", folder_id):
         return
 
     try:
@@ -1677,12 +1731,23 @@ async def show_admin_folders(query):
     if not await _require_permission(query, "can_folders"):
         return
 
+    scoped = await _is_scope_restricted(query.from_user.id)
+    roots = await _scoped_roots(query.from_user.id) if scoped else set()
+
     try:
         folders = await database.get_folders(0)
     except Exception:
         folders = []
 
-    rows = [[btn("➕ إنشاء قسم جديد", "admin_folder_create")]]
+    # A scope-restricted admin only sees the branches they are responsible for
+    # (their scope roots that live at the top level). Creating a new top-level
+    # folder is a platform-wide act, so it is hidden for a scoped admin.
+    if scoped:
+        folders = [f for f in folders if f[0] in roots]
+
+    rows = []
+    if not scoped:
+        rows.append([btn("➕ إنشاء قسم جديد", "admin_folder_create")])
 
     for folder in folders:
         try:
@@ -1735,8 +1800,9 @@ async def show_admin_folder_parents(query, parent_id=0):
         )
         return
 
-    # Capability gate (RBAC).
-    if not await _require_permission(query, "can_folders"):
+    # Capability + scope gate (RBAC). A scoped admin may only build inside
+    # their own branch; the picker is filtered to that subtree below.
+    if not await _require_scoped(query, "section.manage", "folder", parent_id):
         return
 
     try:
@@ -2015,8 +2081,8 @@ async def select_admin_folder_parent(query, context, parent_id):
         )
         return
 
-    # Capability gate (RBAC).
-    if not await _require_permission(query, "can_folders"):
+    # Capability + scope gate (RBAC).
+    if not await _require_scoped(query, "section.manage", "folder", parent_id):
         return
 
     context.user_data["admin_folder_create"] = True
@@ -2178,6 +2244,10 @@ async def finish_admin_folder_create(query, context, accepts):
                 ]
             ),
         )
+        return
+
+    # Scope gate: a scoped admin can only create inside their own branch.
+    if not await _require_scoped(query, "section.manage", "folder", int(parent_id)):
         return
 
     try:
@@ -2342,8 +2412,9 @@ async def start_admin_upload(query, context, folder_id):
         )
         return
 
-    # Capability gate (RBAC).
-    if not await _require_permission(query, "can_content"):
+    # Capability + scope gate (RBAC): only an admin responsible for this
+    # folder (or an unscoped one) may upload into it.
+    if not await _require_scoped(query, "resource.create", "folder", folder_id):
         return
 
     try:
@@ -2456,6 +2527,18 @@ async def admin_upload_media_handler(update, context):
         )
         return True
 
+    # Scope gate (Phase 3): the upload session's folder must be inside the
+    # admin's responsibility, so a stale/forged session can't post out of scope.
+    if not await authorization.can(
+        update.effective_user.id, "resource.create", "folder", folder_id
+    ):
+        _clear_admin_state(context)
+        await update.message.reply_text(
+            "🚫 هذا القسم خارج نطاق مسؤوليتك.",
+            reply_markup=await home_for(update),
+        )
+        return True
+
     try:
         folder = await database.get_folder(folder_id)
     except Exception:
@@ -2535,6 +2618,12 @@ async def admin_upload_confirm(query, context):
         )
         return
 
+    # Scope gate: the upload must target a folder this admin is responsible for.
+    if not await _require_scoped(
+        query, "resource.create", "folder", preview.get("folder_id")
+    ):
+        return
+
     await _register_admin_upload(query, context, preview)
 
 
@@ -2559,6 +2648,11 @@ async def admin_upload_custom_title(query, context, custom_title=None):
             "⚠️ انتهت جلسة الرفع. ابدأ العملية من جديد.",
             InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
         )
+        return
+
+    if not await _require_scoped(
+        query, "resource.create", "folder", preview.get("folder_id")
+    ):
         return
 
     if custom_title is None:
@@ -2712,8 +2806,10 @@ async def show_admin_file(query, content_id):
         )
         return
 
-    # Capability gate (RBAC).
-    if not await _require_permission(query, "can_content"):
+    # Capability + scope gate (RBAC). `resource.view` is checked against the
+    # content row so a scoped admin can only manage resources inside their
+    # branch.
+    if not await _require_scoped(query, "resource.view", "resource", content_id):
         return
 
     try:
@@ -2776,8 +2872,8 @@ async def admin_file_delete(query, context, content_id):
         )
         return
 
-    # Capability gate (RBAC).
-    if not await _require_permission(query, "can_content"):
+    # Capability + scope gate (RBAC).
+    if not await _require_scoped(query, "resource.delete", "resource", content_id):
         return
 
     try:
@@ -2856,6 +2952,11 @@ async def admin_folder_move_menu(query, context):
         )
         return
 
+    # Scope gate: the moved folder must be inside the admin's responsibility,
+    # otherwise it is refused before it can be relocated out of / into scope.
+    if not await _require_scoped(query, "section.manage", "folder", folder_id):
+        return
+
     try:
         folder = await database.get_folder(folder_id)
     except Exception:
@@ -2883,6 +2984,20 @@ async def _render_move_targets(query, context, folder_id, folder, parent_id=0):
     except Exception:
         children = []
 
+    # A scoped admin only sees destinations inside their own branch (the
+    # authoritative `admin_folder_move_to` gate would refuse an out-of-scope
+    # target anyway; this keeps the picker from exposing the rest of the tree).
+    restricted = await _is_scope_restricted(query.from_user.id)
+    allowed = None
+    if restricted:
+        allowed = await database.list_folder_ids_under(
+            await _scoped_roots(query.from_user.id)
+        )
+        if parent_id == 0:
+            # Enter the picker at the scope roots, not the platform root, so a
+            # scoped admin sees their own branch instead of an empty list.
+            children = [f for f in children if f[0] in allowed]
+
     if parent_id:
         try:
             breadcrumb = await database.get_breadcrumbs(parent_id)
@@ -2893,14 +3008,20 @@ async def _render_move_targets(query, context, folder_id, folder, parent_id=0):
 
     rows = []
     if parent_id == 0:
-        rows.append(
-            [btn("🏠 نقل إلى الجذر", f"admin_folder_move_to:{folder_id}:0")]
-        )
+        # Moving to the root would escape every scope, so a scoped admin may
+        # not choose it.
+        if not restricted:
+            rows.append(
+                [btn("🏠 نقل إلى الجذر", f"admin_folder_move_to:{folder_id}:0")]
+            )
 
     for item in children:
         try:
             target_id, name, node_type, _acc = item[:4]
         except Exception:
+            continue
+
+        if allowed is not None and target_id not in allowed:
             continue
 
         # A section cannot be moved into itself or one of its descendants.
@@ -2963,6 +3084,14 @@ async def admin_folder_move_to(query, context, folder_id, target_id):
     if not await _require_permission(query, "can_folders"):
         return
 
+    # Scope gate: both the source and the destination must be inside the
+    # admin's responsibility, so a move can never smuggle a branch into or
+    # out of a scope.
+    if not await _require_scoped(query, "section.manage", "folder", folder_id):
+        return
+    if not await _require_scoped(query, "section.manage", "folder", target_id):
+        return
+
     try:
         ok, message = await database.move_folder(
             int(folder_id),
@@ -3015,6 +3144,10 @@ async def admin_folder_delete(query, context, folder_id):
 
     # Capability gate (RBAC).
     if not await _require_permission(query, "can_folders"):
+        return
+
+    # Scope gate: only a folder inside the admin's responsibility is deletable.
+    if not await _require_scoped(query, "section.manage", "folder", folder_id):
         return
 
     try:
@@ -3095,6 +3228,10 @@ async def admin_file_move_menu(query, context):
         )
         return
 
+    # Scope gate: the resource itself must be inside responsibility.
+    if not await _require_scoped(query, "resource.edit", "resource", content_id):
+        return
+
     try:
         record = await database.get_file_record(content_id)
     except Exception:
@@ -3113,6 +3250,11 @@ async def admin_file_move_menu(query, context):
         roots = await database.get_folders(0)
     except Exception:
         roots = []
+
+    # A scoped admin's destination list is limited to their own branch roots.
+    if await _is_scope_restricted(query.from_user.id):
+        allowed = await _scoped_roots(query.from_user.id)
+        roots = [f for f in roots if f[0] in allowed]
 
     rows = []
 
@@ -3154,6 +3296,13 @@ async def admin_file_move_to(query, context, content_id, target_id):
 
     # Capability gate (RBAC).
     if not await _require_permission(query, "can_content"):
+        return
+
+    # Scope gate: both the resource and the destination folder must be inside
+    # the admin's responsibility.
+    if not await _require_scoped(query, "resource.edit", "resource", content_id):
+        return
+    if not await _require_scoped(query, "resource.edit", "folder", target_id):
         return
 
     try:
@@ -3299,6 +3448,16 @@ async def handle_pending_title_input(update, context):
         )
         return True
 
+    if not await authorization.can(
+        update.effective_user.id, "resource.edit", "resource", content_id
+    ):
+        _clear_admin_state(context)
+        await update.message.reply_text(
+            "🚫 هذا المورد خارج نطاق مسؤوليتك.",
+            reply_markup=await home_for(update),
+        )
+        return True
+
     try:
         ok = await database.update_file_title(content_id, text)
     except Exception:
@@ -3435,6 +3594,19 @@ async def show_pending(query, context):
     except Exception:
         items = []
 
+    # Phase 3: a scope-restricted reviewer only sees contributions destined
+    # for a folder inside their scope.
+    if await _is_scope_restricted(query.from_user.id):
+        filtered = []
+        for item in items:
+            try:
+                folder_id = item[6]
+            except Exception:
+                continue
+            if await database.folder_in_admin_scope(query.from_user.id, folder_id):
+                filtered.append(item)
+        items = filtered
+
     if not items:
         await edit_safe(
             query,
@@ -3489,6 +3661,22 @@ async def review_contribution(query, context, contribution_id):
             InlineKeyboardMarkup(
                 [
                     [btn("⬅️ الرئيسية", "home")],
+                ]
+            ),
+        )
+        return
+
+    # Scope gate: refuse an out-of-scope contribution before rendering it.
+    if not await authorization.can(
+        query.from_user.id, "contribution.review", "contribution", contribution_id
+    ):
+        await edit_safe(
+            query,
+            "🚫 هذه المساهمة خارج نطاق مسؤوليتك.",
+            InlineKeyboardMarkup(
+                [
+                    [btn("📥 Pending", "admin_pending")],
+                    [btn("🏠 الرئيسية", "home")],
                 ]
             ),
         )
@@ -3934,6 +4122,22 @@ async def request_review_note(query, context, contribution_id, kind):
         )
         return
 
+    # Scope gate: a scope-restricted reviewer may only act inside their reach.
+    if not await authorization.can(
+        query.from_user.id, "contribution.review", "contribution", contribution_id
+    ):
+        await edit_safe(
+            query,
+            "🚫 هذه المساهمة خارج نطاق مسؤوليتك.",
+            InlineKeyboardMarkup(
+                [
+                    [btn("📥 Pending", "admin_pending")],
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
+        )
+        return
+
     if context is not None:
         workflow.begin(context, "review_note")
         context.user_data["review_note_kind"] = kind
@@ -3961,6 +4165,23 @@ async def process_approval(query, contribution_id, approve):
             "🔒 غير مصرح لك بمراجعة المساهمات.",
             InlineKeyboardMarkup(
                 [
+                    [btn("🏠 الرئيسية", "home")],
+                ]
+            ),
+        )
+        return
+
+    # Scope gate: a scope-restricted reviewer may only act on a contribution
+    # whose destination folder is inside their responsibility.
+    if not await authorization.can(
+        query.from_user.id, "contribution.review", "contribution", contribution_id
+    ):
+        await edit_safe(
+            query,
+            "🚫 هذه المساهمة خارج نطاق مسؤوليتك.",
+            InlineKeyboardMarkup(
+                [
+                    [btn("📥 Pending", "admin_pending")],
                     [btn("🏠 الرئيسية", "home")],
                 ]
             ),
@@ -4245,7 +4466,8 @@ def _feature_for_callback(data: str):
     if data == "news" or data.startswith(
         (
             "news_open:", "news_more:", "news_filter:", "news_readall",
-            "news_subs", "news_sub:", "news_subs_section:",
+            "news_subs", "news_sub:", "news_unsub:",
+            "news_subs_section:", "news_pick_child:", "news_pick_root:",
         )
     ):
         return "news"
@@ -4492,8 +4714,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Capability gate (RBAC).
-        if not await _require_permission(query, "can_content"):
+        # Capability + scope gate (RBAC).
+        if not await _require_scoped(query, "resource.edit", "resource", content_id):
             return
 
         record = await database.get_file_record(content_id)
@@ -4543,8 +4765,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Capability gate (RBAC).
-        if not await _require_permission(query, "can_content"):
+        # Capability + scope gate (RBAC).
+        if not await _require_scoped(query, "resource.edit", "resource", content_id):
             return
 
         record = await database.get_file_record(content_id)
@@ -4606,8 +4828,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Capability gate (RBAC).
-        if not await _require_permission(query, "can_content"):
+        # Capability + scope gate (RBAC).
+        if not await _require_scoped(query, "resource.edit", "resource", content_id):
             return
 
         record = await database.get_file_record(content_id)
@@ -4761,6 +4983,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardMarkup([[btn("🗂 إدارة الأقسام", "admin_folders")]]),
             )
             return
+        # Scope gate: the moved folder (and any browsed parent) must be inside
+        # the admin's responsibility.
+        if not await _require_scoped(query, "section.manage", "folder", folder_id):
+            return
+        if parent_id and not await _require_scoped(
+            query, "section.manage", "folder", parent_id
+        ):
+            return
         folder = await database.get_folder(folder_id)
         if not folder:
             _clear_admin_state(context)
@@ -4838,6 +5068,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Capability gate (RBAC).
         if not await _require_permission(query, "can_folders"):
+            return
+
+        # Scope gate: only a folder inside the admin's reach may be retyped.
+        if not await _require_scoped(query, "section.manage", "folder", folder_id):
             return
 
         folder = await database.get_folder(folder_id)
@@ -4975,6 +5209,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Capability gate (RBAC).
         if not await _require_permission(query, "can_folders"):
+            return
+
+        # Scope gate: only a folder inside the admin's reach may be renamed.
+        if not await _require_scoped(query, "section.manage", "folder", folder_id):
             return
 
         folder = await database.get_folder(folder_id)

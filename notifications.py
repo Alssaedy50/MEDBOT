@@ -21,6 +21,7 @@ from telegram.ext import (
 )
 
 import audit
+import authorization
 import database
 import workflow
 
@@ -47,7 +48,10 @@ def _home_keyboard():
 
 async def _is_authorized(user_id) -> bool:
     try:
-        return await database.user_has_permission(user_id, "can_notifications")
+        # A global broadcast has no folder target, so a scope-restricted admin
+        # can never satisfy the scope test (`authorization.can` fails closed
+        # for a target-less global operation).
+        return await authorization.can(user_id, "notification.send")
     except Exception:
         return False
 
