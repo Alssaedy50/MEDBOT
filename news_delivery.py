@@ -125,7 +125,7 @@ def build_delivery_text(news) -> str:
     if body:
         lines.extend(["", esc(body[:600])])
 
-    if news.get("news_type") == "resource" and news.get("resource_present"):
+    if news.get("resource_present") and news.get("resource_id"):
         lines.extend(["", f"📄 {esc(news.get('resource_title') or '')}"])
 
     lines.extend(["", "افتحه من 📰 مركز الأخبار للاطلاع الكامل."])
@@ -137,13 +137,14 @@ def build_delivery_markup(news):
 
     Only a reference that still exists in the registry yields a direct button,
     so a removed resource/section degrades to the News Center entry rather than
-    a dead link.
+    a dead link. A linked resource is offered first; the section is always
+    offered when it still exists.
     """
     rows = [[_button("📰 عرض في مركز الأخبار", f"news_open:{news['id']}")]]
 
-    if news.get("news_type") == "resource" and news.get("resource_present"):
+    if news.get("resource_present") and news.get("resource_id"):
         rows.append([_button("📂 عرض المورد", f"file:{news['resource_id']}")])
-    elif news.get("folder_id"):
+    if news.get("folder_id"):
         rows.append([_button("🗂 فتح القسم", f"folder:{news['folder_id']}")])
 
     return rows

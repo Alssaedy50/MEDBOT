@@ -218,6 +218,7 @@ async def init_db():
         await _migrate_v14(db)
         await _migrate_v15(db)
         await _migrate_v16(db)
+        await _migrate_v17(db)
 
         # ------------------------------------------------------------
         # Performance / integrity indexes
@@ -1009,23 +1010,45 @@ async def _migrate_v12(db):
 # ------------------------------------------------------------
 # News Core (الأخبار)
 # ------------------------------------------------------------
-# Three independent news kinds, mirroring the product vision:
-#   notify  -> 🔴 Important Notification (lecture today, exam time, ...)
-#   section -> 🟡 Section/Section News  (Microbiology → عملي, ...)
-#   resource-> 🟢 New Resource          (auto-linked to a real content row)
-NEWS_TYPES = ("notify", "section", "resource")
+# Two independent, first-class news kinds, mirroring the product vision:
+#   notify  -> 🚨 Important / Urgent (lecture today, exam time, ...)
+#   section -> 📚 Section News       (Microbiology → عملي, ...)
+#
+# A resource, explanation post, announcement, etc. is NOT a separate news
+# kind: it is an optional *linked reference* on a Section News item. The
+# legacy `resource` kind is still recognised on read/migration so old rows
+# keep working, but nothing new is ever created with it.
+NEWS_TYPES = ("notify", "section")
+
+# Legacy kind kept only so an existing row/subscription is understood, never
+# produced. `normalize_news_type` maps it onto its canonical kind.
+LEGACY_NEWS_TYPES = ("resource",)
+NEWS_TYPE_ALIASES = {"resource": "section"}
 
 NEWS_TYPE_LABELS = {
-    "notify": "🔴 إشعار هام",
-    "section": "🟡 خبر قسم",
-    "resource": "🟢 مورد جديد",
+    "notify": "🚨 هام / عاجل",
+    "section": "📚 أخبار الأقسام",
+    # Legacy display label for an un-migrated row.
+    "resource": "📚 أخبار الأقسام",
 }
 
 NEWS_TYPE_ICONS = {
-    "notify": "🔴",
-    "section": "🟡",
-    "resource": "🟢",
+    "notify": "🚨",
+    "section": "📚",
+    "resource": "📚",
 }
+
+
+def normalize_news_type(news_type) -> str:
+    """Map a stored/legacy news kind onto its canonical kind.
+
+    ``resource`` is no longer a separate kind — it becomes a Section News item
+    with a linked resource reference — so every write and every validation
+    funnels through here. Unknown values are returned unchanged so the caller's
+    own validation can reject them.
+    """
+    value = str(news_type or "").strip()
+    return NEWS_TYPE_ALIASES.get(value, value)
 
 # Lifecycle. `draft` is the preview stage (Phase 2 publishing workflow),
 # `published` is visible in the News Center, `archived` is hidden but kept.
@@ -1307,6 +1330,62 @@ async def _migrate_v16(db):
         except Exception:
             logger.exception("Migration v16: statement failed")
     logger.info("Migration v16: ensured admin scope table")
+
+
+def _migrate_v17_sql():
+    """DML statements owned by migration v17, exposed for testing/review."""
+    return (
+        # A resource is no longer a news kind; its item becomes Section News
+        # that keeps pointing at the same real resource (`resource_id` is left
+        # untouched, so the access button and delivery links still resolve).
+        (
+            "UPDATE news SET news_type = 'section' WHERE news_type = 'resource'",
+            (),
+        ),
+        # A resource subscriber becomes a section subscriber. INSERT OR IGNORE
+        # first, then drop the old row, so a user who subscribed to both kinds
+        # is left with exactly one canonical row (never a lost or duplicate
+        # subscription).
+        (
+            "INSERT OR IGNORE INTO news_subscriptions "
+            "(user_id, topic_kind, topic_value) "
+            "SELECT user_id, topic_kind, 'section' FROM news_subscriptions "
+            "WHERE topic_kind = 'type' AND topic_value = 'resource'",
+            (),
+        ),
+        (
+            "DELETE FROM news_subscriptions "
+            "WHERE topic_kind = 'type' AND topic_value = 'resource'",
+            (),
+        ),
+    )
+
+
+async def _migrate_v17(db):
+    """News/Admin merge: fold the legacy `resource` kind into Section News.
+
+    The product now exposes only two news kinds — 🚨 Important/Urgent and
+    📚 Section News — with a resource/announcement being an optional *linked
+    reference* on a Section item rather than a third kind. This migration
+    rewrites the historical rows and subscriptions in place:
+
+    * every ``news`` row with ``news_type='resource'`` becomes ``'section'``;
+      its ``resource_id`` (and the auto-source idempotency index) is preserved,
+      so nothing about the linked resource or its delivery changes;
+    * every ``type``/``resource`` subscription becomes ``type``/``section``,
+      de-duplicated, so a subscriber keeps receiving the same items.
+
+    Additive to every other system: only the two news tables are touched, and
+    the statement is idempotent (after the first run there is nothing left to
+    rewrite).
+    """
+    for statement, params in _migrate_v17_sql():
+        try:
+            await db.execute(statement, params)
+        except Exception:
+            logger.exception("Migration v17: statement failed")
+    await db.commit()
+    logger.info("Migration v17: folded resource news into section news")
 
 # Message categories and lifecycle states.
 MESSAGE_CATEGORIES = ("message", "summary", "suggestion", "report")
@@ -3195,7 +3274,7 @@ async def create_news(
     bogus id is rejected rather than stored, so the News Center can never be
     pointed at a non-existent entity.
     """
-    news_type = (news_type or "").strip()
+    news_type = normalize_news_type(news_type)
     if news_type not in NEWS_TYPES:
         return None
 
@@ -3486,8 +3565,10 @@ async def update_news(news_id, **fields) -> bool:
     if news_id is None:
         return False
 
-    if "news_type" in updates and updates["news_type"] not in NEWS_TYPES:
-        return False
+    if "news_type" in updates:
+        updates["news_type"] = normalize_news_type(updates["news_type"])
+        if updates["news_type"] not in NEWS_TYPES:
+            return False
     if "visibility" in updates and updates["visibility"] not in NEWS_VISIBILITIES:
         return False
     if "delivery_scope" in updates and updates["delivery_scope"] not in NEWS_DELIVERY_SCOPES:
@@ -3739,6 +3820,7 @@ async def add_news_subscription(user_id, topic_kind: str, topic_value: str) -> b
     db = await get_db()
     try:
         if topic_kind == NEWS_SUB_TYPE:
+            topic_value = normalize_news_type(topic_value)
             if topic_value not in NEWS_TYPES:
                 return False
         else:  # section
@@ -4130,17 +4212,20 @@ async def get_resource_news_for_content(content_id):
 
 async def create_resource_news_for_content(content_id, sender_id=None,
                                           status: str = "draft") -> int:
-    """Create (once) the 🟢 news row for a registered resource.
+    """Create (once) the auto news row for a registered resource.
 
-    Resolves the resource's REAL folder from the registry and stores the
-    section reference (plus its parent as the subject when one exists), so the
-    generated news is navigable through the same section as the resource.
+    A resource is no longer a news kind of its own: this produces a 📚 Section
+    News row anchored to the resource's REAL folder and carrying the resource
+    as its optional linked reference, so it is navigable through the same
+    section as the resource.
 
     Idempotency is enforced by the database, not by this check: migration v15's
     partial unique index on ``news(resource_id) WHERE source='resource'`` makes
-    a second auto row impossible even under a concurrent race. The pre-check is
-    just a fast path; if a concurrent caller wins, `create_news` returns the
-    winner's row. Returns None when the content row does not exist.
+    a second auto row impossible even under a concurrent race (the ``source``
+    value is retained as the auto-row marker even though the news kind is now
+    ``section``). The pre-check is just a fast path; if a concurrent caller
+    wins, `create_news` returns the winner's row. Returns None when the content
+    row does not exist.
     """
     content_id = _int_or_none(content_id)
     if content_id is None:
@@ -4173,7 +4258,7 @@ async def create_resource_news_for_content(content_id, sender_id=None,
         await db.close()
 
     return await create_news(
-        news_type="resource",
+        news_type="section",
         title=title or "مورد جديد",
         sender_id=sender_id,
         subject_folder_id=subject_id,

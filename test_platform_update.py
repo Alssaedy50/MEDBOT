@@ -204,7 +204,10 @@ class GranularPermissionTests(PlatformUpdateBase):
 
     async def test_owner_panel_lists_new_surfaces_once(self):
         callbacks = await self._panel_callbacks(self.owner_id)
-        self.assertEqual(callbacks.count("admin_notifications"), 1)
+        # 📰 News replaced the old 🔔 Notifications entry: exactly one news
+        # entry, and no leftover notifications menu.
+        self.assertEqual(callbacks.count("admin_news"), 1)
+        self.assertNotIn("admin_notifications", callbacks)
         self.assertEqual(callbacks.count("admin_settings"), 1)
         self.assertEqual(callbacks.count("admin_topics"), 1)
 

@@ -69,6 +69,7 @@ NEWS_CALLBACKS = (
     "news_subs_back",
     "admin_news",
     "news_admin_all",
+    "news_admin_published",
     "news_admin_archived",
     "news_admin_view:",
     "news_admin_preview:",
@@ -78,6 +79,7 @@ NEWS_CALLBACKS = (
     "news_admin_delete:",
     "news_admin_deliveries:",
     "news_admin_retry:",
+    "news_new",
     "news_new:",
     "news_pick_child:",
     "news_pick_root:",
@@ -86,6 +88,7 @@ NEWS_CALLBACKS = (
     "news_ref_set_section:",
     "news_ref_resource:",
     "news_ref_set_resource:",
+    "news_ref_unlink:",
 )
 
 # Admin publish-wizard state keys.
@@ -291,13 +294,14 @@ async def show_news_feed(query, page: int = 0, news_type: str = None):
             ]
         )
 
-    # Type filters keep the three kinds reachable without three systems.
-    filter_row = [btn("📰 الكل", "news_filter:all")]
+    # Explicit, self-describing type filters: the two real kinds plus "all".
+    # No icon-only / colour-only chips and no "resource" filter — a linked
+    # resource lives inside a Section News item, it is not a kind of its own.
+    rows.append([btn("📋 كل الأخبار", "news_filter:all")])
     for key in database.NEWS_TYPES:
-        filter_row.append(
-            btn(database.NEWS_TYPE_ICONS[key], f"news_filter:{key}")
+        rows.append(
+            [btn(database.NEWS_TYPE_LABELS[key], f"news_filter:{key}")]
         )
-    rows.append(filter_row)
 
     if page + 1 < (total + page_size - 1) // max(page_size, 1):
         rows.append([btn(i18n.t("news_more", lang), f"news_more:{page + 1}")])
@@ -343,7 +347,8 @@ def _detail_lines(news, lang) -> list:
     if news.get("body"):
         lines.append(esc(news["body"]))
 
-    if news["news_type"] == "resource" and news.get("resource_present"):
+    # A linked resource/announcement is part of the item, never a kind itself.
+    if news.get("resource_present"):
         lines.append("")
         lines.append(f"📄 {esc(news.get('resource_title') or '')}")
 
@@ -351,15 +356,18 @@ def _detail_lines(news, lang) -> list:
 
 
 def _detail_access_rows(news, lang) -> list:
-    """The real access button for a resolved news row (or none)."""
+    """The real access button(s) for a resolved news row (or none).
+
+    A linked resource yields a direct "open resource" button; otherwise the
+    item's real section is offered. Buttons are built from live registry ids
+    only, so a removed target simply offers nothing.
+    """
     rows = []
-    if news["news_type"] == "resource" and news.get("resource_present"):
+    if news.get("resource_present") and news.get("resource_id"):
         rows.append(
             [btn(i18n.t("news_view_resource", lang), f"file:{news['resource_id']}")]
         )
-    elif news.get("folder_id"):
-        # A section notice, or a resource whose content row was removed but
-        # whose registered section still exists: navigate to the real section.
+    if news.get("folder_id"):
         rows.append(
             [btn(i18n.t("news_open_section", lang), f"folder:{news['folder_id']}")]
         )
@@ -456,42 +464,53 @@ async def _subscription_state(user_id):
 
 
 async def show_subscriptions(query):
-    """The ⚙️ subscriptions screen: three kinds + a sections entry."""
+    """The ⚙️ News Subscriptions screen.
+
+    Two kind toggles plus a sections entry, each labelled explicitly and each
+    showing its current state ("مشترك ✓" / "غير مشترك"). Subscriptions control
+    private delivery only — the News Center still lists everything.
+    """
     user_id = query.from_user.id
     lang = await _lang(user_id)
     _subs, type_subs, section_ids = await _subscription_state(user_id)
 
+    label_for = {
+        "notify": "🚨 أخبار هام / عاجل",
+        "section": "📚 أخبار الأقسام",
+    }
+
+    lines = [
+        "⚙️ <b>اشتراكات الأخبار</b>",
+        "",
+        "اختر ما يصلك كرسالة خاصة. 📰 مركز الأخبار يعرض كل الأخبار المنشورة "
+        "للجميع، والاشتراك يتحكم فقط في التوصيل الخاص.",
+        "",
+    ]
+
     rows = []
     for news_type in database.NEWS_TYPES:
-        icon = database.NEWS_TYPE_ICONS.get(news_type, "📰")
-        label = database.NEWS_TYPE_LABELS.get(news_type, news_type)
         on = news_type in type_subs
         rows.append(
             [
-                btn(
-                    f"{icon} {label}",
-                    f"news_sub:{news_type}",
-                ),
-                btn("✅ مشترك" if on else "🔔 اشترك", f"news_sub:{news_type}"),
+                btn(label_for.get(news_type, news_type), f"news_sub:{news_type}"),
+                btn("مشترك ✓" if on else "غير مشترك", f"news_sub:{news_type}"),
             ]
+        )
+        lines.append(
+            f"{label_for.get(news_type, news_type)} — "
+            f"{'مشترك ✓' if on else 'غير مشترك'}"
         )
 
     if section_ids:
-        sections_label = f"🗂 أقسام محددة ({len(section_ids)})"
+        sections_label = f"📚 إدارة الأقسام المتابَعة ({len(section_ids)})"
     else:
-        sections_label = "🗂 أقسام محددة"
+        sections_label = "📚 إدارة الأقسام المتابَعة"
     rows.append([btn(sections_label, "news_subs_sections")])
 
     rows.append([btn(i18n.t("news_back_feed", lang), "news")])
     rows.append([btn(i18n.t("home", lang), "home")])
 
-    await _edit(
-        query,
-        "⚙️ <b>اشتراكات الأخبار</b>\n\n"
-        "اختر ما يصلك كرسالة خاصة. مركز الأخبار يعرض كل الأخبار المنشورة "
-        "للجميع، والاشتراك يتحكم فقط في التوصيل الخاص.",
-        InlineKeyboardMarkup(rows),
-    )
+    await _edit(query, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
 async def toggle_subscription(query, news_type):
@@ -557,7 +576,7 @@ async def show_section_subscriptions(query, parent_id: int = 0):
                     f"news_subs_section:{folder_id}",
                 ),
                 btn(
-                    "🔔 اشترك" if not subscribed else "🔕 إلغاء",
+                    "مشترك ✓" if subscribed else "غير مشترك",
                     f"news_subs_section:{folder_id}",
                 ),
             ]
@@ -573,14 +592,14 @@ async def show_section_subscriptions(query, parent_id: int = 0):
             parent = 0
         rows.append([btn("⬅️ رجوع", f"news_pick_root:{parent or 0}")])
 
-    rows.append([btn("⚙️ الاشتراكات", "news_subs")])
+    rows.append([btn("⚙️ اشتراكات الأخبار", "news_subs")])
     rows.append([btn(i18n.t("home", lang), "home")])
 
     await _edit(
         query,
-        "🗂 <b>اشتراكات الأقسام</b>\n\n"
+        "📚 <b>إدارة الأقسام المتابَعة</b>\n\n"
         f"📍 {esc(breadcrumb)}\n\n"
-        "اضغط «🔔 اشترك» بجانب القسم الذي يهمك، أو «↳ دخول» للتنقل داخله.",
+        "اضغط على القسم للاشتراك/إلغاء الاشتراك، أو «↳ دخول» للتنقل داخله.",
         InlineKeyboardMarkup(rows),
     )
 
@@ -625,13 +644,11 @@ async def toggle_section_subscription(query, folder_id):
 
 
 def _admin_menu() -> InlineKeyboardMarkup:
-    """The 📝 النشر entry menu: one row per kind + the two listings."""
+    """The 📰 News admin entry: Publish / Published / Archive."""
     return InlineKeyboardMarkup(
         [
-            [btn("🔴 إشعار هام", "news_new:notify")],
-            [btn("🟡 خبر قسم", "news_new:section")],
-            [btn("🟢 مورد جديد", "news_new:resource")],
-            [btn("📋 كل الأخبار", "news_admin_all")],
+            [btn("➕ نشر خبر", "news_new")],
+            [btn("📋 الأخبار المنشورة", "news_admin_published")],
             [btn("🗄 الأرشيف", "news_admin_archived")],
             [btn("⬅️ إدارة المنصة", "admin")],
             [btn("🏠 الرئيسية", "home")],
@@ -642,12 +659,16 @@ def _admin_menu() -> InlineKeyboardMarkup:
 def _status_filter_for_view(view: str):
     """Map an admin view to the `list_news` status filter.
 
-    ``active`` is the default working set (everything except archived);
-    ``archived`` reaches the archived rows so they can be restored; ``all``
-    is the unfiltered list exposed through the explicit filter callbacks.
+    ``active``    is the default working set (draft + published, archived
+                  excluded) shown on the News admin home;
+    ``published`` is the explicit "Published News" list;
+    ``archived``  reaches the archived rows so they can be restored;
+    ``all``       is the unfiltered list exposed through the explicit filter.
     """
     if view == "archived":
         return "archived", False
+    if view == "published":
+        return "published", False
     if view == "all":
         return None, True
     return None, False
@@ -676,14 +697,13 @@ async def _list_all_content() -> list:
 def _reference_missing_for(news) -> str:
     """Return the missing required reference for a row, or "".
 
-    A section news must point at a real folder and a resource news at a real
-    content row before it can be published; the reference is validated again
-    when it is set, and the publish refuses while it is absent.
+    A 📚 Section News item must point at a real section folder before it can be
+    published; the reference is validated again when it is set and the publish
+    refuses while it is absent. A linked resource on a Section item is
+    optional, so it never blocks publishing.
     """
     if news.get("news_type") == "section" and not news.get("section_folder_id"):
         return "section"
-    if news.get("news_type") == "resource" and not news.get("resource_id"):
-        return "resource"
     return ""
 
 
@@ -957,6 +977,38 @@ async def set_resource_reference(query, news_id, content_id):
     await show_admin_news_item(query, news_id)
 
 
+async def unlink_resource_reference(query, news_id):
+    """Remove the optional resource link from a Section News item.
+
+    A linked resource is optional metadata, so clearing it is a normal edit
+    (audited), not a lifecycle change. The item's real section reference is
+    untouched.
+    """
+    if not await _is_manager(query.from_user.id):
+        await _edit(query, "🔒 غير مصرح.", _home_keyboard())
+        return
+
+    if not await authorization.can(query.from_user.id, "news.edit", "news", news_id):
+        await _edit(
+            query,
+            "🚫 هذا الخبر خارج نطاق مسؤوليتك.",
+            InlineKeyboardMarkup([[btn("⬅️ الأخبار", "admin_news")]]),
+        )
+        return
+
+    try:
+        ok = await database.update_news(news_id, resource_id=None)
+    except Exception:
+        ok = False
+
+    if ok:
+        await audit.log_action(
+            query.from_user.id, "news_reference",
+            target_type="news", target_id=news_id, details="resource=unlinked",
+        )
+    await show_admin_news_item(query, news_id)
+
+
 async def show_news_deliveries(query, news_id):
     """Admin view of one item's private-delivery log (counts + recent rows)."""
     if not await _is_manager(query.from_user.id):
@@ -1013,16 +1065,18 @@ async def retry_deliveries(query, news_id):
     await show_news_deliveries(query, news_id)
 
 
-async def show_admin_news(query, context=None, view: str = "active"):
-    """Admin news overview: type counts + a clickable list of rows.
+async def show_admin_news(query, context=None, view: str = "menu"):
+    """Admin News surface: the publishing menu plus the row listings.
 
     Every row is a `news_admin_view:<id>` button, so an admin can open any
     news item — including archived ones — and reach its publish/archive/
     restore/delete actions. `view` selects the working set:
 
-    * ``active``   — draft + published (the default working set)
-    * ``archived`` — archived rows only (so restore is reachable)
-    * ``all``      — every lifecycle state, archived included
+    * ``menu``      — the entry screen: ➕ Publish / 📋 Published / 🗄 Archive
+    * ``active``    — draft + published working set (after a Publish attempt)
+    * ``published`` — published rows only (the "📋 Published News" list)
+    * ``archived``  — archived rows only (so restore is reachable)
+    * ``all``       — every lifecycle state, archived included
     """
     if not await _is_manager(query.from_user.id):
         await _edit(query, "🔒 غير مصرح.", _home_keyboard())
@@ -1048,6 +1102,15 @@ async def show_admin_news(query, context=None, view: str = "active"):
         logger.exception("news: admin overview failed")
         rows_data, archived_count, counts = [], 0, {}
 
+    # A draft left behind by a cancelled wizard has no navigable entry point,
+    # so a draft missing its required reference is not listed here; the admin
+    # reaches such a row through the archive/all views or recreates it.
+    if status is None and not include_archived:
+        rows_data = [
+            r for r in rows_data
+            if not (r["status"] == "draft" and _reference_missing_for(r))
+        ]
+
     if scoped_ids is not None:
         rows_data = [r for r in rows_data if r["id"] in scoped_ids]
         counts = {}
@@ -1066,15 +1129,16 @@ async def show_admin_news(query, context=None, view: str = "active"):
     title = {
         "archived": "🗄 <b>الأخبار المؤرشفة</b>",
         "all": "📋 <b>كل الأخبار</b>",
-    }.get(view, "📝 <b>مركز النشر</b>")
+        "published": "📋 <b>الأخبار المنشورة</b>",
+    }.get(view, "📰 <b>الأخبار</b>")
 
     lines = [
         title,
         "",
         "أنشئ الخبر كمسودة، راجعه، ثم انشره — ويُوصَل المشتركون تلقائيًا.",
         "",
-        f"🔴 {counts.get('notify', 0)} | 🟡 {counts.get('section', 0)} | "
-        f"🟢 {counts.get('resource', 0)}  ·  🗄 {archived_count}",
+        f"🚨 {counts.get('notify', 0)} | 📚 {counts.get('section', 0)}"
+        f"  ·  🗄 {archived_count}",
         "",
     ]
 
@@ -1103,12 +1167,13 @@ async def show_admin_news(query, context=None, view: str = "active"):
             ]
         )
 
-    filter_row = [btn("📋 الكل", "news_admin_all")]
-    if view == "archived":
-        filter_row.append(btn("↩️ العودة للعرض العادي", "admin_news"))
-    else:
-        filter_row.append(btn("🗄 الأرشيف", "news_admin_archived"))
-    keyboard.append(filter_row)
+    # The three required entries, always reachable; a contextual "all" filter
+    # is added only inside a listing so the entry screen stays unambiguous.
+    keyboard.append([btn("➕ نشر خبر", "news_new")])
+    keyboard.append([btn("📋 الأخبار المنشورة", "news_admin_published")])
+    keyboard.append([btn("🗄 الأرشيف", "news_admin_archived")])
+    if view in ("all", "archived", "published"):
+        keyboard.append([btn("↩️ عرض العمل", "admin_news")])
 
     keyboard.append([btn("⬅️ إدارة المنصة", "admin")])
     keyboard.append([btn("🏠 الرئيسية", "home")])
@@ -1133,11 +1198,18 @@ def _admin_item_menu(news, back: str = None) -> InlineKeyboardMarkup:
 
     rows = []
     if news["status"] == "draft":
-        # A section/resource news needs a real reference before it can publish.
-        if news.get("news_type") == "section" and not news.get("section_folder_id"):
-            rows.append([btn("🗂 اختيار القسم", f"news_ref_root:{news['id']}:0")])
-        elif news.get("news_type") == "resource" and not news.get("resource_id"):
-            rows.append([btn("🟢 اختيار المورد", f"news_ref_resource:{news['id']}")])
+        # A section news needs its real section before it can publish; a linked
+        # resource is optional and offered separately.
+        if news.get("news_type") == "section":
+            if not news.get("section_folder_id"):
+                rows.append([btn("🗂 اختيار القسم", f"news_ref_root:{news['id']}:0")])
+            else:
+                rows.append([btn("📢 نشر", f"news_admin_pub:{news['id']}")])
+            if news.get("resource_id"):
+                rows.append([btn("🔗 تغيير المورد المرتبط", f"news_ref_resource:{news['id']}")])
+                rows.append([btn("✂️ إلغاء ربط المورد", f"news_ref_unlink:{news['id']}")])
+            else:
+                rows.append([btn("🔗 ربط مورد (اختياري)", f"news_ref_resource:{news['id']}")])
         else:
             rows.append([btn("📢 نشر", f"news_admin_pub:{news['id']}")])
         rows.append([btn("👁 معاينة", f"news_admin_preview:{news['id']}")])
@@ -1228,35 +1300,64 @@ async def preview_admin_news(query, news_id, back: str = "admin_news"):
     await _edit(query, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
-async def start_create_news(query, context, news_type):
-    """Begin the draft wizard for one news kind.
+async def start_create_news(query, context, news_type=None):
+    """Begin the "➕ Publish News" form.
+
+    With no ``news_type`` the admin first chooses the kind on a clear form;
+    with a kind, the draft wizard starts.
 
     Lands the row as a ``draft`` — nothing reaches students before an explicit
-    publish. The typed steps differ by kind:
+    publish. The typed steps are:
 
-    * notify   — title → body → doctor (optional) → event time (optional)
-    * section  — title → body → doctor → event, then pick a real section
-    * resource — title → body, then pick a real resource
+        title → body → doctor (optional) → event time (optional)
 
-    Section/resource references are *not* typed: the wizard routes to the real
-    registry pickers after the text steps, so an invalid id can never be keyed
-    in.
+    then a 📚 Section News item routes to the real section picker (and may
+    optionally link a real resource); a 🚨 Important/Urgent item is ready to
+    preview/publish. Section/resource references are never typed: the wizard
+    routes to the real registry pickers, so an invalid id can never be keyed in.
     """
     if not await _is_manager(query.from_user.id):
         await _edit(query, "🔒 غير مصرح.", _home_keyboard())
+        return
+
+    # No kind chosen yet: show the type chooser, gated by the caller's scope.
+    if not news_type:
+        scoped = await _is_scope_restricted(query.from_user.id)
+        rows = [
+            [btn("🚨 هام / عاجل", "news_new:notify")],
+            [btn("📚 أخبار الأقسام", "news_new:section")],
+            [btn("❌ إلغاء", "admin_news")],
+            [btn("🏠 الرئيسية", "home")],
+        ]
+        note = (
+            "\n\n🚨 <b>هام / عاجل</b> متاح للمشرفين بصلاحية عامة على كل "
+            "الأقسام فقط.\n📚 <b>أخبار الأقسام</b> متاح لمشرفي الأقسام ضمن "
+            "نطاقهم."
+        )
+        if scoped:
+            note = (
+                "\n\nأدوارك تسمح بنشر 📚 <b>أخبار الأقسام</b> ضمن الأقسام "
+                "المخصصة لك. 🚨 الهام/العاجل يتطلب صلاحية عامة."
+            )
+        await _edit(
+            query,
+            "➕ <b>نشر خبر</b>\n\nاختر نوع الخبر:" + note,
+            InlineKeyboardMarkup(rows),
+        )
         return
 
     if news_type not in database.NEWS_TYPES:
         await _edit(query, "⚠️ نوع غير معروف.", _admin_menu())
         return
 
-    # A scope-restricted admin cannot author a platform-wide 🔴 notification:
+    # A scope-restricted admin cannot author a platform-wide 🚨 notification:
     # it has no folder target, so it can never be placed inside their scope.
     if news_type == "notify" and await _is_scope_restricted(query.from_user.id):
         await _edit(
             query,
-            "🚫 الإشعار الهام عام على مستوى المنصة ولا يقع داخل نطاق مسؤوليتك.",
-            InlineKeyboardMarkup([[btn("⬅️ إدارة الأخبار", "admin_news")]]),
+            "🚫 خبر «هام / عاجل» عام على مستوى المنصة ولا يقع داخل نطاق "
+            "مسؤوليتك. استخدم 📚 أخبار الأقسام.",
+            InlineKeyboardMarkup([[btn("⬅️ الأخبار", "admin_news")]]),
         )
         return
 
@@ -1271,13 +1372,12 @@ async def start_create_news(query, context, news_type):
     hint = {
         "notify": "مثال: محاضرة اليوم — 10:00 بقاعة 3.",
         "section": "اكتب عنوان خبر القسم، ثم اختر القسم الحقيقي من الشجرة.",
-        "resource": "اكتب عنوان الخبر، ثم اختر المورد الحقيقي من القائمة.",
     }.get(news_type, "")
 
     await _edit(
         query,
         f"{database.NEWS_TYPE_ICONS.get(news_type, '📰')} <b>خبر جديد — {esc(label)}</b>\n\n"
-        "أرسل عنوان الخبر في رسالة واحدة.\n"
+        "📋 <b>عنوان الخبر</b>\nأرسل عنوان الخبر في رسالة واحدة.\n"
         + (f"\n{hint}\n" if hint else "")
         + "\nلإلغاء العملية أرسل /cancel.",
         InlineKeyboardMarkup(
@@ -1400,12 +1500,10 @@ async def handle_news_text(update, context) -> bool:
         target_type="news", target_id=news_id, details=f"type={news_type}",
     )
 
-    # A section/resource news must point at a real registry row before it can
-    # publish; route straight to the picker so a bogus id can never be typed.
+    # A section news must point at a real registry row before it can publish;
+    # route straight to the picker so a bogus id can never be typed.
     if news_type == "section":
         next_hint = "اختر القسم الحقيقي من الشجرة أدناه."
-    elif news_type == "resource":
-        next_hint = "اختر المورد الحقيقي من القائمة أدناه."
     else:
         next_hint = "راجعها ثم اضغط 📢 نشر لإظهارها للطلاب."
 
@@ -1415,7 +1513,7 @@ async def handle_news_text(update, context) -> bool:
         reply_markup=InlineKeyboardMarkup(
             [
                 [btn("🔎 مراجعة الخبر", f"news_admin_view:{news_id}")],
-                [btn("📝 مركز النشر", "admin_news")],
+                [btn("📰 الأخبار", "admin_news")],
                 [btn("🏠 الرئيسية", "home")],
             ]
         ),
@@ -1435,7 +1533,7 @@ async def _publish(query, news_id):
     runs after (best-effort) — a Telegram failure never rolls back the publish,
     it is recorded per recipient and retryable from the delivery log.
     """
-    # A section/resource news may not go live without its real reference.
+    # A section news may not go live without its real section reference.
     try:
         news = await database.get_news_detail(news_id)
     except Exception:
@@ -1451,16 +1549,15 @@ async def _publish(query, news_id):
         await _edit(
             query,
             "🚫 هذا الخبر خارج نطاق مسؤوليتك.",
-            InlineKeyboardMarkup([[btn("⬅️ إدارة الأخبار", "admin_news")]]),
+            InlineKeyboardMarkup([[btn("⬅️ الأخبار", "admin_news")]]),
         )
         return
 
     missing = _reference_missing_for(news)
     if missing:
-        label = "القسم" if missing == "section" else "المورد"
         await _edit(
             query,
-            f"⚠️ لا يمكن النشر قبل اختيار {label} حقيقي من المنصة.",
+            "⚠️ لا يمكن النشر قبل اختيار القسم الحقيقي من المنصة.",
             InlineKeyboardMarkup(
                 [[btn("⬅️ الخبر", f"news_admin_view:{news_id}")],
                  [btn("🏠 الرئيسية", "home")]]
@@ -1534,7 +1631,7 @@ async def _delete(query, news_id):
 
 
 async def publish_news_for_resource(bot, content_id, sender_id=None):
-    """Auto-generate (once) a 🟢 news row for a registered resource.
+    """Auto-generate (once) a 📚 Section News row for a registered resource.
 
     Integration hook for the existing resource system: called after a resource
     is registered (admin upload / approved contribution). It is strictly
@@ -1545,7 +1642,7 @@ async def publish_news_for_resource(bot, content_id, sender_id=None):
     * creates at most one news row per content id (`create_resource_news_for_
       content` returns the existing row), so a retry/restart/duplicate event
       cannot spawn a second item;
-    * lands the row as ``draft`` and publishes it, then delivers to resource
+    * lands the row as ``draft`` and publishes it, then delivers to section
       subscribers — the publish + delivery are themselves failure-isolated.
 
     Returns the news id, or None when nothing was created/published.
@@ -1714,8 +1811,16 @@ async def news_callback_handler(update, context: ContextTypes.DEFAULT_TYPE):
         await show_admin_news(query, context, view="all")
         return
 
+    if data == "news_admin_published":
+        await show_admin_news(query, context, view="published")
+        return
+
     if data == "news_admin_archived":
         await show_admin_news(query, context, view="archived")
+        return
+
+    if data == "news_new":
+        await start_create_news(query, context)
         return
 
     if data.startswith("news_new:"):
@@ -1835,6 +1940,14 @@ async def news_callback_handler(update, context: ContextTypes.DEFAULT_TYPE):
             await _edit(query, "⚠️ معرف غير صالح.", _home_keyboard())
             return
         await set_resource_reference(query, news_id, content_id)
+        return
+
+    if data.startswith("news_ref_unlink:"):
+        news_id = _int_or_none(data.split(":", 1)[1])
+        if news_id is None:
+            await _edit(query, "⚠️ معرف غير صالح.", _home_keyboard())
+            return
+        await unlink_resource_reference(query, news_id)
         return
 
     if data.startswith("news_ref_resource:"):
