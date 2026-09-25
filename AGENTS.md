@@ -170,14 +170,16 @@ Both consume one daily quota unit per call and return
   Capabilities live in `database.PERMISSION_KEYS` (`can_folders`, `can_content`,
   `can_contributions`, `can_messages`, `can_ai`, `can_admins`,
   `can_notifications`, `can_settings`, `can_topics`, `can_visibility`,
-  `can_archive`).
+  `can_archive`, `can_news`).
 - Migrations are additive: `_migrate_v5` adds `admins.role`/`admins.permissions`;
   `_migrate_v6` creates the isolated `audit_log` table; `_migrate_v7` backfills
   NULL/empty roles to `admin`; `_migrate_v8` adds the nullable
   `description`/`keywords` columns used by intent-aware search on `folders` and
   `content`; `_migrate_v11` heals a database left with more than one `owner` row
   (keeps the persisted owner, demotes the rest to `admin`); `_migrate_v12`
-  creates the isolated `archive_sync` mirror table. Never rewrite v1..v4.
+  creates the isolated `archive_sync` mirror table; `_migrate_v13` creates the
+  News Core tables (`news`/`news_reads`/`news_subscriptions`). Never rewrite
+  v1..v4.
 - Role scope is explicit: `ROLE_PERMISSION_PRESETS` maps each role to a baseline
   capability set (owner = all, admin = all except `can_admins`, reviewer =
   contributions + messages, none = nothing) and `ROLE_DESCRIPTIONS` is the
@@ -300,6 +302,62 @@ Both consume one daily quota unit per call and return
   legacy empty-perms full, `none` never) and is what admin notifications use,
   so a supervisor without the relevant capability is not pinged.
 
+## News Core (الأخبار) — Phase 1
+- `news.py` is the ONLY news implementation: the student 📰 News Center and a
+  minimal admin publishing surface, built directly on migration v13's tables.
+  Nothing existing is rewritten; the existing `notifications` broadcast is a
+  separate subsystem and is untouched.
+- Three first-class kinds share one chronological feed: `notify` (🔴 important
+  notification), `section` (🟡 subject/section news), `resource` (🟢 new
+  resource). `database.NEWS_TYPES` is the source of truth.
+- Real references only: a news row stores `section_folder_id`/
+  `subject_folder_id`/`resource_id`, never a copied name or path.
+  `create_news`/`update_news` validate every reference against the live
+  `folders`/`content` rows and reject an unknown id, so the News Center can
+  never be pointed at a non-existent entity. `get_news_detail` resolves the
+  CURRENT name and breadcrumb from the registry (`build_breadcrumb_paths`), so
+  a rename shows up automatically and a deleted resource/section degrades to
+  no access button rather than a fabricated path.
+- `database.create_news(..., status='draft')` by default: nothing reaches
+  students before an explicit `publish_news`. Lifecycle helpers:
+  `publish_news` (idempotent, keeps `published_at`), `archive_news`,
+  `restore_news` (back to draft, never straight to students), `delete_news`.
+  `list_news`/`count_news` order newest-first by
+  `COALESCE(published_at, created_at)` with pagination (`NEWS_PAGE_SIZE`);
+  archived rows never leak into a normal listing.
+- Read tracking is standalone: `news_reads` is keyed by `(user_id, news_id)`,
+  so a duplicate read is impossible. `mark_news_read` / `is_news_read` /
+  `get_unread_news_count` / `get_read_news_ids` / `mark_all_news_read`.
+  The home keyboard shows the unread count as a badge on the 📰 entry
+  (`main._home_badges` → `home_keyboard(..., badges=...)`), never a zero badge.
+- Student callbacks: `news` (feed), `news_open:<id>` (marks read + shows the
+  detail and its real access button), `news_more:<page>`, `news_filter:<type>`,
+  `news_readall`. A student may open **published** news only: `open_news`
+  refuses `draft`/`archived` exactly like a missing row and creates NO
+  `news_reads` record, so an unpublished id can never leak text or inflate the
+  unread count. Admin callbacks: `admin_news` (draft+published working set),
+  `news_admin_all`, `news_admin_archived` (reach archived rows),
+  `news_new:<type>`, and per-row `news_admin_view:<id>` (manage actions),
+  `news_admin_preview:<id>` (read-only student-style preview),
+  `news_admin_pub|archive|restore|delete:<id>`. The admin list is fully
+  clickable and each item shows state-appropriate actions (draft →
+  Preview/Publish/Delete; published → View/Archive/Delete; archived →
+  View/Restore/Delete). The admin surface is gated by `can_news`, never
+  records a read for the admin, and every mutation is audited
+  (`news_publish`, `news_archive`, `news_restore`, `news_delete`).
+- `news` is a `database.FEATURES` key (hideable) and its public callbacks are
+  feature-gated; news registers its own handler BEFORE the catch-all
+  `callback_router`, so it owns its namespace and its own hidden check
+  (admins bypass). The admin draft wizard consumes typed input through
+  `news.handle_news_text` (called from `ai_handler`) and uses the single
+  `workflow` name `news_draft` (registered in `workflow.WORKFLOWS`) so its
+  two steps never cancel each other's keys.
+- Future compatibility is designed in, not built: `news_subscriptions`
+  (created empty, unused), `delivery_scope`, `source` and `payload` columns,
+  and the `draft` lifecycle state reserve the shape for Phase 2 (publishing
+  workflow + subscriptions + private delivery + resource-generated news) and
+  Phase 3 (Scoped Admin / RBAC over a subject/folder) without a redesign.
+
 ## Emergency Resource Archive (disaster recovery)
 - `archive.py` is the ONLY archive implementation: it mirrors registered
   resources into a standalone Telegram channel that keeps them reachable when
@@ -338,7 +396,7 @@ Both consume one daily quota unit per call and return
 
 ## Testing
 - `python -m py_compile` all modules.
-- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update test_medbot_fixes test_visibility test_ai_policy test_ai_modes test_archive_sync`
+- `python -m unittest test_medbot_system test_medbot_router test_medbot_grounding test_medbot_phase2 test_messaging test_rbac_audit test_contribution_ux test_medbot_search_intent test_medbot_performance test_platform_update test_medbot_fixes test_visibility test_ai_policy test_ai_modes test_archive_sync test_news_core`
 - `test_ai_policy.py` pins the AI behavior policy: intent classification,
   resource-hallucination refusal, and that only the medical path fetches
   PubMed. It never calls a real provider.
@@ -366,6 +424,15 @@ Both consume one daily quota unit per call and return
   clear message for an unknown handle, owner never touched) and
   `AdminPreviewTests` (preview is authorized, read-only, audited, and changes
   neither the caller's identity nor the target's role/permissions).
+- `test_news_core.py` pins the News Core (Phase 1): migration v13 is additive
+  and idempotent, the three news kinds and their real folder/resource
+  references (an unknown id is rejected), the newest-first paginated feed,
+  publish/archive/restore/delete lifecycle, independent read tracking with no
+  duplicate records, per-user unread counts, the home unread badge, the
+  `can_news`-gated and audited admin surface, and the future-compatibility
+  seams (`news_subscriptions`, `delivery_scope`, `source`, `payload`). It also
+  asserts the existing notification broadcast and resource navigation still
+  work.
 - Tests must exercise real code paths against temporary SQLite; no mocks.
 - Root folders are stored with `parent_id IS NULL` (not `0`).
 

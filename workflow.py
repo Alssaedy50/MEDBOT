@@ -61,6 +61,13 @@ WORKFLOWS = {
     "topics_create": ("topics_create",),
     "topics_link": ("topics_link_id",),
     "notification_body": ("notifications_body",),
+    "news_draft": (
+        "news_new_type",
+        "news_new_title",
+        "news_new_body",
+        "news_new_section",
+        "news_new_resource",
+    ),
 }
 
 

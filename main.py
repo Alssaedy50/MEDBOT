@@ -59,6 +59,7 @@ import i18n
 import platform_settings
 import topics
 import notifications
+import news
 import visibility
 import workflow
 from ai import (
@@ -374,13 +375,16 @@ def _home_rows():
             ("language", "menu_language", "language"),
         ),
         (
+            ("news", "menu_news", "news"),
+        ),
+        (
             ("contact", "menu_contact", "contact"),
             ("about", "menu_about", "about"),
         ),
     )
 
 
-def home_keyboard(lang: str = None, hidden=None):
+def home_keyboard(lang: str = None, hidden=None, badges=None):
     """Start keyboard for a regular (non-privileged) user.
 
     Shows only the student-facing options; the admin entry point is added by
@@ -392,14 +396,19 @@ def home_keyboard(lang: str = None, hidden=None):
     `hidden` is the set of feature keys the operator has taken offline (see
     `database.get_hidden_features`); those entries are omitted so an update or a
     fault can hide a section instantly.
+
+    `badges` optionally maps a feature key to a short suffix (e.g. the unread
+    news count: ``{"news": " 🔴 5"}``) appended to its label. It is supplied by
+    `home_for`, which knows the caller; the raw keyboard builder stays cheap.
     """
     lang = lang or i18n.DEFAULT_LANGUAGE
     hidden = hidden or frozenset()
+    badges = badges or {}
 
     rows = []
     for row in _home_rows():
         buttons = [
-            btn(i18n.t(label, lang), callback)
+            btn(i18n.t(label, lang) + str(badges.get(feature, "")), callback)
             for feature, label, callback in row
             if feature not in hidden
         ]
@@ -412,13 +421,24 @@ def home_keyboard(lang: str = None, hidden=None):
     return InlineKeyboardMarkup(rows)
 
 
-def admin_home_keyboard(lang: str = None, hidden=None, show_admin=True):
+def admin_home_keyboard(lang: str = None, hidden=None, show_admin=True, badges=None):
     """Start keyboard with the admin entry point appended for admins."""
     lang = lang or i18n.DEFAULT_LANGUAGE
-    rows = list(home_keyboard(lang, hidden).inline_keyboard)
+    rows = list(home_keyboard(lang, hidden, badges).inline_keyboard)
     if show_admin:
         rows.append([btn(i18n.t("menu_admin", lang), "admin")])
     return InlineKeyboardMarkup(rows)
+
+
+async def _home_badges(user_id) -> dict:
+    """Unread badge for the 📰 News entry (never shown with a zero count)."""
+    if user_id is None:
+        return {}
+    try:
+        unread = await database.get_unread_news_count(user_id)
+    except Exception:
+        return {}
+    return {"news": f" 🔴 {unread}"} if unread > 0 else {}
 
 
 async def home_for(update):
@@ -445,9 +465,10 @@ async def home_for(update):
             is_admin = False
 
     lang = await user_lang(user_id) if user_id is not None else i18n.DEFAULT_LANGUAGE
+    badges = await _home_badges(user_id)
 
     if not is_admin:
-        return home_keyboard(lang, hidden)
+        return home_keyboard(lang, hidden, badges)
 
     # Hiding the admin entry is a soft hide: the owner always keeps it so a
     # mistake can never lock the platform's owner out of the panel.
@@ -457,7 +478,7 @@ async def home_for(update):
         is_owner = False
     show_admin = not ("admin_panel" in hidden and not is_owner)
 
-    return admin_home_keyboard(lang, hidden, show_admin=show_admin)
+    return admin_home_keyboard(lang, hidden, show_admin=show_admin, badges=badges)
 
 
 async def show_home(update: Update):
@@ -3352,6 +3373,8 @@ async def show_admin(query):
         rows.append([btn("🤖 AI Registry", "admin_ai")])
     if await _allowed("can_notifications"):
         rows.append([btn("🔔 الإشعارات", "admin_notifications")])
+    if await _allowed("can_news"):
+        rows.append([btn("📰 الأخبار", "admin_news")])
     if await _allowed("can_topics"):
         rows.append([btn("🧭 مواضيع البحث", "admin_topics")])
     if await _allowed("can_visibility"):
@@ -4198,6 +4221,10 @@ def _feature_for_callback(data: str):
         return "contributions"
     if data == "topics" or data.startswith("topic_open:"):
         return "topics"
+    if data == "news" or data.startswith(
+        ("news_open:", "news_more:", "news_filter:", "news_readall")
+    ):
+        return "news"
     if data == "contact" or data.startswith("msg_"):
         return "contact"
     if data == "admin":
@@ -5389,6 +5416,10 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await notifications.handle_notification_text(update, context):
         return
 
+    # News: admin typing a draft title / body.
+    if await news.handle_news_text(update, context):
+        return
+
     # Custom title input (upload / resource rename) has the highest priority.
     if context.user_data.get("admin_upload_waiting_title") or (
         context.user_data.get("admin_file_rename")
@@ -5660,6 +5691,7 @@ def main():
     platform_settings.register_platform_settings_handlers(app)
     topics.register_topics_handlers(app)
     notifications.register_notifications_handlers(app)
+    news.register_news_handlers(app)
     visibility.register_visibility_handlers(app)
     archive.register_archive_handlers(app)
 
