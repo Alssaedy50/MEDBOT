@@ -50,6 +50,7 @@ _TRANSLATIONS = {
     "menu_admin": {"ar": "🛠 إدارة المنصة", "en": "🛠 Administration"},
     "menu_topics": {"ar": "🧭 المواضيع", "en": "🧭 Topics"},
     "menu_language": {"ar": "🌐 اللغة", "en": "🌐 Language"},
+    "menu_news": {"ar": "📰 الأخبار", "en": "📰 News"},
 
     "welcome": {
         "ar": "🩺 *{platform}*\n\nمرحباً بك دكتور {name}.\n\n"
@@ -244,6 +245,25 @@ _TRANSLATIONS = {
     "notifications_history": {"ar": "📜 سجل الإشعارات", "en": "📜 Notification history"},
     "notifications_new": {"ar": "✍️ إرسال إشعار", "en": "✍️ Send notification"},
     "notifications_empty": {"ar": "ℹ️ لم يتم إرسال أي إشعار بعد.", "en": "ℹ️ No notifications sent yet."},
+
+    # ---- News Center ---------------------------------------------------
+    "news_title": {
+        "ar": "📰 *مركز الأخبار*\n\nكل الأخبار مرتبة من الأحدث إلى الأقدم.",
+        "en": "📰 *News Center*\n\nAll news, newest first.",
+    },
+    "news_empty": {
+        "ar": "ℹ️ لا توجد أخبار منشورة حالياً.",
+        "en": "ℹ️ No news has been published yet.",
+    },
+    "news_open": {"ar": "📖 قراءة الخبر", "en": "📖 Read the post"},
+    "news_view_resource": {"ar": "📂 عرض المورد", "en": "📂 Open the resource"},
+    "news_open_section": {"ar": "🗂 فتح القسم", "en": "🗂 Open the section"},
+    "news_read": {"ar": "✅ مقروء", "en": "✅ Read"},
+    "news_unread": {"ar": "🔵 جديد", "en": "🔵 New"},
+    "news_mark_all_read": {"ar": "✅ تحديد الكل كمقروء", "en": "✅ Mark all as read"},
+    "news_no_match": {"ar": "⚠️ الخبر غير موجود.", "en": "⚠️ This news item was not found."},
+    "news_more": {"ar": "🔽 المزيد", "en": "🔽 More"},
+    "news_back_feed": {"ar": "⬅️ الأخبار", "en": "⬅️ News"},
 }
 
 

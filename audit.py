@@ -57,6 +57,10 @@ AUDIT_ACTIONS = (
     "notification_send",
     "language_set",
     "feature_visibility",
+    "news_publish",
+    "news_archive",
+    "news_restore",
+    "news_delete",
 )
 
 ACTION_LABELS = {
@@ -91,6 +95,10 @@ ACTION_LABELS = {
     "notification_send": "🔔 إرسال إشعار",
     "language_set": "🌐 تغيير اللغة",
     "feature_visibility": "🙈 إظهار/إخفاء قسم",
+    "news_publish": "📰 نشر خبر",
+    "news_archive": "🗄 أرشفة خبر",
+    "news_restore": "♻️ استرجاع خبر",
+    "news_delete": "🗑 حذف خبر",
 }
 
 

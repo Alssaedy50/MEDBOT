@@ -213,6 +213,7 @@ async def init_db():
         await _migrate_v10(db)
         await _migrate_v11(db)
         await _migrate_v12(db)
+        await _migrate_v13(db)
 
         # ------------------------------------------------------------
         # Performance / integrity indexes
@@ -469,6 +470,7 @@ PERMISSION_KEYS = (
     "can_topics",
     "can_visibility",
     "can_archive",
+    "can_news",
 )
 
 # Stored in `admins.permissions` to mean "explicitly granted nothing". An empty
@@ -487,6 +489,7 @@ PERMISSION_LABELS = {
     "can_topics": "🧭 مواضيع البحث",
     "can_visibility": "🙈 إظهار/إخفاء الأقسام",
     "can_archive": "🗄 أرشيف الطوارئ",
+    "can_news": "📰 الأخبار",
 }
 
 # Short labels for the compact permission toggles in admin_management.
@@ -502,6 +505,7 @@ PERMISSION_SHORT_LABELS = {
     "can_topics": "المواضيع",
     "can_visibility": "الإظهار",
     "can_archive": "الأرشيف",
+    "can_news": "الأخبار",
 }
 
 ROLE_LABELS = {
@@ -567,6 +571,7 @@ FEATURES = (
     "my_contributions",
     "account",
     "topics",
+    "news",
     "language",
     "contact",
     "about",
@@ -580,6 +585,7 @@ FEATURE_LABELS = {
     "my_contributions": "📄 مساهماتي",
     "account": "📊 حسابي",
     "topics": "🧭 المواضيع",
+    "news": "📰 الأخبار",
     "language": "🌐 اللغة",
     "contact": "📬 تواصل مع المنصة",
     "about": "ℹ️ عن المنصة",
@@ -914,6 +920,145 @@ async def _migrate_v12(db):
         logger.info("Migration v12: ensured archive_sync table")
     except Exception:
         logger.exception("Migration v12 failed")
+
+
+# ------------------------------------------------------------
+# News Core (الأخبار)
+# ------------------------------------------------------------
+# Three independent news kinds, mirroring the product vision:
+#   notify  -> 🔴 Important Notification (lecture today, exam time, ...)
+#   section -> 🟡 Section/Section News  (Microbiology → عملي, ...)
+#   resource-> 🟢 New Resource          (auto-linked to a real content row)
+NEWS_TYPES = ("notify", "section", "resource")
+
+NEWS_TYPE_LABELS = {
+    "notify": "🔴 إشعار هام",
+    "section": "🟡 خبر قسم",
+    "resource": "🟢 مورد جديد",
+}
+
+NEWS_TYPE_ICONS = {
+    "notify": "🔴",
+    "section": "🟡",
+    "resource": "🟢",
+}
+
+# Lifecycle. `draft` is the preview stage (Phase 2 publishing workflow),
+# `published` is visible in the News Center, `archived` is hidden but kept.
+NEWS_STATUSES = ("draft", "published", "archived")
+
+NEWS_STATUS_LABELS = {
+    "draft": "📝 مسودة",
+    "published": "✅ منشور",
+    "archived": "🗄 مؤرشف",
+}
+
+NEWS_VISIBILITIES = ("all", "students")
+
+# Telemetry only in Phase 1; Phase 2 delivers to subscribers. Kept so the
+# column never has to be added later (no breaking redesign).
+NEWS_DELIVERY_SCOPES = ("all", "subscribed")
+
+MAX_NEWS_TITLE_LENGTH = 200
+MAX_NEWS_BODY_LENGTH = 3000
+MAX_NEWS_DOCTOR_LENGTH = 120
+MAX_NEWS_EVENT_LENGTH = 120
+
+# Default page size for the chronological News Center feed.
+NEWS_PAGE_SIZE = 5
+
+
+def _migrate_v13_sql():
+    """DDL statements owned by migration v13, exposed for testing/review."""
+    return (
+        """
+        CREATE TABLE IF NOT EXISTS news (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            news_type TEXT NOT NULL DEFAULT 'notify',
+            title TEXT NOT NULL,
+            body TEXT,
+            sender_id INTEGER,
+            subject_folder_id INTEGER,
+            section_folder_id INTEGER,
+            folder_id INTEGER,
+            doctor TEXT,
+            event_at TEXT,
+            resource_id INTEGER,
+            visibility TEXT NOT NULL DEFAULT 'all',
+            status TEXT NOT NULL DEFAULT 'draft',
+            delivery_scope TEXT NOT NULL DEFAULT 'all',
+            source TEXT NOT NULL DEFAULT 'manual',
+            payload TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            published_at TIMESTAMP,
+            archived_at TIMESTAMP,
+            FOREIGN KEY (subject_folder_id) REFERENCES folders (id)
+                ON DELETE SET NULL,
+            FOREIGN KEY (section_folder_id) REFERENCES folders (id)
+                ON DELETE SET NULL,
+            FOREIGN KEY (resource_id) REFERENCES content (id)
+                ON DELETE SET NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS news_reads (
+            user_id INTEGER NOT NULL,
+            news_id INTEGER NOT NULL,
+            read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, news_id),
+            FOREIGN KEY (news_id) REFERENCES news (id) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS news_subscriptions (
+            user_id INTEGER NOT NULL,
+            topic_kind TEXT NOT NULL DEFAULT 'type',
+            topic_value TEXT NOT NULL DEFAULT '*',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, topic_kind, topic_value)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_news_status_created "
+        "ON news(status, created_at DESC, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_news_type "
+        "ON news(news_type, status)",
+        "CREATE INDEX IF NOT EXISTS idx_news_section "
+        "ON news(section_folder_id)",
+        "CREATE INDEX IF NOT EXISTS idx_news_resource "
+        "ON news(resource_id)",
+        "CREATE INDEX IF NOT EXISTS idx_news_reads_user "
+        "ON news_reads(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_news_subs_user "
+        "ON news_subscriptions(user_id)",
+    )
+
+
+async def _migrate_v13(db):
+    """Phase 1 News Core: the `news`, `news_reads` and `news_subscriptions`
+    tables.
+
+    Additive and isolated like the other feature tables: nothing existing is
+    rewritten or dropped. ``news`` carries the full lifecycle up front
+    (draft/published/archived, published_at/archived_at) plus the typed,
+    real references the future phases need — a subject/section folder, a
+    resource content id, a doctor, an event time, a delivery scope and a
+    free-form payload — so Phase 2 (publishing/subscriptions) and Phase 3
+    (scoped RBAC) can build on it without a redesign.
+
+    ``news_reads`` is a standalone read-tracking table keyed by
+    (user_id, news_id) so a duplicate read is impossible and per-user unread
+    counts are one query. ``news_subscriptions`` is created empty and unused
+    in Phase 1; it reserves the (user, topic_kind, topic_value) shape for the
+    Phase 2 subscription system.
+
+    Safe to re-run: uses CREATE TABLE/INDEX IF NOT EXISTS only.
+    """
+    for statement in _migrate_v13_sql():
+        try:
+            await db.execute(statement)
+        except Exception:
+            logger.exception("Migration v13: statement failed")
+    logger.info("Migration v13: ensured news core tables")
 
 # Message categories and lifecycle states.
 MESSAGE_CATEGORIES = ("message", "summary", "suggestion", "report")
@@ -2730,6 +2875,618 @@ async def get_all_user_languages() -> dict:
             language if language in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
         )
     return result
+
+
+# ------------------------------------------------------------
+# News Core — service layer
+# ------------------------------------------------------------
+# The News Center reads real registry entities only. A news row never stores a
+# copy of a folder/resource name: it stores the id, and the accessors join the
+# live `folders`/`content` tables. That keeps MEDBOT's registry the single
+# source of truth and means an admin's rename shows up automatically.
+#
+# Every read helper accepts an optional ``db_conn`` so a caller can reuse one
+# connection (the feed + its breadcrumbs) without opening several.
+
+def _news_row_to_dict(row) -> dict:
+    """Map a `news` row (full column order) to a plain dict."""
+    return {
+        "id": row[0],
+        "news_type": row[1],
+        "title": row[2],
+        "body": row[3],
+        "sender_id": row[4],
+        "subject_folder_id": row[5],
+        "section_folder_id": row[6],
+        "folder_id": row[7],
+        "doctor": row[8],
+        "event_at": row[9],
+        "resource_id": row[10],
+        "visibility": row[11],
+        "status": row[12],
+        "delivery_scope": row[13],
+        "source": row[14],
+        "payload": row[15],
+        "created_at": row[16],
+        "published_at": row[17],
+        "archived_at": row[18],
+    }
+
+
+# Column list kept in one place so every SELECT stays in `_news_row_to_dict`
+# order even when the schema grows.
+_NEWS_COLUMNS = (
+    "id, news_type, title, body, sender_id, subject_folder_id, "
+    "section_folder_id, folder_id, doctor, event_at, resource_id, "
+    "visibility, status, delivery_scope, source, payload, "
+    "created_at, published_at, archived_at"
+)
+
+
+async def create_news(
+    news_type: str,
+    title: str,
+    body: str = None,
+    sender_id=None,
+    subject_folder_id=None,
+    section_folder_id=None,
+    doctor: str = None,
+    event_at: str = None,
+    resource_id=None,
+    visibility: str = "all",
+    status: str = "draft",
+    delivery_scope: str = "all",
+    source: str = "manual",
+    payload: str = None,
+) -> int:
+    """Create a news row and return its id (or None on invalid input).
+
+    ``status='draft'`` by default: Phase 1's admin surface publishes explicitly
+    with `publish_news`, so nothing leaks to students before the admin has seen
+    it. Folder/resource references are validated against the real registry: a
+    bogus id is rejected rather than stored, so the News Center can never be
+    pointed at a non-existent entity.
+    """
+    news_type = (news_type or "").strip()
+    if news_type not in NEWS_TYPES:
+        return None
+
+    title = (title or "").strip()
+    if not title or len(title) > MAX_NEWS_TITLE_LENGTH:
+        return None
+
+    body = (body or "").strip() or None
+    if body and len(body) > MAX_NEWS_BODY_LENGTH:
+        return None
+
+    doctor = (doctor or "").strip() or None
+    if doctor and len(doctor) > MAX_NEWS_DOCTOR_LENGTH:
+        return None
+
+    event_at = (event_at or "").strip() or None
+    if event_at and len(event_at) > MAX_NEWS_EVENT_LENGTH:
+        return None
+
+    if visibility not in NEWS_VISIBILITIES:
+        return None
+    if status not in NEWS_STATUSES:
+        return None
+    if delivery_scope not in NEWS_DELIVERY_SCOPES:
+        return None
+
+    subject_folder_id = _int_or_none(subject_folder_id)
+    section_folder_id = _int_or_none(section_folder_id)
+    resource_id = _int_or_none(resource_id)
+
+    db = await get_db()
+    try:
+        # Validate the real references before persisting (registry = truth).
+        if subject_folder_id is not None:
+            async with db.execute(
+                "SELECT id FROM folders WHERE id = ?", (subject_folder_id,)
+            ) as cur:
+                if not await cur.fetchone():
+                    return None
+        if section_folder_id is not None:
+            async with db.execute(
+                "SELECT id FROM folders WHERE id = ?", (section_folder_id,)
+            ) as cur:
+                if not await cur.fetchone():
+                    return None
+        if resource_id is not None:
+            async with db.execute(
+                "SELECT id FROM content WHERE id = ?", (resource_id,)
+            ) as cur:
+                if not await cur.fetchone():
+                    return None
+
+        # The canonical navigation anchor: an explicit section wins, then the
+        # subject. Kept in sync with section_folder_id so a single column can
+        # drive "go to this section" without re-deriving it.
+        folder_id = section_folder_id if section_folder_id is not None else subject_folder_id
+
+        cursor = await db.execute(
+            """
+            INSERT INTO news (
+                news_type, title, body, sender_id, subject_folder_id,
+                section_folder_id, folder_id, doctor, event_at, resource_id,
+                visibility, status, delivery_scope, source, payload,
+                published_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                news_type, title, body, _int_or_none(sender_id),
+                subject_folder_id, section_folder_id, folder_id, doctor,
+                event_at, resource_id, visibility, status, delivery_scope,
+                (source or "manual").strip() or "manual", payload,
+                datetime.now().isoformat(timespec="seconds") if status == "published" else None,
+            ),
+        )
+        await db.commit()
+        return cursor.lastrowid
+    finally:
+        await db.close()
+
+
+async def get_news(news_id, db_conn=None) -> dict:
+    """One news row as a dict, or None. Read-only registry join applied by
+    the caller (`get_news_detail` for the fully-resolved view)."""
+    async def _run(db):
+        async with db.execute(
+            f"SELECT {_NEWS_COLUMNS} FROM news WHERE id = ?",
+            (_int_or_none(news_id),),
+        ) as cur:
+            row = await cur.fetchone()
+        return _news_row_to_dict(row) if row else None
+
+    if db_conn is not None:
+        return await _run(db_conn)
+    db = await get_db()
+    try:
+        return await _run(db)
+    finally:
+        await db.close()
+
+
+async def get_news_detail(news_id, db_conn=None) -> dict:
+    """A news row with its REAL registry context resolved.
+
+    Adds ``subject_name``, ``section_name``, ``folder_path``,
+    ``resource_title``, ``resource_folder_id`` and ``resource_present`` from
+    the live `folders`/`content` tables. A reference whose row was deleted
+    resolves to None (the news survives; it simply offers no access button),
+    so a stale id can never fabricate a path or a resource.
+    """
+    async def _run(db):
+        news = await get_news(news_id, db_conn=db)
+        if not news:
+            return None
+
+        folder_ids = {
+            fid for fid in (
+                news.get("subject_folder_id"),
+                news.get("section_folder_id"),
+                news.get("folder_id"),
+            ) if fid
+        }
+
+        names = {}
+        for fid in folder_ids:
+            async with db.execute(
+                "SELECT name FROM folders WHERE id = ?", (fid,)
+            ) as cur:
+                row = await cur.fetchone()
+            if row:
+                names[fid] = row[0]
+
+        paths = await build_breadcrumb_paths(db, folder_ids) if folder_ids else {}
+
+        news["subject_name"] = names.get(news.get("subject_folder_id"))
+        news["section_name"] = names.get(news.get("section_folder_id"))
+        anchor = news.get("folder_id")
+        news["folder_path"] = paths.get(anchor) if anchor else None
+
+        news["resource_title"] = None
+        news["resource_folder_id"] = None
+        news["resource_present"] = False
+        if news.get("resource_id"):
+            async with db.execute(
+                "SELECT title, folder_id FROM content WHERE id = ?",
+                (news["resource_id"],),
+            ) as cur:
+                row = await cur.fetchone()
+            if row:
+                news["resource_title"] = row[0]
+                news["resource_folder_id"] = row[1]
+                news["resource_present"] = True
+
+        return news
+
+    if db_conn is not None:
+        return await _run(db_conn)
+    db = await get_db()
+    try:
+        return await _run(db)
+    finally:
+        await db.close()
+
+
+async def list_news(
+    status: str = "published",
+    news_type: str = None,
+    section_folder_id=None,
+    resource_id=None,
+    include_archived: bool = False,
+    limit: int = 20,
+    offset: int = 0,
+    order: str = "newest",
+) -> list:
+    """Chronological news feed, newest-first by default.
+
+    ``status='published'`` (default) is the student view. Passing
+    ``status=None`` / ``'all'`` returns every lifecycle state (admin view);
+    ``include_archived=False`` still excludes archived rows in that case so an
+    archived news item never leaks into a normal listing. Ordered by the
+    publish/creation time then id, so the feed is stable even for rows created
+    within the same second.
+    """
+    try:
+        limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        limit = 20
+    try:
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        offset = 0
+
+    clauses, params = [], []
+
+    if status and status != "all":
+        clauses.append("status = ?")
+        params.append(status)
+    elif not include_archived:
+        clauses.append("status != 'archived'")
+
+    if news_type:
+        clauses.append("news_type = ?")
+        params.append(news_type)
+
+    if section_folder_id is not None:
+        clauses.append("(section_folder_id = ? OR folder_id = ?)")
+        params.extend([_int_or_none(section_folder_id)] * 2)
+
+    if resource_id is not None:
+        clauses.append("resource_id = ?")
+        params.append(_int_or_none(resource_id))
+
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    direction = "ASC" if str(order).lower() == "oldest" else "DESC"
+
+    db = await get_db()
+    try:
+        async with db.execute(
+            f"SELECT {_NEWS_COLUMNS} FROM news {where} "
+            f"ORDER BY COALESCE(published_at, created_at) {direction}, id {direction} "
+            f"LIMIT ? OFFSET ?",
+            tuple(params) + (limit, offset),
+        ) as cur:
+            return [_news_row_to_dict(row) for row in await cur.fetchall()]
+    finally:
+        await db.close()
+
+
+async def count_news(
+    status: str = "published",
+    news_type: str = None,
+    include_archived: bool = False,
+) -> int:
+    """Total rows matching `list_news`' filter (for pagination)."""
+    clauses, params = [], []
+
+    if status and status != "all":
+        clauses.append("status = ?")
+        params.append(status)
+    elif not include_archived:
+        clauses.append("status != 'archived'")
+
+    if news_type:
+        clauses.append("news_type = ?")
+        params.append(news_type)
+
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    db = await get_db()
+    try:
+        async with db.execute(
+            f"SELECT COUNT(*) FROM news {where}", tuple(params)
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else 0
+    finally:
+        await db.close()
+
+
+async def update_news(news_id, **fields) -> bool:
+    """Update only the supplied editable fields of a news row.
+
+    Whitelisted so an admin action can never rewrite lifecycle columns
+    (status/published_at are driven by publish/archive/restore). Folder and
+    resource references are re-validated against the real registry.
+    """
+    editable = {
+        "title", "body", "news_type", "subject_folder_id", "section_folder_id",
+        "doctor", "event_at", "resource_id", "visibility", "delivery_scope",
+        "source", "payload",
+    }
+    updates = {key: value for key, value in fields.items() if key in editable}
+    if not updates:
+        return False
+
+    news_id = _int_or_none(news_id)
+    if news_id is None:
+        return False
+
+    if "news_type" in updates and updates["news_type"] not in NEWS_TYPES:
+        return False
+    if "visibility" in updates and updates["visibility"] not in NEWS_VISIBILITIES:
+        return False
+    if "delivery_scope" in updates and updates["delivery_scope"] not in NEWS_DELIVERY_SCOPES:
+        return False
+    if "title" in updates:
+        title = (updates["title"] or "").strip()
+        if not title or len(title) > MAX_NEWS_TITLE_LENGTH:
+            return False
+        updates["title"] = title
+
+    db = await get_db()
+    try:
+        for ref_type, column in (
+            ("folders", "subject_folder_id"),
+            ("folders", "section_folder_id"),
+            ("content", "resource_id"),
+        ):
+            if column in updates and updates[column] not in (None, ""):
+                value = _int_or_none(updates[column])
+                if value is None:
+                    return False
+                async with db.execute(
+                    f"SELECT id FROM {ref_type} WHERE id = ?", (value,)
+                ) as cur:
+                    if not await cur.fetchone():
+                        return False
+                updates[column] = value
+
+        # Keep the navigation anchor aligned with the (possibly new) section.
+        if "section_folder_id" in updates:
+            updates["folder_id"] = updates["section_folder_id"]
+        elif "subject_folder_id" in updates:
+            async with db.execute(
+                "SELECT section_folder_id FROM news WHERE id = ?", (news_id,)
+            ) as cur:
+                row = await cur.fetchone()
+            if not (row and row[0]):
+                updates["folder_id"] = updates["subject_folder_id"]
+
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        params = list(updates.values()) + [news_id]
+        cur = await db.execute(
+            f"UPDATE news SET {assignments} WHERE id = ?", tuple(params)
+        )
+        await db.commit()
+        return cur.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def publish_news(news_id) -> bool:
+    """Move a news row to `published`. Idempotent: republishing keeps the
+    original `published_at` so the feed order never jumps on a retry."""
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "UPDATE news SET status = 'published', "
+            "published_at = COALESCE(published_at, ?), archived_at = NULL "
+            "WHERE id = ?",
+            (datetime.now().isoformat(timespec="seconds"), _int_or_none(news_id)),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def archive_news(news_id) -> bool:
+    """Archive a news row: hidden from the feed, kept for the audit trail."""
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "UPDATE news SET status = 'archived', archived_at = ? WHERE id = ?",
+            (datetime.now().isoformat(timespec="seconds"), _int_or_none(news_id)),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def restore_news(news_id) -> bool:
+    """Return an archived news row to `draft` (never straight to students)."""
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "UPDATE news SET status = 'draft', archived_at = NULL WHERE id = ?",
+            (_int_or_none(news_id),),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def delete_news(news_id) -> bool:
+    """Hard-delete a news row (its read records cascade). Admin-only."""
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "DELETE FROM news WHERE id = ?", (_int_or_none(news_id),)
+        )
+        await db.commit()
+        return cur.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def mark_news_read(user_id, news_id) -> bool:
+    """Record that `user_id` opened `news_id`. Idempotent by primary key."""
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT OR IGNORE INTO news_reads (user_id, news_id) VALUES (?, ?)",
+            (_int_or_none(user_id), _int_or_none(news_id)),
+        )
+        await db.commit()
+        return True
+    except Exception:
+        logger.exception("mark_news_read failed")
+        return False
+    finally:
+        await db.close()
+
+
+async def is_news_read(user_id, news_id) -> bool:
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT 1 FROM news_reads WHERE user_id = ? AND news_id = ?",
+            (_int_or_none(user_id), _int_or_none(news_id)),
+        ) as cur:
+            return await cur.fetchone() is not None
+    finally:
+        await db.close()
+
+
+async def get_unread_news_count(user_id) -> int:
+    """Published, not-archived news the user has not opened yet.
+
+    Counts only published rows, so the home badge can never advertise a draft
+    or an archived item.
+    """
+    db = await get_db()
+    try:
+        async with db.execute(
+            """
+            SELECT COUNT(*) FROM news n
+            WHERE n.status = 'published'
+              AND NOT EXISTS (
+                  SELECT 1 FROM news_reads r
+                  WHERE r.news_id = n.id AND r.user_id = ?
+              )
+            """,
+            (_int_or_none(user_id),),
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else 0
+    finally:
+        await db.close()
+
+
+async def get_read_news_ids(user_id, news_ids=None) -> set:
+    """The subset of `news_ids` this user has read (empty set when none)."""
+    ids = [_int_or_none(nid) for nid in (news_ids or [])]
+    ids = [i for i in ids if i is not None]
+    if not ids:
+        return set()
+
+    placeholders = ",".join("?" for _ in ids)
+    db = await get_db()
+    try:
+        async with db.execute(
+            f"SELECT news_id FROM news_reads "
+            f"WHERE user_id = ? AND news_id IN ({placeholders})",
+            (_int_or_none(user_id),) + tuple(ids),
+        ) as cur:
+            return {row[0] for row in await cur.fetchall()}
+    finally:
+        await db.close()
+
+
+async def mark_all_news_read(user_id) -> int:
+    """Mark every currently-published news row as read. Returns the count of
+    newly created read records."""
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT id FROM news WHERE status = 'published'"
+        ) as cur:
+            ids = [row[0] for row in await cur.fetchall()]
+
+        created = 0
+        for news_id in ids:
+            cur = await db.execute(
+                "INSERT OR IGNORE INTO news_reads (user_id, news_id) VALUES (?, ?)",
+                (_int_or_none(user_id), news_id),
+            )
+            created += cur.rowcount or 0
+        await db.commit()
+        return created
+    finally:
+        await db.close()
+
+
+async def get_news_subscriptions(user_id) -> list:
+    """Reserved for Phase 2. Returns the user's subscribed topics (empty in
+    Phase 1, since nothing writes to the table yet)."""
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT topic_kind, topic_value FROM news_subscriptions "
+            "WHERE user_id = ? ORDER BY topic_kind, topic_value",
+            (_int_or_none(user_id),),
+        ) as cur:
+            return [tuple(row) for row in await cur.fetchall()]
+    finally:
+        await db.close()
+
+
+async def get_news_counts_by_type() -> dict:
+    """{news_type: count} over published news (admin overview)."""
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT news_type, COUNT(*) FROM news "
+            "WHERE status = 'published' GROUP BY news_type"
+        ) as cur:
+            return {row[0]: row[1] for row in await cur.fetchall()}
+    finally:
+        await db.close()
+
+
+async def add_news_subscription(user_id, topic_kind: str, topic_value: str) -> bool:
+    """Phase 2 stub: reserve the write path so the schema is exercised."""
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT OR IGNORE INTO news_subscriptions "
+            "(user_id, topic_kind, topic_value) VALUES (?, ?, ?)",
+            (_int_or_none(user_id), str(topic_kind), str(topic_value)),
+        )
+        await db.commit()
+        return True
+    except Exception:
+        logger.exception("add_news_subscription failed")
+        return False
+    finally:
+        await db.close()
+
+
+def _int_or_none(value):
+    """Coerce to int, or None when not numeric (used for optional refs)."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 async def ai_registry_add(provider: str, model: str = None, endpoint: str = None, availability: str = None, auth_status: str = None, latency_ms: float = None, success_rate: float = None, capabilities: str = None, notes: str = None):
