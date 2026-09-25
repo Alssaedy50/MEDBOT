@@ -65,6 +65,9 @@ AUDIT_ACTIONS = (
     "news_reference",
     "news_delivery_retry",
     "news_resource_auto",
+    "scope_grant",
+    "scope_revoke",
+    "authz_denied",
 )
 
 ACTION_LABELS = {
@@ -107,6 +110,9 @@ ACTION_LABELS = {
     "news_reference": "🔗 ربط خبر بقسم/مورد",
     "news_delivery_retry": "🔁 إعادة إرسال خبر",
     "news_resource_auto": "🟢 خبر مورد تلقائي",
+    "scope_grant": "🧭 منح نطاق",
+    "scope_revoke": "✂️ سحب نطاق",
+    "authz_denied": "🚫 رفض تصريح",
 }
 
 

@@ -46,6 +46,7 @@ from telegram.constants import ParseMode
 from telegram.ext import CallbackQueryHandler, ContextTypes
 
 import audit
+import authorization
 import database
 import i18n
 import news_delivery
@@ -157,6 +158,35 @@ async def _edit(query, text, markup=None):
 async def _is_manager(user_id) -> bool:
     try:
         return await database.user_has_permission(user_id, "can_news")
+    except Exception:
+        return False
+
+
+async def _scoped_news_ids(user_id):
+    """News ids a scope-restricted admin may manage, or None when unrestricted.
+
+    None = platform-wide (owner / unscoped admin). A scoped admin gets only the
+    news rows anchored in — or referencing a resource inside — their scope.
+    """
+    try:
+        if await database.is_owner(user_id):
+            return None
+        if not await database.admin_has_scopes(user_id):
+            return None
+        return await database.list_news_ids_for_admin(user_id)
+    except Exception:
+        logger.exception("news: scoped id resolution failed")
+        return set()
+
+
+async def _can_manage_news(user_id, news_id) -> bool:
+    return await authorization.can(user_id, "news.edit", "news", news_id)
+
+
+async def _is_scope_restricted(user_id) -> bool:
+    """True when the admin is constrained by at least one scope (Phase 3)."""
+    try:
+        return await database.admin_has_scopes(user_id) and not await database.is_owner(user_id)
     except Exception:
         return False
 
@@ -668,10 +698,28 @@ async def pick_section(query, news_id, parent_id: int = 0):
         await _edit(query, "🔒 غير مصرح.", _home_keyboard())
         return
 
+    # Scope gate: a scoped admin can only reference a folder they own.
+    if not await authorization.can(query.from_user.id, "news.edit", "news", news_id):
+        await _edit(
+            query,
+            "🚫 هذا الخبر خارج نطاق مسؤوليتك.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة الأخبار", "admin_news")]]),
+        )
+        return
+
+    scoped_ids = await _scoped_news_ids(query.from_user.id)
+
     try:
         folders = await database.get_folders(parent_id)
     except Exception:
         folders = []
+
+    # Filter the browse tree to the admin's scope when restricted.
+    if scoped_ids is not None:
+        roots = await database.topic_folder_roots(query.from_user.id)
+        allowed = await database.list_folder_ids_under(roots)
+        folders = [f for f in folders if f[0] in allowed]
+
     try:
         breadcrumb = (
             await database.get_breadcrumbs(parent_id) if parent_id else "الرئيسية 🏠"
@@ -720,11 +768,30 @@ async def pick_resource(query, news_id, folder_id: int = None):
         await _edit(query, "🔒 غير مصرح.", _home_keyboard())
         return
 
+    # Scope gate: a scoped admin can only reference their own resources.
+    if not await authorization.can(query.from_user.id, "news.edit", "news", news_id):
+        await _edit(
+            query,
+            "🚫 هذا الخبر خارج نطاق مسؤوليتك.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة الأخبار", "admin_news")]]),
+        )
+        return
+
+    scoped = await _is_scope_restricted(query.from_user.id)
+    allowed_folders = None
+    if scoped:
+        roots = await database.topic_folder_roots(query.from_user.id)
+        allowed_folders = await database.list_folder_ids_under(roots)
+
+    def _folder_ok(fid):
+        return allowed_folders is None or fid in allowed_folders
+
     rows = []
 
     if folder_id is None:
         # Root listing: recent resources plus the entry folders to browse.
         files = await _list_all_content()
+        files = [f for f in files if _folder_ok(f[1])]
         for content_id, _folder, title in files[:25]:
             rows.append(
                 [
@@ -735,6 +802,7 @@ async def pick_resource(query, news_id, folder_id: int = None):
             folders = await database.get_folders(0)
         except Exception:
             folders = []
+        folders = [f for f in folders if _folder_ok(f[0])]
         for item in folders:
             try:
                 fid, name, node_type = item[0], item[1], item[2]
@@ -762,6 +830,7 @@ async def pick_resource(query, news_id, folder_id: int = None):
             folders = await database.get_folders(folder_id)
         except Exception:
             folders = []
+        folders = [f for f in folders if _folder_ok(f[0])]
         for item in folders:
             try:
                 fid, name, node_type = item[0], item[1], item[2]
@@ -800,6 +869,25 @@ async def set_section_reference(query, news_id, folder_id):
         await _edit(query, "🔒 غير مصرح.", _home_keyboard())
         return
 
+    if not await authorization.can(query.from_user.id, "news.edit", "news", news_id):
+        await _edit(
+            query,
+            "🚫 هذا الخبر خارج نطاق مسؤوليتك.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة الأخبار", "admin_news")]]),
+        )
+        return
+
+    # Scope gate: the chosen folder must be inside the admin's responsibility.
+    if not await authorization.can(
+        query.from_user.id, "news.edit", "folder", folder_id
+    ):
+        await _edit(
+            query,
+            "🚫 هذا القسم خارج نطاق مسؤوليتك.",
+            InlineKeyboardMarkup([[btn("⬅️ الخبر", f"news_admin_view:{news_id}")]]),
+        )
+        return
+
     try:
         folder = await database.get_folder(_int_or_none(folder_id))
     except Exception:
@@ -827,6 +915,25 @@ async def set_resource_reference(query, news_id, content_id):
     """Point a resource news at a real content row (validated server-side)."""
     if not await _is_manager(query.from_user.id):
         await _edit(query, "🔒 غير مصرح.", _home_keyboard())
+        return
+
+    if not await authorization.can(query.from_user.id, "news.edit", "news", news_id):
+        await _edit(
+            query,
+            "🚫 هذا الخبر خارج نطاق مسؤوليتك.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة الأخبار", "admin_news")]]),
+        )
+        return
+
+    # Scope gate: the chosen resource must be inside the admin's responsibility.
+    if not await authorization.can(
+        query.from_user.id, "news.edit", "resource", content_id
+    ):
+        await _edit(
+            query,
+            "🚫 هذا المورد خارج نطاق مسؤوليتك.",
+            InlineKeyboardMarkup([[btn("⬅️ الخبر", f"news_admin_view:{news_id}")]]),
+        )
         return
 
     try:
@@ -926,17 +1033,35 @@ async def show_admin_news(query, context=None, view: str = "active"):
 
     status, include_archived = _status_filter_for_view(view)
 
+    # Phase 3: a scope-restricted admin only sees news inside their folders.
+    scoped_ids = await _scoped_news_ids(query.from_user.id)
+
     try:
-        counts = await database.get_news_counts_by_type()
         rows_data = await database.list_news(
-            status=status, include_archived=include_archived, limit=20
+            status=status, include_archived=include_archived, limit=200
         )
         archived_count = await database.count_news(
             status="archived", include_archived=True
         )
+        counts = await database.get_news_counts_by_type()
     except Exception:
         logger.exception("news: admin overview failed")
-        counts, rows_data, archived_count = {}, [], 0
+        rows_data, archived_count, counts = [], 0, {}
+
+    if scoped_ids is not None:
+        rows_data = [r for r in rows_data if r["id"] in scoped_ids]
+        counts = {}
+        for item in rows_data:
+            counts[item["news_type"]] = counts.get(item["news_type"], 0) + 1
+        try:
+            archived_rows = await database.list_news(
+                status="archived", include_archived=True, limit=500
+            )
+            archived_count = sum(1 for r in archived_rows if r["id"] in scoped_ids)
+        except Exception:
+            archived_count = 0
+
+    rows_data = rows_data[:20]
 
     title = {
         "archived": "🗄 <b>الأخبار المؤرشفة</b>",
@@ -1049,6 +1174,17 @@ async def show_admin_news_item(query, news_id, back: str = None):
         )
         return
 
+    # Scope gate: an out-of-scope news id must not expose its lifecycle actions.
+    if not await authorization.can(
+        query.from_user.id, "news.view", "news", news_id
+    ):
+        await _edit(
+            query,
+            "🚫 هذا الخبر خارج نطاق مسؤوليتك.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة الأخبار", "admin_news")]]),
+        )
+        return
+
     status = database.NEWS_STATUS_LABELS.get(news["status"], news["status"])
     lang = await _lang(query.from_user.id)
     lines = _detail_lines(news, lang)
@@ -1112,6 +1248,16 @@ async def start_create_news(query, context, news_type):
 
     if news_type not in database.NEWS_TYPES:
         await _edit(query, "⚠️ نوع غير معروف.", _admin_menu())
+        return
+
+    # A scope-restricted admin cannot author a platform-wide 🔴 notification:
+    # it has no folder target, so it can never be placed inside their scope.
+    if news_type == "notify" and await _is_scope_restricted(query.from_user.id):
+        await _edit(
+            query,
+            "🚫 الإشعار الهام عام على مستوى المنصة ولا يقع داخل نطاق مسؤوليتك.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة الأخبار", "admin_news")]]),
+        )
         return
 
     workflow.begin(context, NEWS_WORKFLOW)
@@ -1298,6 +1444,17 @@ async def _publish(query, news_id):
         await _edit(query, "⚠️ الخبر غير موجود.", _home_keyboard())
         return
 
+    # Scope gate: publishing is a scoped operation.
+    if not await authorization.can(
+        query.from_user.id, "news.publish", "news", news_id
+    ):
+        await _edit(
+            query,
+            "🚫 هذا الخبر خارج نطاق مسؤوليتك.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة الأخبار", "admin_news")]]),
+        )
+        return
+
     missing = _reference_missing_for(news)
     if missing:
         label = "القسم" if missing == "section" else "المورد"
@@ -1325,6 +1482,13 @@ async def _publish(query, news_id):
 
 
 async def _archive(query, news_id):
+    if not await authorization.can(query.from_user.id, "news.archive", "news", news_id):
+        await _edit(
+            query,
+            "🚫 هذا الخبر خارج نطاق مسؤوليتك.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة الأخبار", "admin_news")]]),
+        )
+        return
     ok = await database.archive_news(news_id)
     if ok:
         await audit.log_action(
@@ -1335,6 +1499,13 @@ async def _archive(query, news_id):
 
 
 async def _restore(query, news_id):
+    if not await authorization.can(query.from_user.id, "news.archive", "news", news_id):
+        await _edit(
+            query,
+            "🚫 هذا الخبر خارج نطاق مسؤوليتك.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة الأخبار", "admin_news")]]),
+        )
+        return
     ok = await database.restore_news(news_id)
     if ok:
         await audit.log_action(
@@ -1346,6 +1517,13 @@ async def _restore(query, news_id):
 
 
 async def _delete(query, news_id):
+    if not await authorization.can(query.from_user.id, "news.edit", "news", news_id):
+        await _edit(
+            query,
+            "🚫 هذا الخبر خارج نطاق مسؤوليتك.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة الأخبار", "admin_news")]]),
+        )
+        return
     ok = await database.delete_news(news_id)
     if ok:
         await audit.log_action(
