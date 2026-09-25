@@ -4466,7 +4466,8 @@ def _feature_for_callback(data: str):
     if data == "news" or data.startswith(
         (
             "news_open:", "news_more:", "news_filter:", "news_readall",
-            "news_subs", "news_sub:", "news_subs_section:",
+            "news_subs", "news_sub:", "news_unsub:",
+            "news_subs_section:", "news_pick_child:", "news_pick_root:",
         )
     ):
         return "news"
