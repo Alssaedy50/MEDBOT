@@ -118,6 +118,14 @@ Both consume one daily quota unit per call and return
   concurrent; generation is capped by `ai.MAX_OUTPUT_TOKENS`; `warm_ai_pool()`
   runs once at startup (best-effort) so the first student reply does not pay for
   discovery.
+- Anti-repetition output guard: `ai._guard_answer` runs locally on every
+  generated answer (inside `_provider_failover` and the legacy `/ask` path) and
+  collapses adjacent repeated lines / paragraphs / table rows. It performs no
+  network or DB calls and never caps answer length, so a long, varied answer is
+  untouched. Only when `ai._has_repetition` still flags an obvious repetition is
+  the answer regenerated once for that candidate (`REPETITION_RETRY_INSTRUCTION`)
+  — never in a loop. Thresholds: `REPETITION_MIN_UNIT_CHARS`,
+  `REPETITION_MIN_REPEATS`.
 
 ### Student UI (main.py)
 - The assistant entry (`assistant` callback) opens a mode chooser
@@ -200,7 +208,21 @@ Both consume one daily quota unit per call and return
   catch-all `callback_router`, and route their callbacks through their own
   handlers in tests.
 - `admin_management` uses `database.add_sub_admin_by_any`, which does
-  `INSERT OR REPLACE`; never let it touch the owner (it would reset role/perms).
+  `INSERT OR REPLACE`; it now refuses to touch the owner (a replace would reset
+  the owner's role/perms), and `handle_add_admin_text` re-asserts the resolved
+  non-owner as least-privilege `admin`.
+- Adding a sub-admin by `@username` or Telegram ID resolves through
+  `database.resolve_user_by_identifier()`, which reads the real `users`
+  registry (the dedicated `username` column, case-insensitive) — NOT a demand
+  that the person press `/start` again. It never creates a user row, and an
+  unknown handle returns an explicit "no such account" message. Falls back to
+  the `admins` table for an already-registered handle.
+- Admin preview: `admin_management.show_admin_preview` (callback
+  `amg_preview:<id>`) is a read-only admin-preview/impersonation aid gated by
+  `can_admins`. It renders the target's stored role and effective permissions
+  from the RBAC tables and audits the action (`admin_preview`); it never
+  changes the acting admin's Telegram identity, never creates a fake session,
+  and never mutates the target's role/permissions.
 - UI visibility rule: `main.home_keyboard(lang, hidden)` is the public student
   keyboard and never contains the admin entry. Use `await main.home_for(update)`
   everywhere a home keyboard is attached; it appends the Admin Panel only for
@@ -325,7 +347,11 @@ Both consume one daily quota unit per call and return
   buttons (discarding an invented entity the model names), and AI chat keeps
   the bilingual medical contract, skips the registry for general questions,
   and never exposes platform structure. It replaces only provider functions
-  (no business logic mocked).
+  (no business logic mocked). `RepetitionGuardTests` pins the local
+  anti-repetition guard: repeated lines/paragraphs/table rows are collapsed,
+  long varied answers pass untouched, the guard makes no DB/network call, and a
+  persistent repetition triggers exactly one regeneration before falling back to
+  the locally cleaned answer.
 - `test_archive_sync.py` pins the Emergency Archive: auto-publish on
   creation, no duplicate after a restart/retry, publication failure never
   failing the resource, retry-once, resync of pre-existing resources, real
@@ -335,6 +361,11 @@ Both consume one daily quota unit per call and return
   logic are real.
 - `test_db_patch.py` needs a real `medbot_v2.sqlite3`; it is skipped locally
   when absent.
+- `test_rbac_audit.py` additionally pins `AddAdminLookupTests` (add by
+  `@username` / ID resolves the existing registry user, no duplicate user row,
+  clear message for an unknown handle, owner never touched) and
+  `AdminPreviewTests` (preview is authorized, read-only, audited, and changes
+  neither the caller's identity nor the target's role/permissions).
 - Tests must exercise real code paths against temporary SQLite; no mocks.
 - Root folders are stored with `parent_id IS NULL` (not `0`).
 

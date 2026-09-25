@@ -381,6 +381,173 @@ class ChatNoProviderTests(ModeBase):
 
 
 # ---------------------------------------------------------------------------
+# Local anti-repetition output guard
+# ---------------------------------------------------------------------------
+
+_REPEATED_LINE = (
+    "The cardiac cycle consists of systole and diastole phases."
+)
+
+
+class RepetitionGuardTests(ModeBase):
+    """Local output guard: fix repetition without capping legitimate length."""
+
+    def setUp(self):
+        super().setUp()
+
+        async def no_pubmed(query):
+            return []
+
+        # Keep the medical path offline: the guard is what is under test.
+        ai._fetch_pubmed_sources = no_pubmed
+
+    def test_repeated_line_is_collapsed(self):
+        repeated = "\n".join([_REPEATED_LINE] * 6)
+        cleaned = ai._guard_answer(repeated)
+        self.assertEqual(cleaned.split("\n"), [_REPEATED_LINE])
+        self.assertFalse(ai._has_repetition(cleaned))
+
+    def test_repeated_paragraph_is_collapsed(self):
+        para = (
+            "Cardiac output is the product of heart rate and stroke volume, "
+            "and it reflects the total blood pumped per minute."
+        )
+        repeated = "\n\n".join([para] * 4)
+        cleaned = ai._guard_answer(repeated)
+        self.assertEqual(cleaned.split("\n\n"), [para])
+        self.assertFalse(ai._has_repetition(cleaned))
+
+    def test_repeated_table_row_is_collapsed(self):
+        row = "| Drug | Dose | Route |"
+        repeated = "\n".join([row] * 5)
+        cleaned = ai._guard_answer(repeated)
+        self.assertEqual(cleaned.split("\n"), [row])
+        self.assertFalse(ai._has_repetition(cleaned))
+
+    def test_long_varied_answer_passes_untouched(self):
+        long_answer = "\n".join(
+            f"Step {i}: a distinct physiological detail number {i} explained "
+            f"with its own wording about system {i}."
+            for i in range(40)
+        )
+        self.assertFalse(ai._has_repetition(long_answer))
+        self.assertEqual(ai._guard_answer(long_answer), long_answer)
+
+    def test_bilingual_medical_answer_passes_untouched(self):
+        answer = (
+            "🩺 Cardiac cycle\n"
+            "**English (academic):**\n"
+            "The cardiac cycle is the sequence of electrical and mechanical "
+            "events occurring during one complete heartbeat.\n"
+            "**العربية — شرح مختصر:**\n"
+            "هي سلسلة الأحداث الكهربائية والميكانيكية خلال نبضة قلب واحدة."
+        )
+        self.assertFalse(ai._has_repetition(answer))
+        self.assertEqual(ai._guard_answer(answer), answer)
+
+    def test_short_repeated_bullets_are_not_touched(self):
+        # Tiny, genuinely distinct list items must never be merged.
+        answer = "\n".join(["- a", "- b", "- c", "- a", "- b"])
+        self.assertEqual(ai._guard_answer(answer), answer)
+
+    def test_guard_is_local_and_does_not_call_db_or_network(self):
+        """The normal path must not gain DB/network calls."""
+        calls = {"db": 0}
+
+        async def spy_get_db(*a, **k):
+            calls["db"] += 1
+            raise AssertionError("guard must not touch the database")
+
+        original = database.get_db
+        database.get_db = spy_get_db
+        try:
+            ai._guard_answer("\n".join([_REPEATED_LINE] * 5))
+            ai._has_repetition("\n".join([_REPEATED_LINE] * 5))
+        finally:
+            database.get_db = original
+        self.assertEqual(calls["db"], 0)
+
+    # -- integration with the provider failover ----------------------------
+
+    def chat_with_answer(self, answer, query):
+        calls = self.install_provider(answer=answer)
+        result = self.chat(query)
+        return calls, result
+
+    def test_repetition_is_repaired_before_delivery(self):
+        repeated = "\n".join([_REPEATED_LINE] * 5)
+        calls, result = self.chat_with_answer(
+            repeated, "What is the cardiac cycle?"
+        )
+        self.assertEqual(result["text"].split("\n"), [_REPEATED_LINE])
+        # A locally repaired answer needs no regeneration.
+        self.assertEqual(len(calls["prompts"]), 1)
+
+    # A repeated two-block sequence: the local line/paragraph pass cannot merge
+    # non-adjacent blocks, but the guard still detects the repetition, which is
+    # exactly what should trigger a single regeneration.
+    _INTERLEAVED_REPEAT = "\n\n".join(
+        [
+            "alpha beta gamma delta epsilon",
+            "zeta eta theta iota kappa",
+        ]
+        * 3
+    )
+
+    def test_persistent_repetition_triggers_exactly_one_regeneration(self):
+        # The retry is clean; exactly one regeneration must happen (no loop).
+        repeated = self._INTERLEAVED_REPEAT
+
+        calls = {"prompts": [], "systems": []}
+        answers = iter([
+            repeated,          # first generation: repetitive
+            "🩺 Clean answer.\n**English (academic):**\nDone.\n"
+            "**العربية — شرح مختصر:**\nتم.",  # retry: clean
+        ])
+
+        async def fake_candidates():
+            return [{"provider": "test", "model": "test-model", "endpoint": "x"}]
+
+        async def fake_request(client, item, prompt, system_prompt=None):
+            calls["prompts"].append(prompt)
+            calls["systems"].append(system_prompt)
+            return next(answers)
+
+        ai._get_candidates = fake_candidates
+        ai._request = fake_request
+
+        result = self.chat("What is the cardiac cycle?")
+
+        # Exactly one regeneration: two calls total, never a loop.
+        self.assertEqual(len(calls["prompts"]), 2)
+        self.assertIn("دون أي تكرار", calls["prompts"][-1])
+        self.assertIn("Clean answer", result["text"])
+
+    def test_failed_regeneration_falls_back_to_locally_cleaned_answer(self):
+        # Both attempts repetitive: the locally repaired first answer is kept
+        # (never an empty reply, never an infinite retry).
+        repeated = "\n".join([_REPEATED_LINE + " again"] * 6)
+        interleaved = self._INTERLEAVED_REPEAT
+
+        calls = {"prompts": []}
+
+        async def fake_candidates():
+            return [{"provider": "test", "model": "test-model", "endpoint": "x"}]
+
+        async def fake_request(client, item, prompt, system_prompt=None):
+            calls["prompts"].append(prompt)
+            return interleaved
+
+        ai._get_candidates = fake_candidates
+        ai._request = fake_request
+
+        result = self.chat("What is the cardiac cycle?")
+        # One generation plus one bounded regeneration, then stop.
+        self.assertEqual(len(calls["prompts"]), 2)
+        self.assertEqual(result["text"], interleaved.strip())
+
+
+# ---------------------------------------------------------------------------
 # Prompt / architecture contracts
 # ---------------------------------------------------------------------------
 

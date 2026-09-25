@@ -3466,34 +3466,121 @@ async def get_audit_count() -> int:
         await db.close()
 
 
-async def add_sub_admin_by_any(identifier: str) -> tuple[bool, str]:
+async def resolve_user_by_identifier(identifier: str):
+    """Resolve a typed @username or numeric Telegram ID to a known bot user.
+
+    Lookup is against the bot's real user registry (the `users` row written the
+    first time the account interacted with MEDBOT), not against a requirement
+    that the person press /start again. A user who has ever used the bot is
+    therefore recognised by their stored @username or their Telegram ID.
+
+    Returns ``(user_id, full_name, stored_username)`` when found, else
+    ``(None, "", "")``. Never creates a user row: this is a read.
+    """
+    identifier = (identifier or "").strip().lstrip("@").strip()
+    if not identifier:
+        return None, "", ""
+
     db = await get_db()
-    identifier = identifier.strip().lstrip("@")
     try:
         if identifier.isdigit():
-            tid = int(identifier)
-            # محاولة جلب الاسم إن كان مسجلاً في البوت
-            async with db.execute("SELECT full_name FROM users WHERE user_id = ?", (tid,)) as cur:
-                row = await cur.fetchone()
-            uname = row[0] if row else ""
-            await db.execute("INSERT OR REPLACE INTO admins (telegram_id, username) VALUES (?, ?)", (tid, uname))
-            await db.commit()
-            return True, f"تمت إضافة المشرف بنجاح (ID: {tid})"
-        else:
-            # البحث باليوزر في جدول المستخدمين
-            async with db.execute("SELECT user_id, full_name FROM users WHERE full_name LIKE ? OR user_id = ?", (f"%{identifier}%", identifier)) as cur:
+            tidy = int(identifier)
+            async with db.execute(
+                "SELECT user_id, full_name, username FROM users WHERE user_id = ?",
+                (tidy,),
+            ) as cur:
                 row = await cur.fetchone()
             if row:
-                tid = row[0]
-                await db.execute("INSERT OR REPLACE INTO admins (telegram_id, username) VALUES (?, ?)", (tid, identifier))
-                await db.commit()
-                return True, f"تم العثور على المستخدم @{identifier} وإضافته كمشرف (ID: {tid})"
-            else:
-                return False, f"لم يتم العثور على مستخدم بالمعرف @{identifier}. اطلب منه إرسال /start للبوت أولاً أو أرسل الـ Telegram ID الرقمي مباشرة."
-    except Exception as e:
-        return False, f"خطأ أثناء الإضافة: {str(e)}"
+                return row[0], row[1] or "", row[2] or ""
+            # Still a valid numeric id even if the row is absent: Telegram can
+            # resolve it, so the caller may add it directly.
+            return tidy, "", ""
+
+        # Prefer the dedicated username column (case-insensitive). Older rows
+        # stored the handle there verbatim, so COLLATE NOCASE covers casing.
+        async with db.execute(
+            "SELECT user_id, full_name, username FROM users "
+            "WHERE username = ? COLLATE NOCASE",
+            (identifier,),
+        ) as cur:
+            row = await cur.fetchone()
+
+        if not row:
+            # A few very old rows only ever stored a display name; match it as
+            # a last resort so an existing user is still found.
+            async with db.execute(
+                "SELECT user_id, full_name, username FROM users "
+                "WHERE full_name = ? COLLATE NOCASE",
+                (identifier,),
+            ) as cur:
+                row = await cur.fetchone()
+
+        if not row:
+            # Fall back to an already-registered admin carrying this handle.
+            async with db.execute(
+                "SELECT telegram_id, username FROM admins "
+                "WHERE username = ? COLLATE NOCASE",
+                (identifier,),
+            ) as cur:
+                admin_row = await cur.fetchone()
+            if admin_row:
+                return admin_row[0], "", admin_row[1] or ""
+
+            return None, "", ""
+
+        return row[0], row[1] or "", row[2] or ""
     finally:
         await db.close()
+
+
+async def add_sub_admin_by_any(identifier: str) -> tuple[bool, str]:
+    identifier = (identifier or "").strip()
+    cleaned = identifier.lstrip("@").strip()
+
+    if not cleaned:
+        return False, "⚠️ أرسل @username أو Telegram ID صالح."
+
+    user_id, full_name, stored_username = await resolve_user_by_identifier(cleaned)
+
+    if user_id is None:
+        return False, (
+            f"⚠️ لا يوجد حساب «@{cleaned}» في بيانات البوت.\n"
+            "تأكد من اسم المستخدم (بدون @ يمكن)، أو أرسل الـ Telegram ID "
+            "الرقمي للحساب."
+        )
+
+    try:
+        # Never let an INSERT OR REPLACE touch the owner: replacing the row
+        # would reset its role and permissions and could leave the platform
+        # without a working owner.
+        if await is_owner(user_id):
+            return False, (
+                "ℹ️ هذا الحساب هو المالك بالفعل؛ لا حاجة لإضافته كمشرف."
+            )
+
+        db = await get_db()
+        try:
+            # The `users` registry is the source of truth for the handle; the
+            # admins row keeps a copy for display. No user row is created here.
+            # A numeric add without a known handle stores no username rather
+            # than duplicating the id into the username column.
+            display_name = (stored_username or "").lstrip("@")
+            if not display_name and not cleaned.isdigit():
+                display_name = cleaned
+            await db.execute(
+                "INSERT OR REPLACE INTO admins (telegram_id, username) "
+                "VALUES (?, ?)",
+                (user_id, display_name),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+    except Exception as e:
+        return False, f"خطأ أثناء الإضافة: {str(e)}"
+
+    nice = f" (@{display_name})" if display_name and not display_name.isdigit() else ""
+    return True, f"تمت إضافة المشرف بنجاح (ID: {user_id}){nice}"
+
 
 async def get_all_user_ids() -> list:
     db = await get_db()

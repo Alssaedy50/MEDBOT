@@ -192,6 +192,10 @@ async def show_admin_detail(query, target_id):
     if await database.is_owner(query.from_user.id) and not target_is_owner:
         rows.append([btn("👑 نقل الملكية", f"amg_transfer:{target_id}")])
 
+    # Read-only preview: let the actor review what this admin actually sees and
+    # can manage, without changing anyone's Telegram identity.
+    rows.append([btn("👁 معاينة واجهة المشرف", f"amg_preview:{target_id}")])
+
     rows.append([btn("🗑 إزالة المشرف", f"amg_remove:{target_id}")])
     rows.append([btn("⬅️ إدارة المشرفين", "amg_list")])
     rows.append([btn("🏠 الرئيسية", "home")])
@@ -280,6 +284,83 @@ async def execute_transfer(query, target_id):
         InlineKeyboardMarkup(
             [
                 [btn("👥 إدارة المشرفين", "amg_list")],
+                [btn("🏠 الرئيسية", "home")],
+            ]
+        ),
+    )
+
+
+async def show_admin_preview(query, target_id):
+    """Read-only preview of what a given admin sees inside MEDBOT.
+
+    This is an admin-preview/impersonation aid, not a session switch: the
+    acting admin's Telegram identity is never changed, no session is created or
+    faked, and the target's role/permissions are never mutated. It renders the
+    target's stored role and effective capabilities from the RBAC tables so the
+    acting admin can review their access, then jump to the real permission
+    controls to change it.
+    """
+    if not await _is_authorized(query.from_user.id):
+        await _edit(query, "🔒 غير مصرح.", _home_keyboard())
+        return
+
+    record = await database.get_admin_record(target_id)
+    if not record:
+        await _edit(
+            query,
+            "⚠️ المشرف غير موجود.",
+            InlineKeyboardMarkup([[btn("⬅️ إدارة المشرفين", "amg_list")]]),
+        )
+        return
+
+    role = record["role"]
+    role_label = database.ROLE_LABELS.get(role, role)
+    name = str(record.get("username") or "").strip() or "بدون اسم"
+    permissions = await database.get_admin_permissions(target_id)
+
+    lines = [
+        "👁 <b>معاينة واجهة المشرف</b>",
+        f"🆔 <code>{esc(target_id)}</code>",
+        f"📝 الاسم: {esc(name)}",
+        f"👑 الدور: {role_label}",
+        "",
+        "🔐 <b>ما يستطيع هذا الحساب الوصول إليه</b>",
+    ]
+
+    granted = [
+        database.PERMISSION_LABELS.get(key, key)
+        for key in database.PERMISSION_KEYS
+        if permissions.get(key)
+    ]
+
+    if granted:
+        for label in granted:
+            lines.append(f"✅ {esc(label)}")
+    else:
+        lines.append("⛔ لا يملك أي صلاحية إدارية حالياً.")
+
+    lines.append("")
+    lines.append(esc(database.ROLE_DESCRIPTIONS.get(role, "")))
+    lines.append("")
+    lines.append(
+        "ℹ️ هذه معاينة للقراءة فقط: هويتك في Telegram لم تتغير، ولا توجد جلسة "
+        "مزيفة. للتحكم في الوصول استخدم أزرار الصلاحيات."
+    )
+
+    await audit.log_action(
+        query.from_user.id,
+        "admin_preview",
+        target_type="admin",
+        target_id=target_id,
+    )
+
+    await _edit(
+        query,
+        "\n".join(lines),
+        InlineKeyboardMarkup(
+            [
+                [btn("🔐 تعديل صلاحيات هذا المشرف", f"amg_view:{target_id}")],
+                [btn("⬅️ إدارة المشرفين", "amg_list")],
                 [btn("🏠 الرئيسية", "home")],
             ]
         ),
@@ -424,6 +505,8 @@ async def start_add_admin(query, context):
         query,
         "➕ <b>إضافة مشرف</b>\n\n"
         "أرسل الـ Telegram ID الرقمي أو @username.\n"
+        "يُتعرَّف على أي حساب استخدم البوت من قبل تلقائياً؛ لا حاجة لأن يرسل "
+        "/start مرة أخرى.\n"
         "لن يحصل المشرف الجديد على أي صلاحية حتى تمنحها له.",
         InlineKeyboardMarkup([[btn("⬅️ إدارة المشرفين", "amg_list")]]),
     )
@@ -456,32 +539,18 @@ async def handle_add_admin_text(update, context):
         #
         # `add_sub_admin_by_any` uses INSERT OR REPLACE, which resets role and
         # permissions. Re-adding an existing (non-owner) admin would therefore
-        # wipe its role/perms, so the resolved row is repaired afterwards: the
-        # owner is never demoted, everyone else is re-asserted as `admin` with
-        # an explicit all-False map.
+        # wipe its role/perms, so the resolved row is repaired afterwards.
+        # The owner row is never touched by the add path.
         try:
-            digits = "".join(ch for ch in identifier if ch.isdigit())
-            if digits:
-                new_id = int(digits)
-            else:
-                # A @username add stores the resolved numeric id on the row.
-                async with (await database.get_db()) as db:
-                    async with db.execute(
-                        "SELECT telegram_id FROM admins "
-                        "WHERE username = ? "
-                        "ORDER BY added_at DESC, telegram_id DESC LIMIT 1",
-                        (identifier.lstrip("@"),),
-                    ) as cur:
-                        row = await cur.fetchone()
-                new_id = row[0] if row else 0
+            resolved_id, _, _ = await database.resolve_user_by_identifier(identifier)
 
-            if new_id > 0 and not await database.is_owner(new_id):
-                await database.set_admin_role(new_id, "admin")
+            if resolved_id and not await database.is_owner(resolved_id):
+                await database.set_admin_role(resolved_id, "admin")
                 await database.update_admin_permissions(
-                    new_id, {key: False for key in database.PERMISSION_KEYS}
+                    resolved_id, {key: False for key in database.PERMISSION_KEYS}
                 )
         except Exception:
-            pass
+            logger.exception("admin_management: failed to normalise new admin")
 
         await audit.log_action(
             update.effective_user.id,
@@ -531,6 +600,15 @@ async def admin_management_callback_handler(update, context: ContextTypes.DEFAUL
             await _edit(query, "⚠️ معرف غير صالح.", _home_keyboard())
             return
         await show_admin_detail(query, target_id)
+        return
+
+    if data.startswith("amg_preview:"):
+        try:
+            target_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await _edit(query, "⚠️ معرف غير صالح.", _home_keyboard())
+            return
+        await show_admin_preview(query, target_id)
         return
 
     if data.startswith("amg_perm:"):
@@ -595,6 +673,6 @@ def register_admin_management_handlers(app):
     app.add_handler(
         CallbackQueryHandler(
             admin_management_callback_handler,
-            pattern=r"^(amg_list|amg_add|amg_roles|amg_view:|amg_perm:|amg_role:|amg_remove:|amg_transfer)",
+            pattern=r"^(amg_list|amg_add|amg_roles|amg_view:|amg_preview:|amg_perm:|amg_role:|amg_remove:|amg_transfer)",
         )
     )

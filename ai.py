@@ -186,6 +186,16 @@ DISCOVERY_TTL_SECONDS = 900
 # big latency contributor) without truncating a normal reply.
 MAX_OUTPUT_TOKENS = 900
 
+# --- Local output guard ---------------------------------------------------
+# A model can degenerate and emit the same line, paragraph or table row many
+# times. The guard is purely local (no network, no DB) and never caps the
+# answer length: a legitimately long reply passes untouched. It only collapses
+# a unit that is substantial (>= REPETITION_MIN_UNIT_CHARS) and clearly
+# duplicated. A single regeneration is attempted at most once, and only when a
+# repetition signature survives the local fix, so there is no loop.
+REPETITION_MIN_UNIT_CHARS = 24
+REPETITION_MIN_REPEATS = 3
+
 # The verified active pool is expensive to build: provider discovery plus up
 # to six health probes, all network round-trips. Rebuilding it on every user
 # message is what made /start-adjacent AI replies slow. Cache the resulting
@@ -1380,6 +1390,204 @@ def _ensure_sources_footer(answer: str, footer: str) -> str:
     return f"{answer}{footer}"
 
 
+# ---------------------------------------------------------------------------
+# Local output guard (anti-repetition)
+# ---------------------------------------------------------------------------
+# Purely local post-processing for model output. It fixes the common
+# "same line / paragraph / table row over and over" degeneration without any
+# network or DB call, and without imposing a length cap: long answers are
+# valid and must pass. See REPETITION_* constants for the thresholds.
+
+_WORD_RE = re.compile(r"[A-Za-z0-9\u0600-\u06FF]+")
+
+
+def _unit_signature(unit: str) -> str:
+    """A stable key for a line/paragraph, normalised for comparison.
+
+    Case, surrounding whitespace, punctuation and Arabic diacritics are
+    ignored so that "* Item" and "- item." count as the same unit.
+    """
+    normalized = search_engine.normalize_text(unit or "")
+    words = _WORD_RE.findall(normalized)
+    return " ".join(words)
+
+
+def _is_table_line(line: str) -> bool:
+    stripped = (line or "").strip()
+    return (
+        stripped.startswith("|")
+        or stripped.startswith("+-")
+        or stripped.startswith("|:")
+    ) or (stripped.count("|") >= 2)
+
+
+def _collapse_repeated_units(text: str):
+    """Collapse runs of >= REPETITION_MIN_REPEATS identical adjacent units.
+
+    Units are lines, and additionally whole paragraphs for blocks that are not
+    table rows. A long, varied answer is returned unchanged. Returns
+    ``(cleaned_text, repeats_found)``.
+    """
+    if not text:
+        return text, 0
+
+    lines = text.split("\n")
+    collapsed: list[str] = []
+    repeats = 0
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        signature = _unit_signature(line)
+
+        # A substantial, non-table line that repeats itself back-to-back.
+        if (
+            signature
+            and len(line.strip()) >= REPETITION_MIN_UNIT_CHARS
+            and not _is_table_line(line)
+        ):
+            run = 1
+            while (
+                index + run < len(lines)
+                and _unit_signature(lines[index + run]) == signature
+            ):
+                run += 1
+
+            if run >= REPETITION_MIN_REPEATS:
+                collapsed.append(line)
+                repeats += run - 1
+                index += run
+                continue
+
+        # A table row repeated with the same column layout.
+        if _is_table_line(line):
+            cells = [
+                _unit_signature(cell) for cell in line.strip().strip("|").split("|")
+            ]
+            run = 1
+            while index + run < len(lines) and _is_table_line(lines[index + run]):
+                next_cells = [
+                    _unit_signature(cell)
+                    for cell in lines[index + run].strip().strip("|").split("|")
+                ]
+                if next_cells != cells:
+                    break
+                run += 1
+
+            if run >= REPETITION_MIN_REPEATS:
+                collapsed.append(line)
+                repeats += run - 1
+                index += run
+                continue
+
+        collapsed.append(line)
+        index += 1
+
+    cleaned = "\n".join(collapsed)
+
+    # Whole-paragraph repetition (blank-line separated), e.g. the same
+    # explanation block pasted several times in a row.
+    paragraphs = cleaned.split("\n\n")
+    if len(paragraphs) > REPETITION_MIN_REPEATS:
+        deduped: list[str] = []
+        para_repeats = 0
+        index = 0
+        while index < len(paragraphs):
+            paragraph = paragraphs[index]
+            signature = _unit_signature(paragraph)
+            if signature and len(paragraph.strip()) >= REPETITION_MIN_UNIT_CHARS:
+                run = 1
+                while (
+                    index + run < len(paragraphs)
+                    and _unit_signature(paragraphs[index + run]) == signature
+                ):
+                    run += 1
+                if run >= REPETITION_MIN_REPEATS:
+                    deduped.append(paragraph)
+                    para_repeats += run - 1
+                    index += run
+                    continue
+            deduped.append(paragraph)
+            index += 1
+
+        if para_repeats:
+            cleaned = "\n\n".join(deduped)
+            repeats += para_repeats
+
+    return cleaned, repeats
+
+
+def _has_repetition(text: str) -> bool:
+    """Heuristic: does the answer still contain obviously duplicated units?
+
+    Used only to decide whether a single regeneration is worth attempting. It
+    is deliberately conservative so a genuinely long, varied answer is never
+    flagged.
+    """
+    if not text:
+        return False
+
+    lines = [
+        line
+        for line in text.split("\n")
+        if len(line.strip()) >= REPETITION_MIN_UNIT_CHARS
+    ]
+    if len(lines) < REPETITION_MIN_REPEATS:
+        return False
+
+    seen: dict[str, int] = {}
+    for line in lines:
+        signature = _unit_signature(line)
+        if not signature:
+            continue
+        seen[signature] = seen.get(signature, 0) + 1
+
+    if any(count >= REPETITION_MIN_REPEATS for count in seen.values()):
+        return True
+
+    paragraphs = [
+        p for p in text.split("\n\n")
+        if len(p.strip()) >= REPETITION_MIN_UNIT_CHARS
+    ]
+    for paragraph in paragraphs:
+        if paragraphs.count(paragraph) >= REPETITION_MIN_REPEATS:
+            return True
+
+    # The whole answer is one block repeated: detect a period in the word
+    # sequence (covers "answer pasted twice/thrice", however it is spaced).
+    words = _unit_signature(text).split()
+    if len(words) >= 2 * REPETITION_MIN_REPEATS:
+        for period in range(1, len(words) // 2 + 1):
+            block = words[:period]
+            repeats = 0
+            for start in range(0, len(words) - period + 1, period):
+                if words[start:start + period] != block:
+                    break
+                repeats += 1
+            # A short period (< 4 words) matches any normal prose; only treat
+            # a substantial repeated block as degeneration.
+            if repeats >= REPETITION_MIN_REPEATS and period * repeats >= len(words) // 2:
+                if period >= 3:
+                    return True
+
+    return False
+
+
+def _guard_answer(text: str) -> str:
+    """Repair obvious local repetition in a generated answer.
+
+    Never truncates a legitimate long answer: only repeated units are removed.
+    """
+    cleaned, _ = _collapse_repeated_units(text or "")
+    return cleaned or (text or "")
+
+
+REPETITION_RETRY_INSTRUCTION = (
+    "\n\nمهم جداً: أعد صياغة الإجابة كاملة مرة واحدة دون أي تكرار. "
+    "لا تعِد نفس السطر أو الفقرة أو صف الجدول، واذكر كل فكرة مرة واحدة فقط."
+)
+
+
 def build_platform_catalog(folders, contents, paths) -> str:
     """Render the full registered MEDBOT tree into a compact text catalog.
 
@@ -1896,6 +2104,39 @@ async def _provider_failover(
                 if not validator.allows(answer):
                     raise RuntimeError("Validator rejected empty answer")
 
+                # Local anti-repetition guard: fix the common "same line /
+                # paragraph / table row repeated" degeneration without any
+                # network or DB call. It never caps answer length, so a
+                # legitimately long reply is untouched. Only when an obvious
+                # repetition survives the local repair do we regenerate — once
+                # for this candidate, never in a loop.
+                answer = _guard_answer(answer)
+
+                if _has_repetition(answer):
+                    logger.info(
+                        "%s repetition detected provider=%s; regenerating once",
+                        label,
+                        provider,
+                    )
+                    try:
+                        retry = await _request(
+                            client,
+                            item,
+                            grounded_prompt + REPETITION_RETRY_INSTRUCTION,
+                            system_prompt,
+                        )
+                        if validator.allows(retry):
+                            retry = _guard_answer(retry)
+                            if not _has_repetition(retry):
+                                answer = retry
+                    except Exception as retry_exc:
+                        logger.warning(
+                            "%s repetition regeneration failed provider=%s error=%s",
+                            label,
+                            provider,
+                            retry_exc,
+                        )
+
                 latency_ms = round(
                     (time.perf_counter() - started) * 1000,
                     1,
@@ -2357,6 +2598,10 @@ async def generate_medical_ai_response(prompt: str, user_id: int = None) -> str:
                     item,
                     grounded_prompt,
                 )
+
+                # Legacy /ask-era path: apply the same local anti-repetition
+                # repair (no network, no length cap).
+                answer = _guard_answer(answer)
 
                 # Add the verified PubMed source programmatically.
                 # The model must not be trusted to invent or format citations.
